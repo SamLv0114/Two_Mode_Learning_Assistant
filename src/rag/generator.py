@@ -22,10 +22,6 @@ class Generator:
             if not settings.OPENAI_API_KEY:
                 raise ValueError("OPENAI_API_KEY not set in environment")
             self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
-        elif self.provider == "anthropic":
-            if not settings.ANTHROPIC_API_KEY:
-                raise ValueError("ANTHROPIC_API_KEY not set in environment")
-            self.client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
     
@@ -100,22 +96,10 @@ Answer:"""
                         {"role": "system", "content": "You are a helpful AI assistant specialized in machine learning and research."},
                         {"role": "user", "content": prompt}
                     ],
-                    max_tokens=max_tokens,
-                    temperature=0.7
+                    max_completion_tokens=max_tokens,
+                    # temperature=0.7
                 )
                 return response.choices[0].message.content.strip()
-            
-            elif self.provider == "anthropic":
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    temperature=0.7,
-                    system="You are a helpful AI assistant specialized in machine learning and research.",
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                return response.content[0].text.strip()
         
         except Exception as e:
             logger.error(f"Error generating LLM response: {e}")
@@ -124,14 +108,6 @@ Answer:"""
     def generate_summary(self, title: str, content: str, user_interests: List[str] = None) -> str:
         """
         Generate personalized summary for a paper/article
-        
-        Args:
-            title: Title of the paper/article
-            content: Abstract or content snippet
-            user_interests: List of user interests for personalization
-            
-        Returns:
-            Personalized summary string
         """
         if user_interests is None:
             user_interests = settings.USER_INTERESTS

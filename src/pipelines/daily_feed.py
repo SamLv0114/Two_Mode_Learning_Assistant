@@ -189,7 +189,7 @@ class DailyFeedPipeline:
                 content=content
             )
             item.personalized_summary = summary
-        
+            
         return items
     
     def _store_results(self, papers: List[PaperData], articles: List):
@@ -288,7 +288,8 @@ class DailyFeedPipeline:
             for paper in output["papers"]:
                 lines.append(f"\n{paper['rank']}. \"{paper['title']}\" [arXiv:{paper['arxiv_id']}]")
                 lines.append(f"   ⭐ {paper['citation_count']} citations")
-                lines.append(f"   💡 {paper['summary']}")
+                summary = paper.get('summary') or "Summary not available"
+                lines.append(f"   💡 {summary}")
                 lines.append(f"   🔗 {paper['url']}")
         
         if output["articles"]:
@@ -296,7 +297,8 @@ class DailyFeedPipeline:
             for article in output["articles"]:
                 lines.append(f"\n{article['rank']}. \"{article['title']}\"")
                 lines.append(f"   🔥 {article['upvotes']} upvotes | Source: {article['source']}")
-                lines.append(f"   💡 {article['summary']}")
+                summary = article.get('summary') or "Summary not available"
+                lines.append(f"   💡 {summary}")
                 lines.append(f"   🔗 {article['url']}")
         
         # Estimate reading time

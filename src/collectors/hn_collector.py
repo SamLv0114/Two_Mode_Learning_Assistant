@@ -23,6 +23,8 @@ class ArticleData:
     author: Optional[str] = None
     published_date: Optional[datetime] = None
     upvotes: int = 0
+    personalized_summary: Optional[str] = None
+    relevance_score: Optional[float] = None
 
 
 class HNCollector:

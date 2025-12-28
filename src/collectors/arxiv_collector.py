@@ -24,6 +24,8 @@ class PaperData:
     arxiv_url: str
     pdf_url: str
     citation_count: int = 0
+    personalized_summary: Optional[str] = None
+    relevance_score: Optional[float] = None
 
 
 class ArxivCollector:

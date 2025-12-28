@@ -52,6 +52,7 @@ class FeatureExtractor:
         }
     
     @staticmethod
+    # Similar to the paper features extractor
     def extract_article_features(article, embedding_manager, user_interests: List[str]) -> Dict:
         interests_text = " ".join(user_interests)
         article_text = f"{article.title} {article.content if hasattr(article, 'content') else ''}"

@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     
     # LLM Settings
     LLM_PROVIDER: str = "openai"
-    LLM_MODEL: str = "gpt-5-mini"
+    LLM_MODEL: str = "gpt-4o-mini"  # or "gpt-3.5-turbo" for cheaper option
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     # ArXiv settings
@@ -37,14 +37,14 @@ class Settings(BaseSettings):
     # Recommendation settings
     TOP_PAPERS_COUNT: int = 5
     TOP_ARTICLES_COUNT: int = 3
-    MIN_SIMILARITY_THRESHOLD: float = 0.3  # Lowered to be more inclusive
+    MIN_SIMILARITY_THRESHOLD: float = 0.3
     
     # Vector database
     VECTOR_DB_COLLECTION_NAME: str = "ml_knowledge_base"
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
     
-    # User preferences - read as string from .env, parsed to list via property
+    # User preferences - read as string from .env, parsed to list
     USER_INTERESTS_STR: Optional[str] = None
     
     # Database
