@@ -71,7 +71,7 @@ class FeatureExtractor:
             else:
                 pub_date = pub_date.astimezone(timezone.utc)
             days_old = (now - pub_date).days
-            recency_score = 1.0 / (1.0 + days_old / 7.0)  # Articles decay faster (7 days)
+            recency_score = 1.0 / (1.0 + days_old / 30.0)  # Articles decay faster (7 days)
         else:
             recency_score = 0.5
         

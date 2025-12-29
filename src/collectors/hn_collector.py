@@ -3,7 +3,7 @@ Hacker News article collector
 """
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from dataclasses import dataclass
 import logging
@@ -30,21 +30,34 @@ class ArticleData:
 class HNCollector:
     """Fetches articles from Hacker News"""
     
-    def fetch(self, limit: int = 20) -> List[ArticleData]:
+    def fetch(self, limit: int = 30, days: Optional[int] = None) -> List[ArticleData]:
         """Fetch top articles from Hacker News"""
         articles = []
+        cutoff_date = None
+        if days:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
         
         try:
             # Hacker News API
             top_stories_url = "https://hacker-news.firebaseio.com/v0/topstories.json"
             response = requests.get(top_stories_url, timeout=10)
-            story_ids = response.json()[:limit]
+            story_ids = response.json()[:limit * 2]  # Fetch more to account for date filtering
             
             for story_id in story_ids:
                 story_url = f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json"
                 story_data = requests.get(story_url, timeout=10).json()
                 
                 if story_data and story_data.get("type") == "story" and story_data.get("url"):
+                    # Parse published date
+                    published_date = None
+                    if story_data.get("time"):
+                        published_date = datetime.fromtimestamp(story_data.get("time", 0), tz=timezone.utc)
+                    
+                    # Filter by date if specified
+                    if cutoff_date and published_date:
+                        if published_date < cutoff_date:
+                            continue
+                    
                     # Extract content from URL
                     content = self._extract_content(story_data.get("url", ""))
                     
@@ -55,10 +68,13 @@ class HNCollector:
                         url=story_data.get("url", ""),
                         content=content or story_data.get("title", ""),
                         author=story_data.get("by"),
-                        published_date=datetime.fromtimestamp(story_data.get("time", 0)) if story_data.get("time") else None,
+                        published_date=published_date,
                         upvotes=story_data.get("score", 0)
                     )
                     articles.append(article)
+                    
+                    if len(articles) >= limit:
+                        break
                     
         except Exception as e:
             logger.error(f"Error fetching Hacker News articles: {e}")

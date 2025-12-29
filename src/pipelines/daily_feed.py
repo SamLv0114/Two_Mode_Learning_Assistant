@@ -90,17 +90,26 @@ class DailyFeedPipeline:
         
         if "hackernews" in settings.TECH_SOURCES:
             collector = HNCollector()
-            all_articles.extend(collector.fetch())
+            hn_articles = collector.fetch(days=7)
+            logger.info(f"Collected {len(hn_articles)} articles from Hacker News (last 7 days)")
+            all_articles.extend(hn_articles)
         
         if "devto" in settings.TECH_SOURCES:
             collector = DevToCollector()
-            all_articles.extend(collector.fetch())
+            devto_articles = collector.fetch(days=7)
+            logger.info(f"Collected {len(devto_articles)} articles from Dev.to (last 7 days)")
+            all_articles.extend(devto_articles)
         
         if "medium" in settings.TECH_SOURCES:
             collector = MediumCollector()
-            all_articles.extend(collector.fetch())
+            medium_articles = collector.fetch(days=7)
+            logger.info(f"Collected {len(medium_articles)} articles from Medium (last 7 days)")
+            all_articles.extend(medium_articles)
+        
+        logger.info(f"Total articles collected: {len(all_articles)} (from last 7 days)")
         
         # Store in database
+        new_count = 0
         for article_data in all_articles:
             existing = self.db.query(Article).filter(Article.url == article_data.url).first()
             if not existing:
@@ -115,8 +124,10 @@ class DailyFeedPipeline:
                     upvotes=article_data.upvotes
                 )
                 self.db.add(article)
+                new_count += 1
         
         self.db.commit()
+        logger.info(f"Stored {new_count} new articles in database")
         return all_articles
     
     def _filter_candidates(self, items: List, item_type: str) -> List:

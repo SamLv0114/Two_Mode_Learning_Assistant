@@ -4,7 +4,7 @@ Medium article collector
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from dataclasses import dataclass
 import logging
@@ -31,16 +31,29 @@ class ArticleData:
 class MediumCollector:
     """Fetches articles from Medium"""
     
-    def fetch(self, limit: int = 20) -> List[ArticleData]:
+    def fetch(self, limit: int = 30, days: Optional[int] = None) -> List[ArticleData]:
         """Fetch articles from Medium (via RSS)"""
         articles = []
+        cutoff_date = None
+        if days:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
         
         try:
             # Medium RSS feed for ML/AI topics
             feed_url = "https://medium.com/feed/tag/machine-learning"
             feed = feedparser.parse(feed_url)
             
-            for entry in feed.entries[:limit]:
+            for entry in feed.entries[:limit * 2]:  # Fetch more to account for date filtering
+                # Parse published date
+                published_date = None
+                if entry.get("published_parsed"):
+                    published_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                
+                # Filter by date if specified
+                if cutoff_date and published_date:
+                    if published_date < cutoff_date:
+                        continue
+                
                 content = self._extract_content(entry.link)
                 
                 article = ArticleData(
@@ -50,10 +63,13 @@ class MediumCollector:
                     url=entry.link,
                     content=content or entry.get("summary", ""),
                     author=entry.get("author"),
-                    published_date=datetime(*entry.published_parsed[:6]) if entry.get("published_parsed") else None,
+                    published_date=published_date,
                     upvotes=0
                 )
                 articles.append(article)
+                
+                if len(articles) >= limit:
+                    break
                 
         except Exception as e:
             logger.error(f"Error fetching Medium articles: {e}")

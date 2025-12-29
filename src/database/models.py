@@ -4,7 +4,7 @@ Database models for storing papers and articles
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from src.utils.config import settings
 
@@ -27,7 +27,7 @@ class Paper(Base):
     citation_count = Column(Integer, default=0)
     relevance_score = Column(Float, default=0.0)
     personalized_summary = Column(Text, nullable=True)
-    collected_date = Column(DateTime, default=datetime.utcnow)
+    collected_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     recommended = Column(Boolean, default=False)
     recommended_date = Column(DateTime, nullable=True)
     
@@ -51,7 +51,7 @@ class Article(Base):
     engagement_score = Column(Float, default=0.0)
     relevance_score = Column(Float, default=0.0)
     personalized_summary = Column(Text, nullable=True)
-    collected_date = Column(DateTime, default=datetime.utcnow)
+    collected_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     recommended = Column(Boolean, default=False)
     recommended_date = Column(DateTime, nullable=True)
     
@@ -67,7 +67,7 @@ class UserInteraction(Base):
     item_type = Column(String)  # "paper" or "article"
     item_id = Column(Integer)
     interaction_type = Column(String)  # "viewed", "saved", "dismissed"
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     def __repr__(self):
         return f"<UserInteraction(type='{self.interaction_type}', item_id={self.item_id})>"
