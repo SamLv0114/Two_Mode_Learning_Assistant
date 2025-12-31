@@ -17,7 +17,28 @@ class EmbeddingManager:
     
     def __init__(self):
         self.model_name = settings.EMBEDDING_MODEL
-        self.model = SentenceTransformer(self.model_name)
+        try:
+            # Force CPU and local files to avoid meta-tensor/device issues
+            self.model = SentenceTransformer(
+                self.model_name,
+                device="cpu",
+                local_files_only=True,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Local-only load failed for {self.model_name}: {e}. "
+                "Retrying with default settings (may use cache/network)."
+            )
+            try:
+                self.model = SentenceTransformer(self.model_name, device="cpu")
+            except Exception as e2:
+                logger.error(f"Failed to load embedding model {self.model_name}: {e2}")
+                raise RuntimeError(
+                    f"Could not load embedding model '{self.model_name}'. "
+                    "Please ensure the model path is correct, files exist locally, "
+                    "and PyTorch is properly installed. "
+                    f"Original errors: {e} | {e2}"
+                ) from e2
         
         # Initialize ChromaDB
         self.client = chromadb.PersistentClient(

@@ -3,16 +3,23 @@ Streamlit UI for the AI Learning Assistant
 """
 import sys
 from pathlib import Path
+import json
+import time
+
+import streamlit as st
+import streamlit.components.v1 as components
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-import streamlit as st
-from datetime import datetime
 from src.pipelines import DailyFeedPipeline, QAAssistant
 from src.utils.config import settings
+from src.models import ModelTrainer
+from src.models.embeddings import EmbeddingManager
+from src.database.models import SessionLocal
+
 
 st.set_page_config(
     page_title="AI Learning Assistant",
@@ -50,6 +57,38 @@ if "qa_assistant" not in st.session_state:
     except Exception as e:
         st.error(f"Error initializing Q&A assistant: {e}")
         st.stop()
+if "feed_result" not in st.session_state:
+    st.session_state.feed_result = None
+if "trainer" not in st.session_state:
+    db = SessionLocal()
+    embedding_manager = EmbeddingManager()
+    st.session_state.trainer = ModelTrainer(db, embedding_manager)
+
+
+# Helper utilities for consistent interaction tracking
+def open_external_link(url: str):
+    """Open a link in a new tab; includes a timestamp to avoid caching the iframe content."""
+    safe_url = json.dumps(url)
+    components.html(
+        f"<script>window.open({safe_url}, '_blank');</script><div>{int(time.time()*1000)}</div>",
+        height=0,
+        width=0,
+    )
+
+
+def record_latest_interaction(item_type: str, item_id: int, interaction_type: str) -> bool:
+    """
+    Record/update the latest interaction for an item.
+    Returns True if the interaction changed or was newly recorded.
+    """
+    state_key = f"last_interaction_{item_type}_{item_id}"
+    last = st.session_state.get(state_key)
+    if last == interaction_type:
+        return False
+    st.session_state.trainer.record_interaction(item_type, item_id, interaction_type)
+    st.session_state[state_key] = interaction_type
+    return True
+
 
 # Sidebar
 st.sidebar.title("📚 AI Learning Assistant")
@@ -62,42 +101,118 @@ mode = st.sidebar.radio(
 
 # Main content
 if mode == "Daily Feed":
-    st.title("📰 Daily ML Reading Feed")
+    st.title("📪 Daily ML Reading Feed")
     st.markdown("Get personalized ML research recommendations")
     
     if st.button("Generate Daily Feed", type="primary"):
         with st.spinner("Generating your daily feed... This may take a few minutes."):
             result = st.session_state.pipeline.run()
+            st.session_state.feed_result = result  # Store for interaction tracking
             formatted = st.session_state.pipeline.format_for_display(result)
             
             st.success("Daily feed generated!")
             st.markdown("---")
             st.text(formatted)
-            
-            # Display papers
-            if result["papers"]:
-                st.subheader(f"📄 Research Papers ({len(result['papers'])})")
-                for paper in result["papers"]:
-                    with st.expander(f"{paper['rank']}. {paper['title']}"):
-                        st.markdown(f"**arXiv ID:** {paper['arxiv_id']}")
-                        st.markdown(f"**Citations:** {paper['citation_count']}")
-                        st.markdown(f"**Summary:** {paper['summary']}")
-                        st.markdown(f"**Relevance Score:** {paper['relevance_score']:.3f}")
-                        st.markdown(f"[View Paper]({paper['url']})")
-            
-            # Display articles
-            if result["articles"]:
-                st.subheader(f"📰 Tech Articles ({len(result['articles'])})")
-                for article in result["articles"]:
-                    with st.expander(f"{article['rank']}. {article['title']}"):
-                        st.markdown(f"**Source:** {article['source']}")
-                        st.markdown(f"**Upvotes:** {article['upvotes']}")
-                        st.markdown(f"**Summary:** {article['summary']}")
-                        st.markdown(f"**Relevance Score:** {article['relevance_score']:.3f}")
-                        st.markdown(f"[Read Article]({article['url']})")
+    
+    # Display feed results with interaction buttons
+    if st.session_state.feed_result:
+        result = st.session_state.feed_result
+        
+        # Display papers
+        if result["papers"]:
+            st.subheader(f"📓 Research Papers ({len(result['papers'])})")
+            for paper in result["papers"]:
+                with st.expander(f"{paper['rank']}. {paper['title']}"):
+                    st.markdown(f"**arXiv ID:** {paper['arxiv_id']}")
+                    st.markdown(f"**Citations:** {paper['citation_count']}")
+                    st.markdown(f"**Summary:** {paper['summary']}")
+                    st.markdown(f"**Relevance Score:** {paper['relevance_score']:.3f}")
+                
+                if paper.get("db_id"):
+                    col1, col2, col3 = st.columns(3)
+                    view_state_key = f"viewed_paper_{paper['db_id']}"
+                    with col1:
+                        view_button_key = f"view_paper_{paper['db_id']}"
+                        if st.button("📓 View & Open", key=view_button_key):
+                            if record_latest_interaction("paper", paper["db_id"], "viewed"):
+                                st.session_state[view_state_key] = True
+                            open_external_link(paper["url"])
+                        if st.session_state.get(view_state_key):
+                            st.caption("View logged. Reopening won't add another interaction.")
+                    with col2:
+                        if st.button("💾 Save", key=f"save_paper_{paper['db_id']}"):
+                            if record_latest_interaction("paper", paper["db_id"], "saved"):
+                                st.success("Saved! This helps improve recommendations.")
+                            else:
+                                st.info("Already saved. No duplicate interaction recorded.")
+                    with col3:
+                        if st.button("✖ Dismiss", key=f"dismiss_paper_{paper['db_id']}"):
+                            if record_latest_interaction("paper", paper["db_id"], "dismissed"):
+                                st.info("Dismissed. We'll learn from this.")
+                            else:
+                                st.info("Already dismissed. No duplicate interaction recorded.")
+                    
+                    st.markdown(f"[Open in new tab]({paper['url']})")
+                    st.caption("Use the buttons above to log interactions; the link is an untracked fallback.")
+        
+        # Display articles
+        if result["articles"]:
+            st.subheader(f"📰 Tech Articles ({len(result['articles'])})")
+            for article in result["articles"]:
+                with st.expander(f"{article['rank']}. {article['title']}"):
+                    st.markdown(f"**Source:** {article['source']}")
+                    st.markdown(f"**Upvotes:** {article['upvotes']}")
+                    st.markdown(f"**Summary:** {article['summary']}")
+                    st.markdown(f"**Relevance Score:** {article['relevance_score']:.3f}")
+                
+                if article.get("db_id"):
+                    col1, col2, col3 = st.columns(3)
+                    view_state_key = f"viewed_article_{article['db_id']}"
+                    with col1:
+                        view_button_key = f"view_article_{article['db_id']}"
+                        if st.button("📰 Read & Open", key=view_button_key):
+                            if record_latest_interaction("article", article["db_id"], "viewed"):
+                                st.session_state[view_state_key] = True
+                            open_external_link(article["url"])
+                        if st.session_state.get(view_state_key):
+                            st.caption("View logged. Reopening won't add another interaction.")
+                    with col2:
+                        if st.button("💾 Save", key=f"save_article_{article['db_id']}"):
+                            if record_latest_interaction("article", article["db_id"], "saved"):
+                                st.success("Saved! This helps improve recommendations.")
+                            else:
+                                st.info("Already saved. No duplicate interaction recorded.")
+                    with col3:
+                        if st.button("✖ Dismiss", key=f"dismiss_article_{article['db_id']}"):
+                            if record_latest_interaction("article", article["db_id"], "dismissed"):
+                                st.info("Dismissed. We'll learn from this.")
+                            else:
+                                st.info("Already dismissed. No duplicate interaction recorded.")
+                    
+                    st.markdown(f"[Open in new tab]({article['url']})")
+                    st.caption("Use the buttons above to log interactions; the link is an untracked fallback.")
+        
+        # Manual retrain button
+        st.markdown("---")
+        interaction_count = st.session_state.trainer.get_interaction_count()
+        st.markdown(f"**Total Interactions:** {interaction_count}")
+        
+        if interaction_count >= 50:
+            if st.button("🔄 Retrain Model", type="secondary"):
+                with st.spinner("Retraining model with your interactions..."):
+                    success = st.session_state.trainer.retrain_model(
+                        st.session_state.pipeline.recommender, 
+                        min_interactions=50
+                    )
+                    if success:
+                        st.success(f"Model retrained successfully with {interaction_count} interactions!")
+                    else:
+                        st.warning("Not enough interactions to retrain. Need at least 50.")
+        else:
+            st.info(f"Collect {50 - interaction_count} more interactions to enable model retraining.")
 
 elif mode == "Q&A Assistant":
-    st.title("❓ Q&A Assistant")
+    st.title("❓Q&A Assistant")
     st.markdown("Ask questions about your knowledge base")
     
     # Question input
@@ -138,8 +253,16 @@ elif mode == "Q&A Assistant":
 
 # Footer
 st.sidebar.markdown("---")
+st.sidebar.markdown("### Statistics")
+interaction_count = st.session_state.trainer.get_interaction_count()
+st.sidebar.markdown(f"**Interactions:** {interaction_count}")
+if interaction_count >= 50:
+    st.sidebar.success("✅Ready to retrain!")
+else:
+    st.sidebar.info(f"📈 Need {50 - interaction_count} more for retraining")
+
+st.sidebar.markdown("---")
 st.sidebar.markdown("### Configuration")
 st.sidebar.markdown(f"**User Interests:** {', '.join(settings.USER_INTERESTS[:3])}...")
 st.sidebar.markdown(f"**LLM Provider:** {settings.LLM_PROVIDER}")
 st.sidebar.markdown(f"**Model:** {settings.LLM_MODEL}")
-

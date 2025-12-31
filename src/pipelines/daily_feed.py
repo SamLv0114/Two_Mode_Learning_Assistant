@@ -6,7 +6,7 @@ from typing import List, Dict
 import logging
 
 from src.collectors import ArxivCollector, PaperData, HNCollector, MediumCollector, DevToCollector
-from src.models import EmbeddingManager, Recommender, FeatureExtractor
+from src.models import EmbeddingManager, Recommender, FeatureExtractor, ModelTrainer
 from src.rag import Generator
 from src.database.models import Paper, Article, SessionLocal, init_db
 from src.utils.config import settings
@@ -24,6 +24,7 @@ class DailyFeedPipeline:
         self.feature_extractor = FeatureExtractor()
         self.recommender = Recommender()
         self.db = SessionLocal()
+        self.trainer = ModelTrainer(self.db, self.embedding_manager)
         init_db()
     
     def run(self):
@@ -56,6 +57,9 @@ class DailyFeedPipeline:
         # Step 6: Format and return
         logger.info("Step 6: Formatting output...")
         output = self._format_output(top_papers, top_articles)
+        
+        # Note: Interactions are only recorded when user explicitly interacts (Save/Dismiss)
+        # via the Streamlit UI, not automatically when recommendations are generated
         
         logger.info("Daily feed pipeline completed!")
         return output
@@ -265,6 +269,10 @@ class DailyFeedPipeline:
         }
         
         for i, paper in enumerate(papers, 1):
+            # Get database ID for interaction tracking
+            db_paper = self.db.query(Paper).filter(Paper.arxiv_id == paper.arxiv_id).first()
+            db_id = db_paper.id if db_paper else None
+            
             output["papers"].append({
                 "rank": i,
                 "title": paper.title,
@@ -272,10 +280,15 @@ class DailyFeedPipeline:
                 "url": paper.arxiv_url,
                 "citation_count": paper.citation_count,
                 "summary": paper.personalized_summary,
-                "relevance_score": paper.relevance_score
+                "relevance_score": paper.relevance_score,
+                "db_id": db_id  # For interaction tracking
             })
         
         for i, article in enumerate(articles, 1):
+            # Get database ID for interaction tracking
+            db_article = self.db.query(Article).filter(Article.url == article.url).first()
+            db_id = db_article.id if db_article else None
+            
             output["articles"].append({
                 "rank": i,
                 "title": article.title,
@@ -283,7 +296,8 @@ class DailyFeedPipeline:
                 "source": article.source,
                 "upvotes": article.upvotes,
                 "summary": article.personalized_summary,
-                "relevance_score": article.relevance_score
+                "relevance_score": article.relevance_score,
+                "db_id": db_id  # For interaction tracking
             })
         
         return output
