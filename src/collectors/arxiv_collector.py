@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from dataclasses import dataclass
 from src.utils.config import settings
+import requests
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +36,13 @@ class ArxivCollector:
         self.categories = settings.ARXIV_CATEGORIES
         self.max_results = settings.MAX_PAPERS_PER_DAY
     
-    def fetch_recent_papers(self, days: int = 1, max_results: Optional[int] = None) -> List[PaperData]:
+    def fetch_recent_papers(
+        self,
+        days: int = 1,
+        max_results: Optional[int] = None,
+        categories: Optional[List[str]] = None,
+        enrich_citations: bool = False,
+    ) -> List[PaperData]:
         """
         Fetch recent papers from ArXiv
         """
@@ -43,7 +50,8 @@ class ArxivCollector:
         papers = []
         
         # Build query for categories
-        category_query = " OR ".join([f"cat:{cat}" for cat in self.categories])
+        use_categories = categories if categories else self.categories
+        category_query = " OR ".join([f"cat:{cat}" for cat in use_categories])
         
         # Date filter (ArXiv doesn't support date filtering directly, so we fetch and filter)
         search = arxiv.Search(
@@ -59,8 +67,13 @@ class ArxivCollector:
             for result in search.results():
                 # Filter by date
                 if result.published.date() >= cutoff_date.date():
+                    citation_count = 0
+                    paper_id = result.entry_id.split('/')[-1]
+                    if enrich_citations and settings.CITATION_ENRICHMENT_ENABLED:
+                        citation_count = self._fetch_citation_count(paper_id)
+
                     paper = PaperData(
-                        arxiv_id=result.entry_id.split('/')[-1],
+                        arxiv_id=paper_id,
                         title=result.title,
                         authors=[author.name for author in result.authors],
                         abstract=result.summary,
@@ -68,7 +81,7 @@ class ArxivCollector:
                         published_date=result.published,
                         arxiv_url=result.entry_id,
                         pdf_url=result.pdf_url,
-                        citation_count=0  # ArXiv doesn't provide citation count directly
+                        citation_count=citation_count  # Best-effort enrichment (0 if unavailable)
                     )
                     papers.append(paper)
                     
@@ -80,6 +93,25 @@ class ArxivCollector:
         
         logger.info(f"Fetched {len(papers)} papers from ArXiv")
         return papers
+
+    def _fetch_citation_count(self, arxiv_id: str) -> int:
+        """
+        Best-effort citation count from Semantic Scholar. Returns 0 on failure.
+        """
+        try:
+            url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{arxiv_id}?fields=citationCount"
+            headers = {}
+            if settings.SEMANTIC_SCHOLAR_API_KEY:
+                headers["x-api-key"] = settings.SEMANTIC_SCHOLAR_API_KEY
+            resp = requests.get(url, headers=headers, timeout=settings.CITATION_API_TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                return int(data.get("citationCount", 0) or 0)
+            else:
+                logger.debug(f"Citation fetch failed for {arxiv_id}: {resp.status_code}")
+        except Exception as e:
+            logger.debug(f"Citation fetch error for {arxiv_id}: {e}")
+        return 0
     
     def fetch_by_query(self, query: str, max_results: int = 10) -> List[PaperData]:
         """

@@ -43,7 +43,12 @@ class Settings(BaseSettings):
     VECTOR_DB_COLLECTION_NAME: str = "ml_knowledge_base"
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
-    
+
+    # Citation enrichment
+    CITATION_ENRICHMENT_ENABLED: bool = False
+    SEMANTIC_SCHOLAR_API_KEY: Optional[str] = None
+    CITATION_API_TIMEOUT: int = 5  # seconds
+
     # User preferences - read as string from .env, parsed to list
     USER_INTERESTS_STR: Optional[str] = None
     

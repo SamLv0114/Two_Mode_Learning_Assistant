@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import List, Dict
 import logging
 
+from sqlalchemy import exc as sa_exc
+
 from src.collectors import ArxivCollector, PaperData, HNCollector, MediumCollector, DevToCollector
 from src.models import EmbeddingManager, Recommender, FeatureExtractor, ModelTrainer
 from src.rag import Generator
@@ -27,23 +29,47 @@ class DailyFeedPipeline:
         self.trainer = ModelTrainer(self.db, self.embedding_manager)
         init_db()
     
-    def run(self):
+    def run(self, time_window_days: int = 7, focus_areas: List[str] = None):
         logger.info("Starting daily feed pipeline...")
         
+        # Normalize user selections
+        time_window_days = max(1, time_window_days)
+        selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
+        # Scale fetch budgets with time window (simple linear scale, capped)
+        scale = min(time_window_days / 7.0, 52)  # up to ~1 year
+        paper_fetch_limit = int(settings.MAX_PAPERS_PER_DAY * scale)
+        article_fetch_limit = int(30 * scale)  # base 30 per source
+        logger.info(f"Fetch scale factor={scale:.2f}, paper_limit={paper_fetch_limit}, article_limit_per_source={article_fetch_limit}")
+
         # Step 1: Collect new content
         logger.info("Step 1: Collecting new content...")
-        new_papers = self._collect_papers()
-        new_articles = self._collect_articles()
+        new_papers = self._collect_papers(
+            time_window_days,
+            selected_interests,
+            paper_fetch_limit,
+            enrich_citations=settings.CITATION_ENRICHMENT_ENABLED,
+        )
+        new_articles = self._collect_articles(time_window_days, article_fetch_limit)
         
         # Step 2: Filter candidates
         logger.info("Step 2: Filtering candidates...")
-        candidate_papers = self._filter_candidates(new_papers, item_type="paper")
-        candidate_articles = self._filter_candidates(new_articles, item_type="article")
+        candidate_papers = self._filter_candidates(
+            new_papers,
+            item_type="paper",
+            selected_interests=selected_interests,
+            min_threshold=0.25,  # slightly lower than default for broader windows
+        )
+        candidate_articles = self._filter_candidates(
+            new_articles,
+            item_type="article",
+            selected_interests=selected_interests,
+            min_threshold=0.15,  # articles often have shorter content; lower threshold
+        )
         
         # Step 3: Rank items
         logger.info("Step 3: Ranking items...")
-        top_papers = self._rank_and_select(candidate_papers, settings.TOP_PAPERS_COUNT, item_type="paper")
-        top_articles = self._rank_and_select(candidate_articles, settings.TOP_ARTICLES_COUNT, item_type="article")
+        top_papers = self._rank_and_select(candidate_papers, settings.TOP_PAPERS_COUNT, item_type="paper", selected_interests=selected_interests)
+        top_articles = self._rank_and_select(candidate_articles, settings.TOP_ARTICLES_COUNT, item_type="article", selected_interests=selected_interests)
         
         # Step 4: Generate personalized summaries
         logger.info("Step 4: Generating personalized summaries...")
@@ -64,10 +90,35 @@ class DailyFeedPipeline:
         logger.info("Daily feed pipeline completed!")
         return output
     
-    def _collect_papers(self) -> List[PaperData]:
+    def _collect_papers(
+        self,
+        time_window_days: int,
+        selected_interests: List[str],
+        max_results: int,
+        enrich_citations: bool = False,
+    ) -> List[PaperData]:
         """Collect new papers from ArXiv"""
         collector = ArxivCollector()
-        papers = collector.fetch_recent_papers(days=7)
+        # Map focus areas to arXiv categories; fall back to configured categories
+        focus_to_categories = {
+            "NLP": ["cs.CL"],
+            "ML": ["cs.LG"],
+            "AI": ["cs.AI"],
+            "DL": ["cs.LG", "cs.CV", "cs.AI", "cs.NE"],
+            "CV": ["cs.CV"],
+        }
+        categories = []
+        for area in selected_interests:
+            categories.extend(focus_to_categories.get(area, []))
+        # Deduplicate categories; if none matched, use defaults
+        category_override = list(dict.fromkeys(categories)) if categories else None
+
+        papers = collector.fetch_recent_papers(
+            days=time_window_days,
+            categories=category_override,
+            max_results=max_results,
+            enrich_citations=enrich_citations,
+        )
         
         for paper_data in papers:
             existing = self.db.query(Paper).filter(Paper.arxiv_id == paper_data.arxiv_id).first()
@@ -88,26 +139,26 @@ class DailyFeedPipeline:
         self.db.commit()
         return papers
     
-    def _collect_articles(self) -> List:
+    def _collect_articles(self, time_window_days: int, per_source_limit: int) -> List:
         """Collect new articles from tech sources"""
         all_articles = []
         
         if "hackernews" in settings.TECH_SOURCES:
             collector = HNCollector()
-            hn_articles = collector.fetch(days=7)
-            logger.info(f"Collected {len(hn_articles)} articles from Hacker News (last 7 days)")
+            hn_articles = collector.fetch(days=time_window_days, limit=per_source_limit)
+            logger.info(f"Collected {len(hn_articles)} articles from Hacker News (last {time_window_days} days)")
             all_articles.extend(hn_articles)
         
         if "devto" in settings.TECH_SOURCES:
             collector = DevToCollector()
-            devto_articles = collector.fetch(days=7)
-            logger.info(f"Collected {len(devto_articles)} articles from Dev.to (last 7 days)")
+            devto_articles = collector.fetch(days=time_window_days, limit=per_source_limit)
+            logger.info(f"Collected {len(devto_articles)} articles from Dev.to (last {time_window_days} days)")
             all_articles.extend(devto_articles)
         
         if "medium" in settings.TECH_SOURCES:
             collector = MediumCollector()
-            medium_articles = collector.fetch(days=7)
-            logger.info(f"Collected {len(medium_articles)} articles from Medium (last 7 days)")
+            medium_articles = collector.fetch(days=time_window_days, limit=per_source_limit)
+            logger.info(f"Collected {len(medium_articles)} articles from Medium (last {time_window_days} days)")
             all_articles.extend(medium_articles)
         
         logger.info(f"Total articles collected: {len(all_articles)} (from last 7 days)")
@@ -127,17 +178,26 @@ class DailyFeedPipeline:
                     published_date=article_data.published_date,
                     upvotes=article_data.upvotes
                 )
-                self.db.add(article)
-                new_count += 1
+                try:
+                    self.db.add(article)
+                    self.db.flush()  # detect unique violations early
+                    new_count += 1
+                except sa_exc.IntegrityError:
+                    self.db.rollback()
+                    logger.debug(f"Duplicate article skipped (url={article_data.url})")
+                except Exception as e:
+                    self.db.rollback()
+                    logger.error(f"Error saving article {article_data.url}: {e}")
         
         self.db.commit()
         logger.info(f"Stored {new_count} new articles in database")
         return all_articles
     
-    def _filter_candidates(self, items: List, item_type: str) -> List:
+    def _filter_candidates(self, items: List, item_type: str, selected_interests: List[str], min_threshold: float = None) -> List:
         """Filter candidates by similarity threshold"""
         filtered = []
-        interests_text = " ".join(settings.USER_INTERESTS)
+        interests_text = " ".join(selected_interests)
+        threshold = min_threshold if min_threshold is not None else settings.MIN_SIMILARITY_THRESHOLD
         
         # Debug: log user interests
         if items:
@@ -153,19 +213,19 @@ class DailyFeedPipeline:
             similarity = self.embedding_manager.get_similarity_score(interests_text, item_text)
             similarities.append(similarity)
             
-            if similarity >= settings.MIN_SIMILARITY_THRESHOLD:
+            if similarity >= threshold:
                 filtered.append(item)
         
         # Debug: log similarity stats
         if similarities:
             max_sim = max(similarities)
             avg_sim = sum(similarities) / len(similarities)
-            logger.info(f"Similarity stats: max={max_sim:.3f}, avg={avg_sim:.3f}, threshold={settings.MIN_SIMILARITY_THRESHOLD}")
+            logger.info(f"Similarity stats: max={max_sim:.3f}, avg={avg_sim:.3f}, threshold={threshold}")
         
-        logger.info(f"Filtered {len(filtered)}/{len(items)} {item_type}s above threshold")
+        logger.info(f"Filtered {len(filtered)}/{len(items)} {item_type}s above threshold {threshold}")
         return filtered
     
-    def _rank_and_select(self, items: List, top_k: int, item_type: str) -> List:
+    def _rank_and_select(self, items: List, top_k: int, item_type: str, selected_interests: List[str]) -> List:
         """Rank items and select top K"""
         if not items:
             return []
@@ -174,9 +234,9 @@ class DailyFeedPipeline:
         features = []
         for item in items:
             if item_type == "paper":
-                feat = self.feature_extractor.extract_paper_features(item, self.embedding_manager, settings.USER_INTERESTS)
+                feat = self.feature_extractor.extract_paper_features(item, self.embedding_manager, selected_interests)
             else:
-                feat = self.feature_extractor.extract_article_features(item, self.embedding_manager, settings.USER_INTERESTS)
+                feat = self.feature_extractor.extract_article_features(item, self.embedding_manager, selected_interests)
             features.append(feat)
         
         # Rank

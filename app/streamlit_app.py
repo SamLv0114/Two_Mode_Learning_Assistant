@@ -59,6 +59,10 @@ if "qa_assistant" not in st.session_state:
         st.stop()
 if "feed_result" not in st.session_state:
     st.session_state.feed_result = None
+if "time_window_days" not in st.session_state:
+    st.session_state.time_window_days = 7
+if "focus_areas" not in st.session_state:
+    st.session_state.focus_areas = []
 if "trainer" not in st.session_state:
     db = SessionLocal()
     embedding_manager = EmbeddingManager()
@@ -103,10 +107,37 @@ mode = st.sidebar.radio(
 if mode == "Daily Feed":
     st.title("📪 Daily ML Reading Feed")
     st.markdown("Get personalized ML research recommendations")
+
+    # User filters
+    time_window_label = {
+        "1 Day": 1,
+        "1 Week": 7,
+        "1 Month": 30,
+        "1 Year": 365,
+    }
+    selected_window = st.selectbox(
+        "Time window",
+        list(time_window_label.keys()),
+        index=list(time_window_label.keys()).index("1 Week"),
+        help="Limit recommendations to content published within this window.",
+    )
+    st.session_state.time_window_days = time_window_label[selected_window]
+
+    available_areas = ["NLP", "ML", "AI", "DL", "CV"]
+    selected_areas = st.multiselect(
+        "Focus areas (optional)",
+        options=available_areas,
+        default=st.session_state.focus_areas or ["ML", "AI", "DL"],
+        help="Choose one or more areas to prioritize. Leave empty to use default interests.",
+    )
+    st.session_state.focus_areas = selected_areas
     
     if st.button("Generate Daily Feed", type="primary"):
         with st.spinner("Generating your daily feed... This may take a few minutes."):
-            result = st.session_state.pipeline.run()
+            result = st.session_state.pipeline.run(
+                time_window_days=st.session_state.time_window_days,
+                focus_areas=st.session_state.focus_areas,
+            )
             st.session_state.feed_result = result  # Store for interaction tracking
             formatted = st.session_state.pipeline.format_for_display(result)
             
