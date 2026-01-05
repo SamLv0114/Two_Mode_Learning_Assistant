@@ -3,6 +3,8 @@ Feature extraction for ranking models
 """
 from typing import List, Dict
 from datetime import datetime, timezone
+import math
+from src.models.recommender import Recommender
 
 
 class FeatureExtractor:
@@ -20,10 +22,9 @@ class FeatureExtractor:
             # Normalize both datetimes to UTC-aware for comparison
             now = datetime.now(timezone.utc)
             pub_date = paper.published_date
-            # If published_date is naive, assume it's UTC
+            # assume it's UTC
             if pub_date.tzinfo is None:
                 pub_date = pub_date.replace(tzinfo=timezone.utc)
-            # If published_date is aware, convert to UTC
             else:
                 pub_date = pub_date.astimezone(timezone.utc)
             days_old = (now - pub_date).days
@@ -31,9 +32,9 @@ class FeatureExtractor:
         else:
             recency_score = 0.5
         
-        # Citation count (normalized)
-        citation_count = getattr(paper, 'citation_count', 0)
-        citation_score = min(citation_count / 100.0, 1.0)  # Normalize to 0-1
+        # Heuristic impact (use recommender heuristic as the impact/citation proxy)
+        impact_score = Recommender.calculate_impact_score(paper)
+        citation_score = impact_score  # treat heuristic as citation proxy for now
         
         # Category relevance (check if in preferred categories)
         categories = getattr(paper, 'categories', [])
@@ -45,8 +46,9 @@ class FeatureExtractor:
         
         return {
             "similarity": similarity,
-            "recency": recency_score,
-            "citations": citation_score,
+            # "recency": recency_score,
+            # "citations": citation_score,
+            "impact": impact_score,
             "category": category_score,
             "title_length": title_score
         }
@@ -64,10 +66,8 @@ class FeatureExtractor:
             # Normalize both datetimes to UTC-aware for comparison
             now = datetime.now(timezone.utc)
             pub_date = article.published_date
-            # If published_date is naive, assume it's UTC
             if pub_date.tzinfo is None:
                 pub_date = pub_date.replace(tzinfo=timezone.utc)
-            # If published_date is aware, convert to UTC
             else:
                 pub_date = pub_date.astimezone(timezone.utc)
             days_old = (now - pub_date).days
@@ -78,6 +78,7 @@ class FeatureExtractor:
         # Engagement (upvotes, normalized)
         upvotes = getattr(article, 'upvotes', 0)
         engagement_score = min(upvotes / 500.0, 1.0)  # Normalize to 0-1
+        impact_score = engagement_score  # alias for stars scoring
         
         # Source quality (Hacker News typically higher quality)
         source = getattr(article, 'source', '')
@@ -89,8 +90,9 @@ class FeatureExtractor:
         
         return {
             "similarity": similarity,
-            "recency": recency_score,
-            "engagement": engagement_score,
+            # "recency": recency_score,
+            # "engagement": engagement_score,
+            "impact": impact_score,
             "source": source_score,
             "content_length": content_score
         }

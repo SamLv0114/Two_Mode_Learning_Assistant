@@ -1,7 +1,7 @@
 """
 MODE 1: Daily Recommendation Feed Pipeline
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 import logging
 
@@ -24,9 +24,9 @@ class DailyFeedPipeline:
         self.embedding_manager = EmbeddingManager()
         self.generator = Generator()
         self.feature_extractor = FeatureExtractor()
-        self.recommender = Recommender()
+        self.recommender = Recommender()  # Unified: heuristic + ML personalization
         self.db = SessionLocal()
-        self.trainer = ModelTrainer(self.db, self.embedding_manager)
+        self.trainer = ModelTrainer(self.db, self.embedding_manager)  # Learns from your clicks
         init_db()
     
     def run(self, time_window_days: int = 7, focus_areas: List[str] = None):
@@ -35,6 +35,7 @@ class DailyFeedPipeline:
         # Normalize user selections
         time_window_days = max(1, time_window_days)
         selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
+        logger.info("Daily feed mode")
         # Scale fetch budgets with time window (simple linear scale, capped)
         scale = min(time_window_days / 7.0, 52)  # up to ~1 year
         paper_fetch_limit = int(settings.MAX_PAPERS_PER_DAY * scale)
@@ -52,7 +53,7 @@ class DailyFeedPipeline:
         new_articles = self._collect_articles(time_window_days, article_fetch_limit)
         
         # Step 2: Filter candidates
-        logger.info("Step 2: Filtering candidates...")
+        logger.info(f"Step 2: Filtering candidates with interests: {', '.join(selected_interests)}...")
         candidate_papers = self._filter_candidates(
             new_papers,
             item_type="paper",
@@ -66,10 +67,33 @@ class DailyFeedPipeline:
             min_threshold=0.15,  # articles often have shorter content; lower threshold
         )
         
-        # Step 3: Rank items
-        logger.info("Step 3: Ranking items...")
-        top_papers = self._rank_and_select(candidate_papers, settings.TOP_PAPERS_COUNT, item_type="paper", selected_interests=selected_interests)
-        top_articles = self._rank_and_select(candidate_articles, settings.TOP_ARTICLES_COUNT, item_type="article", selected_interests=selected_interests)
+        # Step 3: Rank items (heuristic before training threshold, ML after)
+        logger.info("Step 3: Ranking items using unified signals...")
+        interaction_count = self.trainer.get_interaction_count()
+        use_ml = interaction_count >= 50
+
+        # Optional citation enrichment for shortlist if enabled and we plan to use ML
+        if use_ml and settings.CITATION_ENRICHMENT_ENABLED and candidate_papers:
+            shortlist = candidate_papers[: max(settings.TOP_PAPERS_COUNT * 5, 50)]
+            cita_fetcher = ArxivCollector()
+            for p in shortlist:
+                if p.citation_count is None:
+                    p.citation_count = cita_fetcher._fetch_citation_count(p.arxiv_id)
+
+        top_papers = self._rank_and_select(
+            candidate_papers,
+            settings.TOP_PAPERS_COUNT,
+            item_type="paper",
+            selected_interests=selected_interests,
+            use_ml=use_ml,
+        )
+        top_articles = self._rank_and_select(
+            candidate_articles,
+            settings.TOP_ARTICLES_COUNT,
+            item_type="article",
+            selected_interests=selected_interests,
+            use_ml=use_ml,
+        )
         
         # Step 4: Generate personalized summaries
         logger.info("Step 4: Generating personalized summaries...")
@@ -84,22 +108,45 @@ class DailyFeedPipeline:
         logger.info("Step 6: Formatting output...")
         output = self._format_output(top_papers, top_articles)
         
-        # Note: Interactions are only recorded when user explicitly interacts (Save/Dismiss)
-        # via the Streamlit UI, not automatically when recommendations are generated
+        # Step 7: Check if model should be retrained
+        if use_ml:
+            logger.info(f"Step 7: Retraining model with {interaction_count} interactions...")
+            if self.trainer.retrain_model(self.recommender, min_interactions=50):
+                logger.info("Model retrained successfully! Recommendations will be more personalized.")
+        else:
+            logger.info(f"Step 7: Skipping retrain ({interaction_count}/50 interactions)")
+        
+        # Note: Interactions are recorded when user explicitly clicks Save/View/Dismiss via the Streamlit UI
         
         logger.info("Daily feed pipeline completed!")
         return output
     
-    def _collect_papers(
-        self,
-        time_window_days: int,
-        selected_interests: List[str],
-        max_results: int,
-        enrich_citations: bool = False,
-    ) -> List[PaperData]:
+    def record_interaction(self, item_type: str, item_id: int, interaction_type: str):
+        """
+        Record user interaction (saved/viewed/dismissed)
+        Call this from UI when user clicks buttons
+        
+        Args:
+            item_type: "paper" or "article"
+            item_id: Database ID of the item
+            interaction_type: "saved", "viewed", or "dismissed"
+        """
+        self.trainer.record_interaction(item_type, item_id, interaction_type)
+        logger.info(f"Recorded {interaction_type} for {item_type} {item_id}")
+    
+    def get_interaction_stats(self) -> dict:
+        """Get statistics about collected interactions"""
+        count = self.trainer.get_interaction_count()
+        return {
+            "total_interactions": count,
+            "ready_for_retrain": count >= 50,
+            "interactions_needed": max(0, 50 - count)
+        }
+    
+    def _collect_papers(self, time_window_days: int, selected_interests: List[str], max_results: int, enrich_citations: bool = False,) -> List[PaperData]:
         """Collect new papers from ArXiv"""
         collector = ArxivCollector()
-        # Map focus areas to arXiv categories; fall back to configured categories
+        # Map focus areas to arXiv categories
         focus_to_categories = {
             "NLP": ["cs.CL"],
             "ML": ["cs.LG"],
@@ -117,8 +164,32 @@ class DailyFeedPipeline:
             days=time_window_days,
             categories=category_override,
             max_results=max_results,
-            enrich_citations=enrich_citations,
         )
+
+        # Try to fetch high impact papers in addition to the main feed
+        impact_queries = [
+            "survey OR benchmark OR dataset",
+            "state-of-the-art OR sota",
+        ]
+        for q in impact_queries:
+            try:
+                extra = collector.fetch_by_query(
+                    q,
+                    max_results=max_results // 4,
+                    categories=category_override,
+                )
+                cutoff = datetime.now(timezone.utc) - timedelta(days=time_window_days)
+                for p in extra:
+                    if p.published_date and p.published_date >= cutoff:
+                        papers.append(p)
+            except Exception as e:
+                logger.debug(f"Impact lane fetch failed for query '{q}': {e}")
+
+        # Deduplicate by arxiv_id
+        dedup = {}
+        for p in papers:
+            dedup[p.arxiv_id] = p
+        papers = list(dedup.values())
         
         for paper_data in papers:
             existing = self.db.query(Paper).filter(Paper.arxiv_id == paper_data.arxiv_id).first()
@@ -161,7 +232,7 @@ class DailyFeedPipeline:
             logger.info(f"Collected {len(medium_articles)} articles from Medium (last {time_window_days} days)")
             all_articles.extend(medium_articles)
         
-        logger.info(f"Total articles collected: {len(all_articles)} (from last 7 days)")
+        logger.info(f"Total articles collected: {len(all_articles)} (from last {time_window_days} days)")
         
         # Store in database
         new_count = 0
@@ -198,10 +269,13 @@ class DailyFeedPipeline:
         filtered = []
         interests_text = " ".join(selected_interests)
         threshold = min_threshold if min_threshold is not None else settings.MIN_SIMILARITY_THRESHOLD
+
+        # Diversity prep: simple seen titles set to drop near-duplicates (case-insensitive exact)
+        seen_titles = set()
         
         # Debug: log user interests
         if items:
-            logger.info(f"Filtering {len(items)} {item_type}s with user interests: {', '.join(settings.USER_INTERESTS[:3])}...")
+            logger.info(f"Filtering {len(items)} {item_type}s with user interests: {', '.join(selected_interests)}...")
         
         similarities = []
         for item in items:
@@ -214,6 +288,10 @@ class DailyFeedPipeline:
             similarities.append(similarity)
             
             if similarity >= threshold:
+                title_key = getattr(item, "title", "").strip().lower()
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
                 filtered.append(item)
         
         # Debug: log similarity stats
@@ -225,12 +303,12 @@ class DailyFeedPipeline:
         logger.info(f"Filtered {len(filtered)}/{len(items)} {item_type}s above threshold {threshold}")
         return filtered
     
-    def _rank_and_select(self, items: List, top_k: int, item_type: str, selected_interests: List[str]) -> List:
-        """Rank items and select top K"""
+    def _rank_and_select(self, items: List, top_k: int, item_type: str, selected_interests: List[str], use_ml: bool) -> List:
+        """Rank items using ML Recommender (learns from your interactions)"""
         if not items:
             return []
         
-        # Extract features
+        # Extract features for each item
         features = []
         for item in items:
             if item_type == "paper":
@@ -238,17 +316,28 @@ class DailyFeedPipeline:
             else:
                 feat = self.feature_extractor.extract_article_features(item, self.embedding_manager, selected_interests)
             features.append(feat)
-        
-        # Rank
-        ranked = self.recommender.rank_items(items, features)
-        
+
+        if use_ml:
+            # Use ML recommender
+            ranked = self.recommender.rank_items(items, features)
+        else:
+            # Heuristic-only scoring (pre-training)
+            scored = []
+            for item, feat in zip(items, features):
+                if item_type == "paper":
+                    score = self.recommender.calculate_impact_score(item)
+                else:
+                    score = feat.get("impact", 0.0)
+                scored.append((item, score))
+            ranked = sorted(scored, key=lambda x: x[1], reverse=True)
+
         # Select top K
         top_items = [item for item, score in ranked[:top_k]]
-        
+
         # Store relevance scores
-        for (item, score), top_item in zip(ranked[:top_k], top_items):
-            top_item.relevance_score = score
-        
+        for item, score in ranked[:top_k]:
+            item.relevance_score = score
+
         return top_items
     
     def _generate_summaries(self, items: List, item_type: str) -> List:
@@ -277,6 +366,9 @@ class DailyFeedPipeline:
                 paper.personalized_summary = paper_data.personalized_summary
                 paper.recommended = True
                 paper.recommended_date = datetime.now(timezone.utc)
+                # Update citation count if fetched
+                if paper_data.citation_count is not None:
+                    paper.citation_count = paper_data.citation_count
                 
                 # Add to vector DB if not already there
                 try:
@@ -333,12 +425,18 @@ class DailyFeedPipeline:
             db_paper = self.db.query(Paper).filter(Paper.arxiv_id == paper.arxiv_id).first()
             db_id = db_paper.id if db_paper else None
             
+            # Use citation from paper data or database, default to "—" if unavailable
+            citation_count = paper.citation_count
+            if citation_count is None and db_paper:
+                citation_count = db_paper.citation_count
+            citation_display = citation_count if citation_count is not None else "—"
+            
             output["papers"].append({
                 "rank": i,
                 "title": paper.title,
                 "arxiv_id": paper.arxiv_id,
                 "url": paper.arxiv_url,
-                "citation_count": paper.citation_count,
+                "citation_count": citation_display,
                 "summary": paper.personalized_summary,
                 "relevance_score": paper.relevance_score,
                 "db_id": db_id  # For interaction tracking
@@ -398,4 +496,3 @@ if __name__ == "__main__":
     pipeline = DailyFeedPipeline()
     result = pipeline.run()
     print(pipeline.format_for_display(result))
-

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     
     # API Keys
     OPENAI_API_KEY: Optional[str] = None
+    SEMANTIC_SCHOLAR_API_KEY: Optional[str] = None  #  rate limit from 100 to 5000 req/5min
     
     # LLM Settings
     LLM_PROVIDER: str = "openai"
@@ -44,10 +45,9 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
 
-    # Citation enrichment
+    # Citation enrichment (disabled - using heuristic ranking instead)
     CITATION_ENRICHMENT_ENABLED: bool = False
-    SEMANTIC_SCHOLAR_API_KEY: Optional[str] = None
-    CITATION_API_TIMEOUT: int = 5  # seconds
+    USE_HEURISTIC_RANKING: bool = True  # Use proxy signals instead of real citations
 
     # User preferences - read as string from .env, parsed to list
     USER_INTERESTS_STR: Optional[str] = None

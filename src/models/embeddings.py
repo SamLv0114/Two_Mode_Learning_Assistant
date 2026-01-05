@@ -17,28 +17,7 @@ class EmbeddingManager:
     
     def __init__(self):
         self.model_name = settings.EMBEDDING_MODEL
-        try:
-            # Force CPU and local files to avoid meta-tensor/device issues
-            self.model = SentenceTransformer(
-                self.model_name,
-                device="cpu",
-                local_files_only=True,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Local-only load failed for {self.model_name}: {e}. "
-                "Retrying with default settings (may use cache/network)."
-            )
-            try:
-                self.model = SentenceTransformer(self.model_name, device="cpu")
-            except Exception as e2:
-                logger.error(f"Failed to load embedding model {self.model_name}: {e2}")
-                raise RuntimeError(
-                    f"Could not load embedding model '{self.model_name}'. "
-                    "Please ensure the model path is correct, files exist locally, "
-                    "and PyTorch is properly installed. "
-                    f"Original errors: {e} | {e2}"
-                ) from e2
+        self.model = self._load_model_with_retry()
         
         # Initialize ChromaDB
         self.client = chromadb.PersistentClient(
@@ -51,6 +30,41 @@ class EmbeddingManager:
             name=settings.VECTOR_DB_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"}
         )
+    
+    def _load_model_with_retry(self) -> SentenceTransformer:
+        """Simple model loading with one retry if cache is corrupted"""
+        from pathlib import Path
+        import shutil
+        
+        logger.info(f"Loading model: {self.model_name}")
+        
+        # Try 1: Load from cache
+        try:
+            model = SentenceTransformer(self.model_name, device="cpu", local_files_only=True)
+            logger.info("Model loaded from cache")
+            return model
+        except Exception as e:
+            # If meta tensor error, clear cache and retry
+            if "meta tensor" in str(e).lower():
+                logger.warning("Corrupted cache detected, clearing...")
+                cache_path = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{self.model_name.replace('/', '--')}"
+                if cache_path.exists():
+                    shutil.rmtree(cache_path, ignore_errors=True)
+        
+        # Try 2: Download fresh
+        try:
+            logger.info("Downloading model...")
+            model = SentenceTransformer(self.model_name, device="cpu")
+            logger.info("Model loaded successfully")
+            return model
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load model '{self.model_name}'.\n"
+                f"Fix: Run in PowerShell:\n"
+                # f"  Remove-Item -Recurse -Force \"$env:USERPROFILE\\.cache\\huggingface\"\n"
+                f"Remove-Item -Recurse -Force \"$env:USERPROFILE\.cache\huggingface\" \n"
+                f"Error: {e}"
+            )
     
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for a single text"""
