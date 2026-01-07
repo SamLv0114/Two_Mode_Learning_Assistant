@@ -63,6 +63,8 @@ if "time_window_days" not in st.session_state:
     st.session_state.time_window_days = 7
 if "focus_areas" not in st.session_state:
     st.session_state.focus_areas = []
+if "interest_phrases" not in st.session_state:
+    st.session_state.interest_phrases = []
 if "trainer" not in st.session_state:
     db = SessionLocal()
     embedding_manager = EmbeddingManager()
@@ -131,12 +133,34 @@ if mode == "Daily Feed":
         help="Choose one or more areas to prioritize. Leave empty to use default interests.",
     )
     st.session_state.focus_areas = selected_areas
+
+    st.markdown("**Example interests**")
+    example_interests = [
+        "machine learning and deep learning",
+        "natural language processing and transformers",
+        "computer vision and image recognition",
+        "reinforcement learning and agents",
+    ]
+    selected_examples = st.multiselect(
+        "Select from examples (optional)",
+        options=example_interests,
+        help="Choose any examples that match your interests; you can also add your own below.",
+    )
+
+    custom_interests = st.text_area(
+        "Enter your interests (one per line)",
+        placeholder="e.g.\nmachine learning and deep learning\nnatural language processing and transformers",
+        help="Used to compute semantic similarity; longer, specific phrases work best.",
+    )
+    user_interest_lines = [line.strip() for line in custom_interests.splitlines() if line.strip()]
+    combined_interests = list(dict.fromkeys(selected_examples + user_interest_lines))
+    st.session_state.interest_phrases = combined_interests
     
     if st.button("Generate Daily Feed", type="primary"):
         with st.spinner("Generating your daily feed... This may take a few minutes."):
             result = st.session_state.pipeline.run(
                 time_window_days=st.session_state.time_window_days,
-                focus_areas=st.session_state.focus_areas,
+                focus_areas=st.session_state.interest_phrases or st.session_state.focus_areas,
             )
             st.session_state.feed_result = result  # Store for interaction tracking
             formatted = st.session_state.pipeline.format_for_display(result)

@@ -33,7 +33,8 @@ class Recommender:
     def _load_or_create_model(self):
         """Load existing ML model or create a new one"""
         expected_features = [
-            "similarity", "recency", "impact", "category", "title_length"
+            # remove recency for now
+            "similarity", "impact", "category", "title_length"
         ]
         if self.model_path.exists():
             try:
@@ -62,7 +63,8 @@ class Recommender:
         )
         
         # Feature names (should match FeatureExtractor output)
-        self.feature_names = ["similarity", "recency", "impact", "category", "title_length"]
+        # remove recency for now
+        self.feature_names = ["similarity", "impact", "category", "title_length"]
         
         # Train on dummy data to initialize
         X_dummy = np.random.rand(100, len(self.feature_names))
@@ -243,8 +245,7 @@ class Recommender:
     @staticmethod
     def explain_score(paper) -> str:
         """
-        Generate human-readable explanation of heuristic score
-        Useful for debugging and understanding why papers rank high/low
+        Generate human-readable explanation of heuristic score for debugging
         """
         lines = []
         lines.append(f"Paper: {getattr(paper, 'title', 'Unknown')[:60]}...")

@@ -102,7 +102,8 @@ class ModelTrainer:
 
         # Process papers
         # Use recommender's feature names for papers
-        paper_feature_names = ["similarity", "recency", "citations", "category", "title_length"]
+        # remove recency for now
+        paper_feature_names = ["similarity", "citations", "category", "title_length"]
         for paper in recommended_papers:
             features = self.feature_extractor.extract_paper_features(
                 paper, self.embedding_manager, settings.USER_INTERESTS
@@ -137,7 +138,7 @@ class ModelTrainer:
         # Process articles
         # Note: Articles have different features, but we'll map them to paper features for now
         # will considereparate models or unified features in future
-        article_feature_names = ["similarity", "recency", "engagement", "source", "content_length"]
+        article_feature_names = ["similarity", "engagement", "source", "content_length"]
         for article in recommended_articles:
             features = self.feature_extractor.extract_article_features(
                 article, self.embedding_manager, settings.USER_INTERESTS

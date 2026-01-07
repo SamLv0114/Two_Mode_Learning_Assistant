@@ -72,14 +72,6 @@ class DailyFeedPipeline:
         interaction_count = self.trainer.get_interaction_count()
         use_ml = interaction_count >= 50
 
-        # Optional citation enrichment for shortlist if enabled and we plan to use ML
-        if use_ml and settings.CITATION_ENRICHMENT_ENABLED and candidate_papers:
-            shortlist = candidate_papers[: max(settings.TOP_PAPERS_COUNT * 5, 50)]
-            cita_fetcher = ArxivCollector()
-            for p in shortlist:
-                if p.citation_count is None:
-                    p.citation_count = cita_fetcher._fetch_citation_count(p.arxiv_id)
-
         top_papers = self._rank_and_select(
             candidate_papers,
             settings.TOP_PAPERS_COUNT,
@@ -157,7 +149,8 @@ class DailyFeedPipeline:
         categories = []
         for area in selected_interests:
             categories.extend(focus_to_categories.get(area, []))
-        # Deduplicate categories; if none matched, use defaults
+        # Deduplicate categories
+        # if none matched, use defaults
         category_override = list(dict.fromkeys(categories)) if categories else None
 
         papers = collector.fetch_recent_papers(
