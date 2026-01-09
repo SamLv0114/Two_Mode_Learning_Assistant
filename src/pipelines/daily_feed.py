@@ -44,21 +44,38 @@ class DailyFeedPipeline:
 
         # Step 1: Collect new content
         logger.info("Step 1: Collecting new content...")
+        # Use time-slice bucketing to ensure coverage across the time window
+        # This divides the time window into equal slices and samples from each
+        use_time_slices = True
         new_papers = self._collect_papers(
             time_window_days,
             selected_interests,
             paper_fetch_limit,
             enrich_citations=settings.CITATION_ENRICHMENT_ENABLED,
+            use_time_slices=use_time_slices,
         )
         new_articles = self._collect_articles(time_window_days, article_fetch_limit)
         
-        # Step 2: Filter candidates
+        # Step 2: Filter candidates with quality hard filter
         logger.info(f"Step 2: Filtering candidates with interests: {', '.join(selected_interests)}...")
+        # Calculate min papers per slice for auto-relaxation
+        # Divide time window into slices (same logic as collection)
+        if time_window_days >= 365:
+            num_slices = 12
+        elif time_window_days >= 30:
+            num_slices = 4
+        elif time_window_days >= 7:
+            num_slices = 7
+        else:
+            num_slices = time_window_days
+        min_papers_per_slice = max(5, settings.TOP_PAPERS_COUNT // num_slices)
+        
         candidate_papers = self._filter_candidates(
             new_papers,
             item_type="paper",
             selected_interests=selected_interests,
             min_threshold=0.25,  # slightly lower than default for broader windows
+            min_papers_per_slice=min_papers_per_slice,
         )
         candidate_articles = self._filter_candidates(
             new_articles,
@@ -71,7 +88,16 @@ class DailyFeedPipeline:
         logger.info("Step 3: Ranking items using unified signals...")
         interaction_count = self.trainer.get_interaction_count()
         use_ml = interaction_count >= 50
-
+                # Calculate heuristic impact scores for all papers
+        if candidate_papers:
+            logger.info(f"Computing heuristic scores for {len(candidate_papers)} papers...")
+            for paper in candidate_papers:
+                # Calculate impact using proxy signals (part of unified Ranker)
+                impact_score = self.recommender.calculate_impact_score(paper)
+                # Store as citation_count equivalent for ranking
+                # Max heuristic score is 1.0, scale to ~1000
+                paper.citation_count = int(impact_score * 1000)
+            logger.info("Heuristic scoring complete (no API calls needed)")
         top_papers = self._rank_and_select(
             candidate_papers,
             settings.TOP_PAPERS_COUNT,
@@ -135,7 +161,7 @@ class DailyFeedPipeline:
             "interactions_needed": max(0, 50 - count)
         }
     
-    def _collect_papers(self, time_window_days: int, selected_interests: List[str], max_results: int, enrich_citations: bool = False,) -> List[PaperData]:
+    def _collect_papers(self, time_window_days: int, selected_interests: List[str], max_results: int, enrich_citations: bool = False, use_time_slices: bool = True,) -> List[PaperData]:
         """Collect new papers from ArXiv"""
         collector = ArxivCollector()
         # Map focus areas to arXiv categories
@@ -153,11 +179,32 @@ class DailyFeedPipeline:
         # if none matched, use defaults
         category_override = list(dict.fromkeys(categories)) if categories else None
 
-        papers = collector.fetch_recent_papers(
-            days=time_window_days,
-            categories=category_override,
-            max_results=max_results,
-        )
+        # Use time-slice bucketing to ensure balanced sampling across time window
+        if use_time_slices:
+            # Calculate number of slices and candidates per slice
+            if time_window_days >= 365:
+                num_slices = 12  # Monthly slices for 1 year
+            elif time_window_days >= 30:
+                num_slices = 4  # Weekly slices for 1 month
+            elif time_window_days >= 7:
+                num_slices = 7  # Daily slices for 1 week
+            else:
+                num_slices = time_window_days  # Daily slices for < 7 days
+            
+            candidates_per_slice = min(500, max(200, max_results // num_slices))
+            logger.info(f"Using time-slice bucketing: {num_slices} slices, ~{candidates_per_slice} candidates/slice")
+            papers = collector.fetch_by_time_slices(
+                days=time_window_days,
+                num_slices=num_slices,
+                candidates_per_slice=candidates_per_slice,
+                categories=category_override,
+            )
+        else:
+            papers = collector.fetch_recent_papers(
+                days=time_window_days,
+                categories=category_override,
+                max_results=max_results,
+            )
 
         # Try to fetch high impact papers in addition to the main feed
         impact_queries = [
@@ -257,26 +304,145 @@ class DailyFeedPipeline:
         logger.info(f"Stored {new_count} new articles in database")
         return all_articles
     
-    def _filter_candidates(self, items: List, item_type: str, selected_interests: List[str], min_threshold: float = None) -> List:
-        """Filter candidates by similarity threshold"""
+    
+    def _filter_candidates(
+        self, 
+        items: List, 
+        item_type: str, 
+        selected_interests: List[str], 
+        min_threshold: float = None,
+        min_papers_per_slice: int = 10,  # Minimum papers we want per time slice
+    ) -> List:
+        """
+        Filter candidates with quality hard filter for papers:
+        (relevance >= r_min) AND ((impact_score >= i_min) OR has_doi/journal_ref)
+        
+        For articles, uses simple relevance threshold.
+        Auto-relaxes thresholds if not enough papers pass.
+        """
+        if item_type == "paper":
+            return self._filter_papers_with_quality(
+                items, selected_interests, min_threshold, min_papers_per_slice
+            )
+        else:
+            return self._filter_articles(items, selected_interests, min_threshold)
+    
+    def _filter_papers_with_quality(
+        self,
+        papers: List,
+        selected_interests: List[str],
+        r_min: float = None,
+        min_papers_target: int = 10,
+    ) -> List:
+        """
+        Quality hard filter for papers:
+        (relevance >= r_min) AND ((impact_score >= i_min) OR has_doi/journal_ref)
+        
+        Auto-relaxes thresholds if not enough papers pass.
+        """
+        if not papers:
+            return []
+        
+        interests_text = " ".join(selected_interests)
+        r_threshold = r_min if r_min is not None else settings.MIN_SIMILARITY_THRESHOLD
+        i_min = 0.3  # Minimum impact score threshold
+        
+        # Step 1: Calculate relevance and impact scores for all papers
+        paper_data = []
+        seen_titles = set()
+        
+        for paper in papers:
+            title_key = getattr(paper, "title", "").strip().lower()
+            if title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
+            
+            # Calculate relevance
+            paper_text = f"{paper.title} {paper.abstract}"
+            relevance = self.embedding_manager.get_similarity_score(interests_text, paper_text)
+            
+            # Calculate impact score (heuristic)
+            impact_score = self.recommender.calculate_impact_score(paper)
+            
+            # Check for DOI/journal_ref
+            has_venue_metadata = bool(getattr(paper, 'doi', None) or getattr(paper, 'journal_ref', None))
+            
+            paper_data.append({
+                'paper': paper,
+                'relevance': relevance,
+                'impact_score': impact_score,
+                'has_venue_metadata': has_venue_metadata,
+            })
+        
+        # Step 2: Apply quality hard filter
+        # quality_pass = (impact_score >= i_min) OR has_venue_metadata
+        # Keep if: (relevance >= r_threshold) AND quality_pass
+        filtered = []
+        for data in paper_data:
+            quality_pass = (data['impact_score'] >= i_min) or data['has_venue_metadata']
+            relevance_pass = data['relevance'] >= r_threshold
+            
+            if relevance_pass and quality_pass:
+                filtered.append(data['paper'])
+        
+        logger.info(f"Initial filter: {len(filtered)}/{len(paper_data)} papers passed quality hard filter")
+        
+        # Step 3: Auto-relax if not enough papers
+        if len(filtered) < min_papers_target and len(paper_data) > 0:
+            logger.info(f"Only {len(filtered)} papers passed. Auto-relaxing thresholds...")
+            
+            # Strategy 1: Take top X% by relevance
+            # Sort by relevance descending
+            paper_data.sort(key=lambda x: x['relevance'], reverse=True)
+            top_pct = 0.3  # Top 30% by relevance
+            top_count = max(min_papers_target, int(len(paper_data) * top_pct))
+            
+            filtered = []
+            for data in paper_data[:top_count]:
+                quality_pass = (data['impact_score'] >= i_min * 0.7) or data['has_venue_metadata']  # Lower i_min slightly
+                if quality_pass:
+                    filtered.append(data['paper'])
+            
+            # Strategy 2: If still not enough, lower i_min further
+            if len(filtered) < min_papers_target:
+                logger.info(f"Still only {len(filtered)} papers. Lowering impact threshold...")
+                filtered = []
+                relaxed_i_min = i_min * 0.5  # Much lower threshold
+                for data in paper_data[:top_count]:
+                    quality_pass = (data['impact_score'] >= relaxed_i_min) or data['has_venue_metadata']
+                    if quality_pass:
+                        filtered.append(data['paper'])
+            
+            # Strategy 3: If still not enough, just take top by relevance (no quality filter)
+            if len(filtered) < min_papers_target:
+                logger.info(f"Taking top {min_papers_target} by relevance (quality filter disabled)")
+                filtered = [data['paper'] for data in paper_data[:min_papers_target]]
+            
+            logger.info(f"After relaxation: {len(filtered)} papers selected")
+        
+        # Log stats
+        if paper_data:
+            relevances = [d['relevance'] for d in paper_data]
+            impacts = [d['impact_score'] for d in paper_data]
+            logger.info(f"Stats - Relevance: max={max(relevances):.3f}, avg={sum(relevances)/len(relevances):.3f}")
+            logger.info(f"Stats - Impact: max={max(impacts):.3f}, avg={sum(impacts)/len(impacts):.3f}")
+            venue_metadata_count = sum(1 for d in paper_data if d['has_venue_metadata'])
+            logger.info(f"Papers with DOI/journal_ref: {venue_metadata_count}/{len(paper_data)}")
+        
+        return filtered
+    
+    def _filter_articles(self, articles: List, selected_interests: List[str], min_threshold: float = None) -> List:
+        """Simple relevance filter for articles"""
+        
         filtered = []
         interests_text = " ".join(selected_interests)
         threshold = min_threshold if min_threshold is not None else settings.MIN_SIMILARITY_THRESHOLD
 
-        # Diversity prep: simple seen titles set to drop near-duplicates (case-insensitive exact)
+        # simple seen titles set to drop near-duplicates (case-insensitive exact)
         seen_titles = set()
-        
-        # Debug: log user interests
-        if items:
-            logger.info(f"Filtering {len(items)} {item_type}s with user interests: {', '.join(selected_interests)}...")
-        
         similarities = []
-        for item in items:
-            if item_type == "paper":
-                item_text = f"{item.title} {item.abstract}"
-            else:
-                item_text = f"{item.title} {item.content if hasattr(item, 'content') else ''}"
-            
+        for item in articles:
+            item_text = f"{item.title} {item.content if hasattr(item, 'content') else ''}"
             similarity = self.embedding_manager.get_similarity_score(interests_text, item_text)
             similarities.append(similarity)
             
@@ -287,13 +453,12 @@ class DailyFeedPipeline:
                 seen_titles.add(title_key)
                 filtered.append(item)
         
-        # Debug: log similarity stats
         if similarities:
             max_sim = max(similarities)
             avg_sim = sum(similarities) / len(similarities)
-            logger.info(f"Similarity stats: max={max_sim:.3f}, avg={avg_sim:.3f}, threshold={threshold}")
+            logger.info(f"Article similarity stats: max={max_sim:.3f}, avg={avg_sim:.3f}, threshold={threshold}")
         
-        logger.info(f"Filtered {len(filtered)}/{len(items)} {item_type}s above threshold {threshold}")
+        logger.info(f"Filtered {len(filtered)}/{len(articles)} articles above threshold {threshold}")
         return filtered
     
     def _rank_and_select(self, items: List, top_k: int, item_type: str, selected_interests: List[str], use_ml: bool) -> List:
