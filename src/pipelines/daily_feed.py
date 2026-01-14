@@ -206,24 +206,24 @@ class DailyFeedPipeline:
                 max_results=max_results,
             )
 
-        # Try to fetch high impact papers in addition to the main feed
-        impact_queries = [
-            "survey OR benchmark OR dataset",
-            "state-of-the-art OR sota",
-        ]
-        for q in impact_queries:
-            try:
-                extra = collector.fetch_by_query(
-                    q,
-                    max_results=max_results // 4,
-                    categories=category_override,
-                )
-                cutoff = datetime.now(timezone.utc) - timedelta(days=time_window_days)
-                for p in extra:
-                    if p.published_date and p.published_date >= cutoff:
-                        papers.append(p)
-            except Exception as e:
-                logger.debug(f"Impact lane fetch failed for query '{q}': {e}")
+        # # Try to fetch high impact papers in addition to the main feed
+        # impact_queries = [
+        #     "survey OR benchmark OR dataset",
+        #     "state-of-the-art OR sota",
+        # ]
+        # for q in impact_queries:
+        #     try:
+        #         extra = collector.fetch_by_query(
+        #             q,
+        #             max_results=max_results // 4,
+        #             categories=category_override,
+        #         )
+        #         cutoff = datetime.now(timezone.utc) - timedelta(days=time_window_days)
+        #         for p in extra:
+        #             if p.published_date and p.published_date >= cutoff:
+        #                 papers.append(p)
+        #     except Exception as e:
+        #         logger.debug(f"Impact lane fetch failed for query '{q}': {e}")
 
         # Deduplicate by arxiv_id
         dedup = {}

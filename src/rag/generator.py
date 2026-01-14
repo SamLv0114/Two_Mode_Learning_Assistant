@@ -80,6 +80,12 @@ Answer:"""
                     "url": metadata.get("url", ""),
                     "source": metadata.get("source", "")
                 })
+            elif metadata.get("type") == "user_doc":
+                citations.append({
+                    "type": "user_doc",
+                    "title": metadata.get("title", "User document"),
+                    "source": metadata.get("source", "")
+                })
         
         return {
             "answer": answer,

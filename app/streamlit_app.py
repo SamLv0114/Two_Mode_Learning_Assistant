@@ -16,6 +16,7 @@ if str(project_root) not in sys.path:
 
 from src.pipelines import DailyFeedPipeline, QAAssistant
 from src.utils.config import settings
+from src.utils.preprocessing import extract_text_from_pdf
 from src.models import ModelTrainer
 from src.models.embeddings import EmbeddingManager
 from src.database.models import SessionLocal
@@ -269,6 +270,34 @@ if mode == "Daily Feed":
 elif mode == "Q&A Assistant":
     st.title("❓Q&A Assistant")
     st.markdown("Ask questions about your knowledge base")
+
+    st.subheader("Upload study materials")
+    uploaded_files = st.file_uploader(
+        "Upload .txt, .md, or .pdf files",
+        type=["txt", "md", "pdf"],
+        accept_multiple_files=True
+    )
+    if st.button("Add to Knowledge Base", key="upload_docs"):
+        if not uploaded_files:
+            st.warning("Please upload at least one .txt or .md file.")
+        else:
+            total_chunks = 0
+            for uploaded_file in uploaded_files:
+                try:
+                    if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
+                        content = extract_text_from_pdf(uploaded_file.getvalue())
+                    else:
+                        cotent = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+                except Exception as e:
+                    st.warning(f"Failed to read {uploaded_file.name}: {e}")
+                    content = ""
+                result = st.session_state.qa_assistant.add_user_document(
+                    title=uploaded_file.name,
+                    content=content,
+                    source=uploaded_file.name
+                )
+                total_chunks += result.get("chunks", 0)
+            st.success(f"Added {total_chunks} chunks from {len(uploaded_files)} file(s).")
     
     # Question input
     question = st.text_input(
@@ -277,12 +306,14 @@ elif mode == "Q&A Assistant":
     )
     
     n_context = st.slider("Number of context documents", 3, 10, 5)
+    use_uploads_only = st.checkbox("Use only my uploaded documents", value=False)
     
     if st.button("Ask Question", type="primary") and question:
         with st.spinner("Searching knowledge base and generating answer..."):
             result = st.session_state.qa_assistant.answer_question(
                 question=question,
-                n_context=n_context
+                n_context=n_context,
+                filter_type="user_doc" if use_uploads_only else None
             )
         
         st.success("Answer generated!")
@@ -301,10 +332,13 @@ elif mode == "Q&A Assistant":
                         st.markdown(f"**Type:** Research Paper")
                         st.markdown(f"**arXiv ID:** {citation.get('arxiv_id', 'N/A')}")
                         st.markdown(f"[View Paper]({citation.get('url', '#')})")
-                    else:
+                    elif citation['type'] == 'article':
                         st.markdown(f"**Type:** Article")
                         st.markdown(f"**Source:** {citation.get('source', 'N/A')}")
                         st.markdown(f"[Read Article]({citation.get('url', '#')})")
+                    else:
+                        st.markdown("**Type:** User Document")
+                        st.markdown(f"**Source:** {citation.get('source', 'N/A')}")
 
 # Footer
 st.sidebar.markdown("---")

@@ -1,8 +1,9 @@
 """
 MODE 2: Q&A Assistant with RAG
 """
-from typing import Dict
+from typing import Dict, Optional
 import logging
+from uuid import uuid4
 
 from src.rag import Retriever, Generator
 from src.utils.config import settings
@@ -18,13 +19,14 @@ class QAAssistant:
         self.retriever = Retriever()
         self.generator = Generator()
     
-    def answer_question(self, question: str, n_context: int = 5) -> Dict:
+    def answer_question(self, question: str, n_context: int = 5, filter_type: Optional[str] = None) -> Dict:
         """
         Answer a question using RAG
         
         Args:
             question: User's question
             n_context: Number of relevant documents to retrieve
+            filter_type: Optional filter by "paper", "article", or "user_doc"
             
         Returns:
             Dict with 'answer' and 'citations'
@@ -33,7 +35,11 @@ class QAAssistant:
         
         # Step 1: Retrieve relevant context
         logger.info("Step 1: Retrieving relevant context...")
-        context = self.retriever.retrieve(question, n_results=n_context)
+        context = self.retriever.retrieve(
+            question,
+            n_results=n_context,
+            filter_type=filter_type
+        )
         
         if not context:
             return {
@@ -51,6 +57,20 @@ class QAAssistant:
         
         logger.info("Answer generated successfully")
         return result
+
+    def add_user_document(self, title: str, content: str, source: str = "") -> Dict:
+        """
+        Add a user document to the vector database.
+        """
+        doc_id = uuid4().hex
+        chunk_count = self.retriever.embedding_manager.add_user_document(
+            doc_id=doc_id,
+            title=title,
+            content=content,
+            metadata={"source": source}
+        )
+        return {"doc_id": doc_id, "chunks": chunk_count}
+
     
     def format_answer(self, result: Dict) -> str:
         """Format answer for display"""
@@ -69,10 +89,13 @@ class QAAssistant:
                     lines.append(f"\n{i}. Paper: {citation['title']}")
                     lines.append(f"   arXiv: {citation.get('arxiv_id', 'N/A')}")
                     lines.append(f"   URL: {citation.get('url', 'N/A')}")
-                else:
+                elif citation['type'] == 'article':
                     lines.append(f"\n{i}. Article: {citation['title']}")
                     lines.append(f"   Source: {citation.get('source', 'N/A')}")
                     lines.append(f"   URL: {citation.get('url', 'N/A')}")
+                else:
+                    lines.append(f"\n{i}. User Document: {citation['title']}")
+                    lines.append(f"   Source: {citation.get('source', 'N/A')}")
         
         return "\n".join(lines)
     

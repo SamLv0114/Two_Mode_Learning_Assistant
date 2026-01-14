@@ -6,24 +6,36 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Optional
 from src.utils.config import settings
+from src.utils.preprocessing import clean_text, chunk_text
 import logging
+import threading
+from pathlib import Path
+import shutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class EmbeddingManager:
-    """Manages embeddings and vector database"""
+    """Manages embeddings and vector database
+    
+    Thread-safe singleton pattern: model is loaded once and shared across instances.
+    """
+    
+    # Class-level shared model instance and lock
+    _model_instance = None
+    _model_lock = threading.Lock()
+    _client_instance = None
+    _client_lock = threading.Lock()
+    _cache_lock = threading.Lock()  # Lock for cache operations
     
     def __init__(self):
         self.model_name = settings.EMBEDDING_MODEL
-        self.model = self._load_model_with_retry()
+        # Use shared model instance (thread-safe loading)
+        self.model = self._get_or_load_model()
         
-        # Initialize ChromaDB
-        self.client = chromadb.PersistentClient(
-            path=str(settings.VECTOR_DB_DIR),
-            settings=Settings(anonymized_telemetry=False)
-        )
+        # Initialize ChromaDB (shared client to avoid multiple connections)
+        self.client = self._get_or_create_client()
         
         # Get or create collection
         self.collection = self.client.get_or_create_collection(
@@ -31,41 +43,71 @@ class EmbeddingManager:
             metadata={"hnsw:space": "cosine"}
         )
     
-    def _load_model_with_retry(self) -> SentenceTransformer:
-        """Simple model loading with one retry if cache is corrupted"""
-        from pathlib import Path
-        import shutil
+    @classmethod
+    def _get_or_load_model(cls) -> SentenceTransformer:
+        """Thread-safe model loading - ensures only one instance loads at a time"""
+        # Double-checked locking pattern
+        if cls._model_instance is not None:
+            return cls._model_instance
         
-        logger.info(f"Loading model: {self.model_name}")
-        
-        # Try 1: Load from cache
-        try:
-            model = SentenceTransformer(self.model_name, device="cpu", local_files_only=True)
-            logger.info("Model loaded from cache")
-            return model
-        except Exception as e:
-            # If meta tensor error, clear cache and retry
-            if "meta tensor" in str(e).lower():
-                logger.warning("Corrupted cache detected, clearing...")
-                cache_path = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{self.model_name.replace('/', '--')}"
-                if cache_path.exists():
-                    shutil.rmtree(cache_path, ignore_errors=True)
-        
-        # Try 2: Download fresh
-        try:
-            logger.info("Downloading model...")
-            model = SentenceTransformer(self.model_name, device="cpu")
-            logger.info("Model loaded successfully")
-            return model
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load model '{self.model_name}'.\n"
-                f"Fix: Run in PowerShell:\n"
-                # f"  Remove-Item -Recurse -Force \"$env:USERPROFILE\\.cache\\huggingface\"\n"
-                f"Remove-Item -Recurse -Force \"$env:USERPROFILE\.cache\huggingface\" \n"
-                f"Error: {e}"
-            )
+        with cls._model_lock:
+            # Check again inside lock (another thread might have loaded it)
+            if cls._model_instance is not None:
+                return cls._model_instance
+            
+            logger.info(f"Loading model: {settings.EMBEDDING_MODEL} (first initialization)")
+            cls._model_instance = cls._load_model_with_retry_impl(settings.EMBEDDING_MODEL)
+            return cls._model_instance
     
+    @classmethod
+    def _get_or_create_client(cls):
+        """Thread-safe ChromaDB client creation"""
+        if cls._client_instance is not None:
+            return cls._client_instance
+        
+        with cls._client_lock:
+            if cls._client_instance is not None:
+                return cls._client_instance
+            
+            logger.info("Initializing ChromaDB client (first initialization)")
+            cls._client_instance = chromadb.PersistentClient(
+                path=str(settings.VECTOR_DB_DIR),
+                settings=Settings(anonymized_telemetry=False)
+            )
+            return cls._client_instance
+    
+    @staticmethod
+    def _load_model_with_retry_impl(model_name: str) -> SentenceTransformer:
+        """Internal implementation of model loading (called within lock)"""
+        # 1) Try local cache first (fast path)
+        try:
+            model = SentenceTransformer(model_name, device="cpu", local_files_only=True)
+            logger.info("Model loaded from local cache")
+            return model
+        except Exception as e:
+            msg = str(e).lower()
+            logger.warning(f"Local cache load failed: {e}")
+
+            # If it's the meta tensor / partial-cache kind of error, clear model cache
+            # Use lock to prevent multiple instances from clearing cache simultaneously
+            if "meta tensor" in msg or "cannot copy out of meta tensor" in msg:
+                logger.warning("Meta-tensor / corrupted cache detected. Clearing model snapshot cache...")
+                cache_path = (
+                    Path.home() / ".cache" / "huggingface" / "hub" /
+                    f"models--{model_name.replace('/', '--')}"
+                )
+                # Lock cache clearing to prevent race conditions
+                with EmbeddingManager._cache_lock:
+                    if cache_path.exists():
+                        shutil.rmtree(cache_path, ignore_errors=True)
+
+            # 2) Re-download clean copy (slow path)
+            logger.info("Downloading model from Hugging Face...")
+            model = SentenceTransformer(model_name, device="cpu")  # allow download
+            logger.info("Model loaded successfully after download")
+            return model
+
+
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for a single text"""
         return self.model.encode(text, show_progress_bar=False).tolist()
@@ -159,6 +201,49 @@ class EmbeddingManager:
             )
         except Exception as e:
             logger.debug(f"Error adding article {article_id}: {e}")
+
+    def add_user_document(self, doc_id: str, title: str, content: str, metadata: Dict) -> int:
+        """
+        Add a user-uploaded document to the vector database as chunked entries.
+
+        Returns:
+            Number of chunks added
+        """
+        clean_content = clean_text(content)
+        if not clean_content:
+            return 0
+
+        chunks = chunk_text(
+            clean_content,
+            chunk_size=settings.CHUNK_SIZE,
+            overlap=settings.CHUNK_OVERLAP,
+        )
+        if not chunks:
+            return 0
+
+        embeddings = self.generate_embeddings(chunks)
+        ids = [f"userdoc_{doc_id}_{i}" for i in range(len(chunks))]
+        metadatas = [{
+            **metadata,
+            "type": "user_doc",
+            "doc_id": doc_id,
+            "title": title,
+            "chunk_index": i,
+        } for i in range(len(chunks))]
+
+        try:
+            self.collection.add(
+                embeddings=embeddings,
+                documents=chunks,
+                metadatas=metadatas,
+                ids=ids
+            )
+        except Exception as e:
+            logger.debug(f"Error adding user document {doc_id}: {e}")
+            return 0
+
+        return len(chunks)
+
     
     def search(self, query: str, n_results: int = 10, filter_type: Optional[str] = None) -> List[Dict]:
         """
