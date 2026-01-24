@@ -180,7 +180,10 @@ if mode == "Daily Feed":
             for paper in result["papers"]:
                 with st.expander(f"{paper['rank']}. {paper['title']}"):
                     st.markdown(f"**arXiv ID:** {paper['arxiv_id']}")
-                    st.markdown(f"**Citations:** {paper['citation_count']}")
+                    if paper.get("citation_count"):
+                        st.markdown(f"**Citations:** {paper['citation_count']}")
+                    elif paper.get("impact_score"):
+                        st.markdown(f"**Impact score:** {paper['impact_score']}")
                     st.markdown(f"**Summary:** {paper['summary']}")
                     st.markdown(f"**Relevance Score:** {paper['relevance_score']:.3f}")
                 

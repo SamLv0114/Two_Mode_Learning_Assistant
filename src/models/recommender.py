@@ -12,6 +12,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+try:
+    import lightgbm as lgb
+except Exception:
+    lgb = None
 
 class Recommender:
     """
@@ -24,6 +28,7 @@ class Recommender:
         self.model_path = settings.MODELS_DIR / "ranker_model.pkl"
         self.model = None
         self.feature_names = None
+        self.model_type = None
         self._load_or_create_model()
     
     # ============================================================================
@@ -33,20 +38,66 @@ class Recommender:
     def _load_or_create_model(self):
         """Load existing ML model or create a new one"""
         expected_features = [
-            # remove recency for now
-            "similarity", "impact", "category", "title_length"
+            "similarity",
+            "recency",
+            "impact",
+            "category",
+            "source",
+            "title_length",
+            "content_length",
+            "readability",
+            "has_code",
+            "is_survey",
+            "novelty",
+            "venue"
         ]
+
+        # Expected hyperparameters
+        expected_n_estimators = 50
+        expected_num_leaves = 15
+
         if self.model_path.exists():
             try:
                 with open(self.model_path, 'rb') as f:
                     data = pickle.load(f)
                     self.model = data['model']
                     self.feature_names = data['feature_names']
+                    self.model_type = data.get('model_type', 'regressor')
+                    self.is_trained = data.get('is_trained', True)  # Assume old models are trained
+
+                # Check if features changed
                 if self.feature_names != expected_features:
                     logger.warning("Feature names changed; recreating model with new feature set.")
                     self._create_new_model()
                     return
-                logger.info("Loaded existing ML ranking model")
+
+                # Check if LTR setting changed
+                if settings.USE_LTR and self.model_type != "ltr":
+                    logger.warning("LTR enabled but stored model is not a ranker; recreating model.")
+                    self._create_new_model()
+                    return
+
+                # Check if hyperparameters changed (for LightGBM models)
+                if self.model_type == "ltr" and lgb is not None:
+                    try:
+                        model_n_estimators = self.model.n_estimators
+                        model_num_leaves = self.model.num_leaves
+
+                        if model_n_estimators != expected_n_estimators or model_num_leaves != expected_num_leaves:
+                            logger.warning(
+                                f"Model hyperparameters changed (n_estimators: {model_n_estimators}->{expected_n_estimators}, "
+                                f"num_leaves: {model_num_leaves}->{expected_num_leaves}). Recreating model."
+                            )
+                            self._create_new_model()
+                            return
+                    except AttributeError:
+                        # If we can't check hyperparameters, recreate to be safe
+                        logger.warning("Cannot verify model hyperparameters; recreating model.")
+                        self._create_new_model()
+                        return
+
+                status = "trained" if self.is_trained else "untrained"
+                logger.info(f"Loaded existing ML ranking model ({status})")
             except Exception as e:
                 logger.warning(f"Could not load model: {e}. Creating new model.")
                 self._create_new_model()
@@ -55,24 +106,50 @@ class Recommender:
     
     def _create_new_model(self):
         """Create a new ML ranking model"""
-        self.model = GradientBoostingRegressor(
-            n_estimators=100,
-            learning_rate=0.1,
-            max_depth=5,
-            random_state=42
-        )
+        use_ltr = settings.USE_LTR and lgb is not None
+        if settings.USE_LTR and lgb is None:
+            logger.warning("LightGBM not installed; falling back to regressor model.")
+
+        if use_ltr:
+            self.model_type = "ltr"
+            self.model = lgb.LGBMRanker(
+                objective="lambdarank",
+                metric="ndcg",
+                n_estimators=50,
+                learning_rate=0.05,
+                num_leaves=15,
+                min_data_in_leaf=5,
+                label_gain=[0, 1, 2],
+                random_state=42
+            )
+        else:
+            self.model_type = "regressor"
+            self.model = GradientBoostingRegressor(
+                n_estimators=50,
+                learning_rate=0.1,
+                max_depth=3,
+                random_state=42
+            )
         
         # Feature names (should match FeatureExtractor output)
-        # remove recency for now
-        self.feature_names = ["similarity", "impact", "category", "title_length"]
-        
-        # Train on dummy data to initialize
-        X_dummy = np.random.rand(100, len(self.feature_names))
-        y_dummy = np.random.rand(100)
-        self.model.fit(X_dummy, y_dummy)
-        
-        self._save_model()
-        logger.info("Created new ML ranking model")
+        self.feature_names = [
+            "similarity",
+            "recency",
+            "impact",
+            "category",
+            "source",
+            "title_length",
+            "content_length",
+            "readability",
+            "has_code",
+            "is_survey",
+            "novelty",
+            "venue"
+        ]
+
+        # Mark as untrained (will be trained on first real data)
+        self.is_trained = False
+        logger.info("Created new ML ranking model (untrained - will use heuristics until trained on real data)")
     
     def _save_model(self):
         """Save the ML model to disk"""
@@ -80,7 +157,9 @@ class Recommender:
             with open(self.model_path, 'wb') as f:
                 pickle.dump({
                     'model': self.model,
-                    'feature_names': self.feature_names
+                    'feature_names': self.feature_names,
+                    'model_type': self.model_type,
+                    'is_trained': self.is_trained
                 }, f)
         except Exception as e:
             logger.error(f"Error saving model: {e}")
@@ -88,37 +167,59 @@ class Recommender:
     def rank_items(self, items: List, features: List[Dict]) -> List[Tuple]:
         """
         Rank items using ML model (learns from user interactions)
-        
+        Falls back to heuristic scoring if model is not yet trained.
+
         Args:
             items: List of items to rank
             features: List of feature dicts (one per item)
-            
+
         Returns:
             List of (item, score) tuples sorted by score (descending)
         """
         if len(items) != len(features):
             raise ValueError("Items and features must have same length")
-        
+
         # Convert features to array
         X = np.array([[f.get(name, 0.0) for name in self.feature_names] for f in features])
-        
-        # Predict scores using ML model
-        scores = self.model.predict(X)
-        
+
+        # If model is not trained, use heuristic scoring
+        if not self.is_trained:
+            logger.debug("Model not yet trained, using heuristic scoring")
+            scores = []
+            for item, feat in zip(items, features):
+                # Use impact feature as the heuristic score
+                score = feat.get('impact', 0.0)
+                scores.append(score)
+            scores = np.array(scores)
+        else:
+            # Predict scores using ML model
+            scores = self.model.predict(X)
+
         # Sort by score (descending)
         ranked = sorted(zip(items, scores), key=lambda x: x[1], reverse=True)
-        
+
         return ranked
     
-    def update_model(self, X: np.ndarray, y: np.ndarray):
+    def update_model(self, X: np.ndarray, y: np.ndarray, group: Optional[List[int]] = None):
         """
         Update ML model with new training data
-        
+
         Args:
             X: Feature matrix
             y: Target scores (e.g., from user interactions: saved=1.0, viewed=0.6, dismissed=0.0)
+            group: Group sizes for ranking (required for LTR)
         """
-        self.model.fit(X, y)
+        if self.model_type == "ltr":
+            if not group:
+                logger.error("LTR training requires group sizes; skipping update.")
+                return
+            y = np.array(y, dtype=int)
+            self.model.fit(X, y, group=group)
+        else:
+            self.model.fit(X, y)
+
+        # Mark model as trained
+        self.is_trained = True
         self._save_model()
         logger.info("Updated ML ranking model with new training data")
     
@@ -127,9 +228,9 @@ class Recommender:
     # ============================================================================
     
     @staticmethod
-    def calculate_impact_score(paper) -> float:
+    def calculate_impact_score(paper, include_venue: bool = True) -> float:
         """
-        Calculate heuristic impact score (used as "citations" feature for ML)
+        Calculate heuristic impact score (used as a quality proxy for ML)
         
         This provides a quality baseline even before any user interactions.
         Signals that correlate with high-impact papers:
@@ -137,7 +238,6 @@ class Recommender:
         - Code availability (GitHub)
         - Author count and collaboration
         - Top venues and conferences
-        - Recency sweet spot (6-18 months)
         - Title and abstract quality
         
         Returns:
@@ -188,20 +288,21 @@ class Recommender:
             score += 0.08
         
         # 4. Venue/Conference signals (weight: 0.15)
-        top_venues = {
-            'neurips': 0.15, 'nips': 0.15, 'icml': 0.15, 'iclr': 0.15,
-            'cvpr': 0.15, 'iccv': 0.15, 'eccv': 0.14,
-            'acl': 0.15, 'emnlp': 0.14, 'naacl': 0.13, 'coling': 0.12,
-            'aaai': 0.13, 'ijcai': 0.13,
-        }
+        if include_venue:
+            top_venues = {
+                'neurips': 0.15, 'nips': 0.15, 'icml': 0.15, 'iclr': 0.15,
+                'cvpr': 0.15, 'iccv': 0.15, 'eccv': 0.14,
+                'acl': 0.15, 'emnlp': 0.14, 'naacl': 0.13, 'coling': 0.12,
+                'aaai': 0.13, 'ijcai': 0.13,
+            }
+            
+            venue_contribution = 0.0
+            for venue, weight in top_venues.items():
+                if venue in text:
+                    venue_contribution = max(venue_contribution, weight)
+            score += venue_contribution
         
-        venue_contribution = 0.0
-        for venue, weight in top_venues.items():
-            if venue in text:
-                venue_contribution = max(venue_contribution, weight)
-        score += venue_contribution
-        
-        # 5. Recency (weight: 0.10)
+        # 5. Recency (weight: 0.10, continuous decay)
         published_date = getattr(paper, 'published_date', None)
         if published_date:
             try:
@@ -212,17 +313,7 @@ class Recommender:
                     published_date = published_date.astimezone(timezone.utc)
                 
                 days_old = (now - published_date).days
-                
-                if 180 <= days_old <= 540:  # 6-18 months
-                    score += 0.10
-                elif 90 <= days_old < 180:  # 3-6 months
-                    score += 0.08
-                elif 30 <= days_old < 90:  # 1-3 months
-                    score += 0.06
-                elif days_old < 30:  # Very new
-                    score += 0.03
-                elif 540 < days_old <= 730:  # 18-24 months
-                    score += 0.05
+                score += 0.10 * np.exp(-days_old / 180.0)
             except:
                 pass
         

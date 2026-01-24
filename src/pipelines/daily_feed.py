@@ -4,6 +4,8 @@ MODE 1: Daily Recommendation Feed Pipeline
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 import logging
+import numpy as np
+import random
 
 from sqlalchemy import exc as sa_exc
 
@@ -88,15 +90,14 @@ class DailyFeedPipeline:
         logger.info("Step 3: Ranking items using unified signals...")
         interaction_count = self.trainer.get_interaction_count()
         use_ml = interaction_count >= 50
-                # Calculate heuristic impact scores for all papers
+        # Calculate heuristic impact scores for all papers
         if candidate_papers:
             logger.info(f"Computing heuristic scores for {len(candidate_papers)} papers...")
             for paper in candidate_papers:
                 # Calculate impact using proxy signals (part of unified Ranker)
                 impact_score = self.recommender.calculate_impact_score(paper)
-                # Store as citation_count equivalent for ranking
-                # Max heuristic score is 1.0, scale to ~1000
-                paper.citation_count = int(impact_score * 1000)
+                # Store heuristic impact separately from citations
+                paper.heuristic_impact_score = impact_score
             logger.info("Heuristic scoring complete (no API calls needed)")
         top_papers = self._rank_and_select(
             candidate_papers,
@@ -129,7 +130,8 @@ class DailyFeedPipeline:
         # Step 7: Check if model should be retrained
         if use_ml:
             logger.info(f"Step 7: Retraining model with {interaction_count} interactions...")
-            if self.trainer.retrain_model(self.recommender, min_interactions=50):
+            # Use validation split if we have enough data (>=100 examples)
+            if self.trainer.retrain_model(self.recommender, min_interactions=50, use_validation=True):
                 logger.info("Model retrained successfully! Recommendations will be more personalized.")
         else:
             logger.info(f"Step 7: Skipping retrain ({interaction_count}/50 interactions)")
@@ -468,11 +470,16 @@ class DailyFeedPipeline:
         
         # Extract features for each item
         features = []
+        recent_texts = self._get_recent_item_texts(item_type)
         for item in items:
             if item_type == "paper":
-                feat = self.feature_extractor.extract_paper_features(item, self.embedding_manager, selected_interests)
+                feat = self.feature_extractor.extract_paper_features(
+                    item, self.embedding_manager, selected_interests, recent_texts=recent_texts
+                )
             else:
-                feat = self.feature_extractor.extract_article_features(item, self.embedding_manager, selected_interests)
+                feat = self.feature_extractor.extract_article_features(
+                    item, self.embedding_manager, selected_interests, recent_texts=recent_texts
+                )
             features.append(feat)
 
         if use_ml:
@@ -489,14 +496,115 @@ class DailyFeedPipeline:
                 scored.append((item, score))
             ranked = sorted(scored, key=lambda x: x[1], reverse=True)
 
-        # Select top K
-        top_items = [item for item, score in ranked[:top_k]]
+        # Select top K (with optional exploration + diversity)
+        candidates = ranked
+        if settings.EXPLORATION_RATE > 0 and len(ranked) > top_k:
+            candidates = self._apply_exploration(ranked, top_k)
+
+        selected = candidates
+        if settings.USE_MMR_DIVERSITY and len(candidates) > top_k:
+            selected = self._apply_mmr(candidates, top_k, item_type)
 
         # Store relevance scores
-        for item, score in ranked[:top_k]:
+        for item, score in selected:
             item.relevance_score = score
 
-        return top_items
+        return [item for item, score in selected]
+
+    def _get_recent_item_texts(self, item_type: str) -> List[str]:
+        """Get recent recommended item texts for novelty scoring."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.NOVELTY_LOOKBACK_DAYS)
+        texts = []
+        if item_type == "paper":
+            items = (
+                self.db.query(Paper)
+                .filter(Paper.recommended == True)
+                .filter(Paper.recommended_date >= cutoff)
+                .order_by(Paper.recommended_date.desc())
+                .limit(settings.NOVELTY_MAX_ITEMS)
+                .all()
+            )
+            for item in items:
+                texts.append(f"{item.title} {item.abstract or ''}")
+        else:
+            items = (
+                self.db.query(Article)
+                .filter(Article.recommended == True)
+                .filter(Article.recommended_date >= cutoff)
+                .order_by(Article.recommended_date.desc())
+                .limit(settings.NOVELTY_MAX_ITEMS)
+                .all()
+            )
+            for item in items:
+                texts.append(f"{item.title} {item.content or ''}")
+        return texts
+
+    def _apply_mmr(self, ranked_items: List, top_k: int, item_type: str) -> List:
+        """Apply Maximal Marginal Relevance (MMR) to diversify results."""
+        if not ranked_items:
+            return []
+        candidate_limit = min(len(ranked_items), max(top_k, top_k * settings.MMR_CANDIDATE_MULTIPLIER))
+        candidates = ranked_items[:candidate_limit]
+
+        texts = []
+        for item, _score in candidates:
+            if item_type == "paper":
+                text = f"{item.title} {getattr(item, 'abstract', '')}"
+            else:
+                text = f"{item.title} {getattr(item, 'content', '')[:2000]}"
+            texts.append(text)
+
+        embeddings = np.array(self.embedding_manager.generate_embeddings(texts))
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        emb_norm = embeddings / norms
+
+        scores = np.array([score for _item, score in candidates], dtype=float)
+        if scores.max() > scores.min():
+            scores = (scores - scores.min()) / (scores.max() - scores.min())
+
+        selected_indices = []
+        available = set(range(len(candidates)))
+
+        while len(selected_indices) < min(top_k, len(candidates)) and available:
+            if not selected_indices:
+                idx = int(np.argmax(scores))
+                selected_indices.append(idx)
+                available.remove(idx)
+                continue
+
+            mmr_scores = []
+            for idx in list(available):
+                candidate_vec = emb_norm[idx]
+                max_sim = 0.0
+                for sel_idx in selected_indices:
+                    sim = float(np.dot(candidate_vec, emb_norm[sel_idx]))
+                    if sim > max_sim:
+                        max_sim = sim
+                mmr_score = settings.MMR_LAMBDA * scores[idx] - (1.0 - settings.MMR_LAMBDA) * max_sim
+                mmr_scores.append((idx, mmr_score))
+
+            best_idx = max(mmr_scores, key=lambda x: x[1])[0]
+            selected_indices.append(best_idx)
+            available.remove(best_idx)
+
+        return [candidates[i] for i in selected_indices]
+
+    def _apply_exploration(self, ranked_items: List, top_k: int) -> List:
+        """Add a small exploration pool to the candidate set."""
+        if not ranked_items:
+            return []
+        explore_count = max(1, int(top_k * settings.EXPLORATION_RATE))
+        candidate_limit = min(
+            len(ranked_items),
+            max(top_k * settings.MMR_CANDIDATE_MULTIPLIER, top_k)
+        )
+        candidates = ranked_items[:candidate_limit]
+        tail = ranked_items[candidate_limit:]
+        if tail:
+            sampled = random.sample(tail, min(explore_count, len(tail)))
+            candidates.extend(sampled)
+        return candidates
     
     def _generate_summaries(self, items: List, item_type: str) -> List:
         """Generate personalized summaries for items"""
@@ -527,6 +635,8 @@ class DailyFeedPipeline:
                 # Update citation count if fetched
                 if paper_data.citation_count is not None:
                     paper.citation_count = paper_data.citation_count
+                if getattr(paper_data, "heuristic_impact_score", None) is not None:
+                    paper.heuristic_impact_score = paper_data.heuristic_impact_score
                 
                 # Add to vector DB if not already there
                 try:
@@ -585,9 +695,14 @@ class DailyFeedPipeline:
             
             # Use citation from paper data or database, default to "—" if unavailable
             citation_count = paper.citation_count
-            if citation_count is None and db_paper:
-                citation_count = db_paper.citation_count
-            citation_display = citation_count if citation_count is not None else "—"
+            heuristic_impact = getattr(paper, "heuristic_impact_score", None)
+            if db_paper:
+                if citation_count is None:
+                    citation_count = db_paper.citation_count
+                if heuristic_impact is None:
+                    heuristic_impact = db_paper.heuristic_impact_score
+            citation_display = citation_count if citation_count else None
+            impact_display = f"{heuristic_impact:.2f}" if heuristic_impact is not None else None
             
             output["papers"].append({
                 "rank": i,
@@ -595,6 +710,7 @@ class DailyFeedPipeline:
                 "arxiv_id": paper.arxiv_id,
                 "url": paper.arxiv_url,
                 "citation_count": citation_display,
+                "impact_score": impact_display,
                 "summary": paper.personalized_summary,
                 "relevance_score": paper.relevance_score,
                 "db_id": db_id  # For interaction tracking
@@ -628,7 +744,10 @@ class DailyFeedPipeline:
             lines.append(f"\nRESEARCH PAPERS ({len(output['papers'])}):")
             for paper in output["papers"]:
                 lines.append(f"\n{paper['rank']}. \"{paper['title']}\" [arXiv:{paper['arxiv_id']}]")
-                lines.append(f"   ⭐ {paper['citation_count']} citations")
+                if paper.get("citation_count"):
+                    lines.append(f"   ⭐ {paper['citation_count']} citations")
+                elif paper.get("impact_score"):
+                    lines.append(f"   📊 Impact score: {paper['impact_score']}")
                 summary = paper.get('summary') or "Summary not available"
                 lines.append(f"   💡 {summary}")
                 lines.append(f"   🔗 {paper['url']}")

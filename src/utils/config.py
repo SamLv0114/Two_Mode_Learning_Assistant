@@ -39,6 +39,25 @@ class Settings(BaseSettings):
     TOP_PAPERS_COUNT: int = 5
     TOP_ARTICLES_COUNT: int = 3
     MIN_SIMILARITY_THRESHOLD: float = 0.3
+
+    # Learning-to-rank settings
+    USE_LTR: bool = True
+
+    # Diversity settings
+    USE_MMR_DIVERSITY: bool = True
+    MMR_LAMBDA: float = 0.7
+    MMR_CANDIDATE_MULTIPLIER: int = 5
+
+    # Exploration settings
+    EXPLORATION_RATE: float = 0.2
+
+    # Novelty settings
+    NOVELTY_LOOKBACK_DAYS: int = 14
+    NOVELTY_MAX_ITEMS: int = 50
+
+    # Implicit feedback handling
+    INCLUDE_IMPLICIT_NEGATIVES: bool = False
+    IMPLICIT_NEGATIVE_SAMPLE_RATE: float = 0.2
     
     # Vector database
     VECTOR_DB_COLLECTION_NAME: str = "ml_knowledge_base"

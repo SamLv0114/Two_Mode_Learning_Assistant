@@ -57,7 +57,7 @@ class ArxivCollector:
         
         cutoff_date = datetime.now() - timedelta(days=days)
         
-        # Try modern pagination via Client.results (preferred)
+        # Try modern pagination via Client.results
         try:
             client = Client(
                 page_size=min(200, max_results * 2),
@@ -91,39 +91,7 @@ class ArxivCollector:
                     )
                     papers.append(paper)
         except Exception as e:
-            logger.warning(f"Client pagination failed, falling back to single search: {e}")
-            try:
-                search = arxiv.Search(
-                    query=category_query,
-                    max_results=max_results * 2,  # overfetch then trim/filter
-                    sort_by=arxiv.SortCriterion.SubmittedDate,
-                    sort_order=arxiv.SortOrder.Descending,
-                )
-                for result in search.results():
-                    if len(papers) >= max_results:
-                        break
-                    if result.published.date() >= cutoff_date.date():
-                        paper_id = result.entry_id.split('/')[-1]
-                        # Extract DOI and journal_ref if available
-                        doi = getattr(result, 'doi', None) or None
-                        journal_ref = getattr(result, 'journal_ref', None) or None
-                        paper = PaperData(
-                            arxiv_id=paper_id,
-                            title=result.title,
-                            authors=[author.name for author in result.authors],
-                            abstract=result.summary,
-                            categories=result.categories,
-                            published_date=result.published,
-                            arxiv_url=result.entry_id,
-                            pdf_url=result.pdf_url,
-                            doi=doi,
-                            journal_ref=journal_ref,
-                        )
-                        papers.append(paper)
-            except Exception as e2:
-                logger.error(f"Error fetching ArXiv papers: {e2}")
-        
-        logger.info(f"Fetched {len(papers)} papers from ArXiv")
+            logger.warning(f"Client pagination failed.")
         return papers
     
     def fetch_by_time_slices(

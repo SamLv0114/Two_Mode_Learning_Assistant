@@ -1,7 +1,7 @@
 """
 Database models for storing papers and articles
 """
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime, timezone
@@ -25,6 +25,7 @@ class Paper(Base):
     arxiv_url = Column(String)
     pdf_url = Column(String)
     citation_count = Column(Integer, default=0)
+    heuristic_impact_score = Column(Float, nullable=True)
     relevance_score = Column(Float, default=0.0)
     personalized_summary = Column(Text, nullable=True)
     collected_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -87,6 +88,13 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Initialize database tables"""
     Base.metadata.create_all(bind=engine)
+    if db_url.startswith("sqlite"):
+        with engine.connect() as conn:
+            result = conn.execute(text("PRAGMA table_info(papers)")).fetchall()
+            existing = {row[1] for row in result}
+            if "heuristic_impact_score" not in existing:
+                conn.execute(text("ALTER TABLE papers ADD COLUMN heuristic_impact_score FLOAT"))
+                conn.commit()
 
 
 def get_db():
