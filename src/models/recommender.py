@@ -2,7 +2,6 @@
 Unified ranking system combining heuristic scoring and ML personalization
 """
 import pickle
-from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timezone
 import numpy as np
@@ -18,18 +17,23 @@ except Exception:
     lgb = None
 
 class Recommender:
-    """
-    Unified recommendation system that combines:
-    1. Heuristic scoring (quality baseline, always works)
-    2. ML personalization (learns from user interactions)
-    """
-    
+    """Combines heuristic scoring (quality baseline) with ML personalization."""
+
+    FEATURE_NAMES = [
+        "similarity", "recency", "impact", "category", "source",
+        "title_length", "content_length", "readability", "has_code",
+        "is_survey", "novelty", "venue", "author_reputation",
+    ]
+
     def __init__(self):
         self.model_path = settings.MODELS_DIR / "ranker_model.pkl"
+        self.heuristic_weights_path = settings.MODELS_DIR / "heuristic_weights.pkl"
         self.model = None
         self.feature_names = None
         self.model_type = None
+        self.heuristic_weights = None  # Learned weights for heuristic scoring
         self._load_or_create_model()
+        self._load_heuristic_weights()
     
     # ============================================================================
     # ML MODEL (Learns from user interactions)
@@ -37,21 +41,6 @@ class Recommender:
     
     def _load_or_create_model(self):
         """Load existing ML model or create a new one"""
-        expected_features = [
-            "similarity",
-            "recency",
-            "impact",
-            "category",
-            "source",
-            "title_length",
-            "content_length",
-            "readability",
-            "has_code",
-            "is_survey",
-            "novelty",
-            "venue"
-        ]
-
         # Expected hyperparameters
         expected_n_estimators = 50
         expected_num_leaves = 15
@@ -66,7 +55,7 @@ class Recommender:
                     self.is_trained = data.get('is_trained', True)  # Assume old models are trained
 
                 # Check if features changed
-                if self.feature_names != expected_features:
+                if self.feature_names != self.FEATURE_NAMES:
                     logger.warning("Feature names changed; recreating model with new feature set.")
                     self._create_new_model()
                     return
@@ -131,21 +120,7 @@ class Recommender:
                 random_state=42
             )
         
-        # Feature names (should match FeatureExtractor output)
-        self.feature_names = [
-            "similarity",
-            "recency",
-            "impact",
-            "category",
-            "source",
-            "title_length",
-            "content_length",
-            "readability",
-            "has_code",
-            "is_survey",
-            "novelty",
-            "venue"
-        ]
+        self.feature_names = list(self.FEATURE_NAMES)
 
         # Mark as untrained (will be trained on first real data)
         self.is_trained = False
@@ -165,17 +140,7 @@ class Recommender:
             logger.error(f"Error saving model: {e}")
     
     def rank_items(self, items: List, features: List[Dict]) -> List[Tuple]:
-        """
-        Rank items using ML model (learns from user interactions)
-        Falls back to heuristic scoring if model is not yet trained.
-
-        Args:
-            items: List of items to rank
-            features: List of feature dicts (one per item)
-
-        Returns:
-            List of (item, score) tuples sorted by score (descending)
-        """
+        """Rank items by ML score (or heuristic fallback). Returns (item, score) pairs descending."""
         if len(items) != len(features):
             raise ValueError("Items and features must have same length")
 
@@ -187,8 +152,8 @@ class Recommender:
             logger.debug("Model not yet trained, using heuristic scoring")
             scores = []
             for item, feat in zip(items, features):
-                # Use impact feature as the heuristic score
-                score = feat.get('impact', 0.0)
+                # Use learned heuristic weights if available, else fallback to impact
+                score = self.calculate_weighted_heuristic_score(feat)
                 scores.append(score)
             scores = np.array(scores)
         else:
@@ -201,14 +166,7 @@ class Recommender:
         return ranked
     
     def update_model(self, X: np.ndarray, y: np.ndarray, group: Optional[List[int]] = None):
-        """
-        Update ML model with new training data
-
-        Args:
-            X: Feature matrix
-            y: Target scores (e.g., from user interactions: saved=1.0, viewed=0.6, dismissed=0.0)
-            group: Group sizes for ranking (required for LTR)
-        """
+        """Train the ML model on interaction data. group is required for LTR."""
         if self.model_type == "ltr":
             if not group:
                 logger.error("LTR training requires group sizes; skipping update.")
@@ -229,20 +187,7 @@ class Recommender:
     
     @staticmethod
     def calculate_impact_score(paper, include_venue: bool = True) -> float:
-        """
-        Calculate heuristic impact score (used as a quality proxy for ML)
-        
-        This provides a quality baseline even before any user interactions.
-        Signals that correlate with high-impact papers:
-        - High-value keywords (survey, benchmark, SOTA)
-        - Code availability (GitHub)
-        - Author count and collaboration
-        - Top venues and conferences
-        - Title and abstract quality
-        
-        Returns:
-            Float between 0.0 and 1.0
-        """
+        """Heuristic quality proxy based on keywords, code, authors, venue, recency, and text quality."""
         score = 0.0
         
         # Prepare text for analysis
@@ -314,7 +259,7 @@ class Recommender:
                 
                 days_old = (now - published_date).days
                 score += 0.10 * np.exp(-days_old / 180.0)
-            except:
+            except Exception:
                 pass
         
         # 6. Title quality (weight: 0.05)
@@ -333,105 +278,61 @@ class Recommender:
         
         return min(score, 1.0)
     
-    @staticmethod
-    def explain_score(paper) -> str:
-        """
-        Generate human-readable explanation of heuristic score for debugging
-        """
-        lines = []
-        lines.append(f"Paper: {getattr(paper, 'title', 'Unknown')[:60]}...")
-        lines.append(f"Heuristic Impact Score: {Recommender.calculate_impact_score(paper):.3f}")
-        lines.append("")
-        lines.append("Score Breakdown:")
-        
-        text = f"{getattr(paper, 'title', '')} {getattr(paper, 'abstract', '')}".lower()
-        
-        # Keywords
-        keywords_found = []
-        for kw in ['survey', 'benchmark', 'dataset', 'sota', 'novel', 'github']:
-            if kw in text:
-                keywords_found.append(kw)
-        if keywords_found:
-            lines.append(f"  + Keywords: {', '.join(keywords_found)}")
-        
-        # Code
-        if 'github' in text or 'code' in text:
-            lines.append("  + Code available")
-        
-        # Authors
-        num_authors = len(getattr(paper, 'authors', []))
-        if num_authors >= 3:
-            lines.append(f"  + {num_authors} authors (multi-author)")
-        
-        # Venue
-        for venue in ['neurips', 'icml', 'iclr', 'cvpr', 'acl']:
-            if venue in text:
-                lines.append(f"  + Top venue ({venue.upper()})")
-                break
-        
-        # Recency
-        published_date = getattr(paper, 'published_date', None)
-        if published_date:
+    def _load_heuristic_weights(self):
+        """Load learned heuristic weights from disk"""
+        if self.heuristic_weights_path.exists():
             try:
-                days_old = (datetime.now(timezone.utc) - published_date).days
-                months_old = days_old // 30
-                lines.append(f"  - Age: ~{months_old} months")
-            except:
-                pass
-        
-        return "\n".join(lines)
+                with open(self.heuristic_weights_path, 'rb') as f:
+                    self.heuristic_weights = pickle.load(f)
+                logger.info(f"Loaded learned heuristic weights: {len(self.heuristic_weights)} features")
+            except Exception as e:
+                logger.warning(f"Could not load heuristic weights: {e}")
+                self.heuristic_weights = None
+        else:
+            self.heuristic_weights = None
 
+    def _save_heuristic_weights(self):
+        """Save learned heuristic weights to disk"""
+        try:
+            with open(self.heuristic_weights_path, 'wb') as f:
+                pickle.dump(self.heuristic_weights, f)
+            logger.info("Saved learned heuristic weights")
+        except Exception as e:
+            logger.error(f"Error saving heuristic weights: {e}")
 
-if __name__ == "__main__":
-    # Test the unified ranker
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    
-    from dataclasses import dataclass
-    from datetime import timedelta
-    
-    @dataclass
-    class MockPaper:
-        arxiv_id: str
-        title: str
-        abstract: str
-        authors: List[str]
-        published_date: datetime
-    
-    # Create test papers
-    papers = [
-        MockPaper(
-            arxiv_id="1",
-            title="A Survey of Deep Learning Methods for Natural Language Processing",
-            abstract="This survey reviews recent advances in deep learning for NLP. "
-                     "Code is available on GitHub.",
-            authors=["Author A", "Author B", "Author C"],
-            published_date=datetime.now(timezone.utc) - timedelta(days=200)
-        ),
-        MockPaper(
-            arxiv_id="2",
-            title="Novel Approach to Image Classification",
-            abstract="We propose a novel method that achieves state-of-the-art results.",
-            authors=["Author X", "Author Y"],
-            published_date=datetime.now(timezone.utc) - timedelta(days=30)
-        ),
-    ]
-    
-    print("=" * 80)
-    print("UNIFIED RECOMMENDER TEST")
-    print("=" * 80)
-    
-    recommender = Recommender()
-    
-    for paper in papers:
-        impact = recommender.calculate_impact_score(paper)
-        print(f"\n{paper.title[:60]}")
-        print(f"Impact Score: {impact:.3f}")
-        print(recommender.explain_score(paper))
-    
-    print("\n" + "=" * 80)
-    print("ML model loaded and ready for training!")
-    print(f"Feature names: {recommender.feature_names}")
-    print("=" * 80)
+    def update_heuristic_weights(self, X: np.ndarray, y: np.ndarray):
+        """Learn heuristic feature weights via logistic regression on interaction data."""
+        try:
+            from sklearn.linear_model import LogisticRegression
+
+            # Convert to binary classification
+            y_binary = (y > 0.5).astype(int)
+
+            # Train logistic regression to learn feature weights
+            lr = LogisticRegression(max_iter=1000, random_state=42)
+            lr.fit(X, y_binary)
+
+            # Store coefficients as weights
+            self.heuristic_weights = lr.coef_[0]
+            self._save_heuristic_weights()
+
+            logger.info(f"Updated heuristic weights from {len(X)} examples")
+        except Exception as e:
+            logger.warning(f"Could not update heuristic weights: {e}")
+
+    def calculate_weighted_heuristic_score(self, features: Dict) -> float:
+        """Score using learned weights if available, else fallback to impact."""
+        if self.heuristic_weights is None or len(self.heuristic_weights) != len(self.feature_names):
+            # Fallback to impact score
+            return features.get('impact', 0.0)
+
+        # Compute weighted sum of features
+        feature_vec = np.array([features.get(name, 0.0) for name in self.feature_names])
+        score = np.dot(self.heuristic_weights, feature_vec)
+
+        # Apply sigmoid to bound to [0, 1]
+        score = 1.0 / (1.0 + np.exp(-score))
+
+        return float(score)
+
 

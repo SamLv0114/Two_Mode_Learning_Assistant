@@ -3,12 +3,10 @@ Feature extraction for ranking models
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
-import math
 from src.models.recommender import Recommender
 
 
 class FeatureExtractor:
-    """Extracts features for ranking models"""
 
     @staticmethod
     def _basic_readability(text: str) -> float:
@@ -64,127 +62,98 @@ class FeatureExtractor:
                 max_sim = sim
         novelty = 1.0 - max_sim
         return max(0.0, min(novelty, 1.0))
-    
+
     @staticmethod
-    def extract_paper_features(
-        paper,
+    def _author_reputation_score(paper) -> float:
+        """Heuristic based on author count: values collaboration but not excessively."""
+        authors = getattr(paper, 'authors', [])
+        if isinstance(authors, str):
+            authors = [a.strip() for a in authors.split(',') if a.strip()]
+
+        num_authors = len(authors)
+        if 2 <= num_authors <= 5:
+            return 1.0
+        elif 6 <= num_authors <= 10:
+            return 0.8
+        elif num_authors > 10:
+            return 0.6
+        elif num_authors == 1:
+            return 0.7
+        else:
+            return 0.0
+
+    @staticmethod
+    def extract_features(
+        item,
+        item_type: str,
         embedding_manager,
         user_interests: List[str],
-        recent_texts: Optional[List[str]] = None
+        recent_texts: Optional[List[str]] = None,
     ) -> Dict:
+        """Extract 13 ranking features for a paper or article."""
+        is_paper = (item_type == "paper")
         interests_text = " ".join(user_interests)
-        paper_text = f"{paper.title} {paper.abstract if hasattr(paper, 'abstract') else ''}"
-        paper_text_lower = paper_text.lower()
-        
-        similarity = embedding_manager.get_similarity_score(interests_text, paper_text)
-        
-        # Recency (days since publication)
-        if hasattr(paper, 'published_date') and paper.published_date:
-            # Normalize both datetimes to UTC-aware for comparison
+
+        # Text fields differ: papers have abstract, articles have content
+        body_field = 'abstract' if is_paper else 'content'
+        body_text = getattr(item, body_field, '') or ''
+        full_text = f"{item.title} {body_text}"
+        full_text_lower = full_text.lower()
+
+        similarity = embedding_manager.get_similarity_score(interests_text, full_text)
+
+        # Recency
+        if hasattr(item, 'published_date') and item.published_date:
             now = datetime.now(timezone.utc)
-            pub_date = paper.published_date
-            # assume it's UTC
+            pub_date = item.published_date
             if pub_date.tzinfo is None:
                 pub_date = pub_date.replace(tzinfo=timezone.utc)
             else:
                 pub_date = pub_date.astimezone(timezone.utc)
             days_old = (now - pub_date).days
-            recency_score = 1.0 / (1.0 + days_old / 30.0)  # Decay over 30 days
+            recency_score = 1.0 / (1.0 + days_old / 30.0)
         else:
             recency_score = 0.5
-        
-        # Heuristic impact without venue to avoid double-counting
-        impact_score = Recommender.calculate_impact_score(paper, include_venue=False)
-        citation_score = impact_score  # treat heuristic as citation proxy for now
-        
-        # Category relevance (check if in preferred categories)
-        categories = getattr(paper, 'categories', [])
-        category_score = 1.0 if any(cat in categories for cat in ["cs.LG", "cs.AI"]) else 0.5
 
-        venue_score = FeatureExtractor._venue_score(paper_text_lower)
-        
-        # Title length (shorter titles often more focused)
-        title_length = len(getattr(paper, 'title', ''))
+        # Impact: papers use heuristic score, articles use upvote count
+        if is_paper:
+            impact_score = Recommender.calculate_impact_score(item, include_venue=False)
+        else:
+            upvotes = getattr(item, 'upvotes', 0)
+            impact_score = min(upvotes / 500.0, 1.0)
+
+        # Category relevance (papers only)
+        if is_paper:
+            categories = getattr(item, 'categories', [])
+            category_score = 1.0 if any(cat in categories for cat in ["cs.LG", "cs.AI"]) else 0.5
+        else:
+            category_score = 0.0
+
+        # Source quality (articles only)
+        if is_paper:
+            source_score = 0.0
+        else:
+            source = getattr(item, 'source', '')
+            source_score = 1.0 if source == "hackernews" else 0.7
+
+        title_length = len(getattr(item, 'title', ''))
         title_score = 1.0 - min(title_length / 200.0, 0.5)
 
-        # Content length (cap to keep within 0-1 range)
-        content_length = len(getattr(paper, 'abstract', '') or '')
-        content_score = min(content_length / 3000.0, 1.0)
+        content_max = 3000.0 if is_paper else 2000.0
+        content_score = min(len(body_text) / content_max, 1.0)
 
-        readability = FeatureExtractor._basic_readability(getattr(paper, 'abstract', '') or '')
-        has_code = FeatureExtractor._has_code(paper_text_lower)
-        is_survey = FeatureExtractor._is_survey_or_tutorial(paper_text_lower)
-        novelty = FeatureExtractor._novelty_score(paper_text, recent_texts, embedding_manager)
-        
+        readability = FeatureExtractor._basic_readability(body_text)
+        has_code = FeatureExtractor._has_code(full_text_lower)
+        is_survey = FeatureExtractor._is_survey_or_tutorial(full_text_lower)
+        novelty = FeatureExtractor._novelty_score(full_text, recent_texts, embedding_manager)
+        venue_score = FeatureExtractor._venue_score(full_text_lower) if is_paper else 0.0
+        author_reputation = FeatureExtractor._author_reputation_score(item) if is_paper else 0.5
+
         return {
             "similarity": similarity,
             "recency": recency_score,
             "impact": impact_score,
             "category": category_score,
-            "source": 0.0,
-            "title_length": title_score,
-            "content_length": content_score,
-            "readability": readability,
-            "has_code": has_code,
-            "is_survey": is_survey,
-            "novelty": novelty,
-            "venue": venue_score
-        }
-    
-    @staticmethod
-    # Similar to the paper features extractor
-    def extract_article_features(
-        article,
-        embedding_manager,
-        user_interests: List[str],
-        recent_texts: Optional[List[str]] = None
-    ) -> Dict:
-        interests_text = " ".join(user_interests)
-        article_text = f"{article.title} {article.content if hasattr(article, 'content') else ''}"
-        article_text_lower = article_text.lower()
-        
-        similarity = embedding_manager.get_similarity_score(interests_text, article_text)
-        
-        # Recency
-        if hasattr(article, 'published_date') and article.published_date:
-            # Normalize both datetimes to UTC-aware for comparison
-            now = datetime.now(timezone.utc)
-            pub_date = article.published_date
-            if pub_date.tzinfo is None:
-                pub_date = pub_date.replace(tzinfo=timezone.utc)
-            else:
-                pub_date = pub_date.astimezone(timezone.utc)
-            days_old = (now - pub_date).days
-            recency_score = 1.0 / (1.0 + days_old / 30.0)  # Articles decay faster (7 days)
-        else:
-            recency_score = 0.5
-        
-        # Engagement (upvotes, normalized)
-        upvotes = getattr(article, 'upvotes', 0)
-        engagement_score = min(upvotes / 500.0, 1.0)  # Normalize to 0-1
-        impact_score = engagement_score  # alias for stars scoring
-        
-        # Source quality (Hacker News typically higher quality)
-        source = getattr(article, 'source', '')
-        source_score = 1.0 if source == "hackernews" else 0.7
-        
-        # Title length (shorter titles often more focused)
-        title_length = len(getattr(article, 'title', ''))
-        title_score = 1.0 - min(title_length / 200.0, 0.5)
-
-        # Content length (longer articles often more comprehensive)
-        content_length = len(getattr(article, 'content', ''))
-        content_score = min(content_length / 2000.0, 1.0)
-        readability = FeatureExtractor._basic_readability(getattr(article, 'content', '') or '')
-        has_code = FeatureExtractor._has_code(article_text_lower)
-        is_survey = FeatureExtractor._is_survey_or_tutorial(article_text_lower)
-        novelty = FeatureExtractor._novelty_score(article_text, recent_texts, embedding_manager)
-        
-        return {
-            "similarity": similarity,
-            "recency": recency_score,
-            "impact": impact_score,
-            "category": 0.0,
             "source": source_score,
             "title_length": title_score,
             "content_length": content_score,
@@ -192,6 +161,6 @@ class FeatureExtractor:
             "has_code": has_code,
             "is_survey": is_survey,
             "novelty": novelty,
-            "venue": 0.0
+            "venue": venue_score,
+            "author_reputation": author_reputation,
         }
-

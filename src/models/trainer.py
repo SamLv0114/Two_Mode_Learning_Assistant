@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class ModelTrainer:
-    """Collects training data from user interactions and retrains the model"""
+    """Collects training data from user interactions and retrains the model."""
+
+    FEATURE_NAMES = [
+        "similarity", "recency", "impact", "category", "source",
+        "title_length", "content_length", "readability", "has_code",
+        "is_survey", "novelty", "venue", "author_reputation",
+    ]
 
     def __init__(self, db: Session, embedding_manager: EmbeddingManager):
         self.db = db
@@ -86,15 +92,7 @@ class ModelTrainer:
         return texts
 
     def generate_training_data(self, min_interactions: int = 50) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """
-        Generate training data from user interactions
-        
-        Args:
-            min_interactions: Minimum number of interactions needed to generate training data
-            
-        Returns:
-            Tuple of (X, y) numpy arrays, or (None, None) if not enough data
-        """
+        """Generate (X, y) arrays from interactions, or (None, None) if insufficient data."""
         interactions = self.db.query(UserInteraction).all()
 
         if len(interactions) < min_interactions:
@@ -129,26 +127,27 @@ class ModelTrainer:
         y_list = []
 
         # Process papers
-        paper_feature_names = [
-            "similarity", "recency", "impact", "category", "source",
-            "title_length", "content_length", "readability", "has_code",
-            "is_survey", "novelty", "venue"
-        ]
         recent_paper_texts = self._get_recent_texts("paper")
         for paper in recommended_papers:
-            features = self.feature_extractor.extract_paper_features(
-                paper, self.embedding_manager, settings.USER_INTERESTS, recent_texts=recent_paper_texts
+            features = self.feature_extractor.extract_features(
+                paper, "paper", self.embedding_manager, settings.USER_INTERESTS,
+                recent_texts=recent_paper_texts,
             )
             
             # Convert to array matching feature_names
-            X_list.append([features.get(name, 0.0) for name in paper_feature_names])
+            X_list.append([features.get(name, 0.0) for name in self.FEATURE_NAMES])
 
             # Get label from interactions
             key = ("paper", paper.id)
             if key in interaction_scores:
                 y_list.append(interaction_scores[key])
             elif settings.INCLUDE_IMPLICIT_NEGATIVES:
-                if np.random.rand() <= settings.IMPLICIT_NEGATIVE_SAMPLE_RATE:
+                # Position bias correction
+                position = len(y_list)
+                position_factor = 0.5 + 0.5 * min(position / 20.0, 1.0)
+                adjusted_sample_rate = settings.IMPLICIT_NEGATIVE_SAMPLE_RATE * position_factor
+
+                if np.random.rand() <= adjusted_sample_rate:
                     y_list.append(0.0)
                 else:
                     X_list.pop()
@@ -158,17 +157,23 @@ class ModelTrainer:
         # Process articles
         recent_article_texts = self._get_recent_texts("article")
         for article in recommended_articles:
-            features = self.feature_extractor.extract_article_features(
-                article, self.embedding_manager, settings.USER_INTERESTS, recent_texts=recent_article_texts
+            features = self.feature_extractor.extract_features(
+                article, "article", self.embedding_manager, settings.USER_INTERESTS,
+                recent_texts=recent_article_texts,
             )
 
-            X_list.append([features.get(name, 0.0) for name in paper_feature_names])
+            X_list.append([features.get(name, 0.0) for name in self.FEATURE_NAMES])
 
             key = ("article", article.id)
             if key in interaction_scores:
                 y_list.append(interaction_scores[key])
             elif settings.INCLUDE_IMPLICIT_NEGATIVES:
-                if np.random.rand() <= settings.IMPLICIT_NEGATIVE_SAMPLE_RATE:
+                # Position bias correction
+                position = len(y_list)
+                position_factor = 0.5 + 0.5 * min(position / 20.0, 1.0)
+                adjusted_sample_rate = settings.IMPLICIT_NEGATIVE_SAMPLE_RATE * position_factor
+
+                if np.random.rand() <= adjusted_sample_rate:
                     y_list.append(0.0)
                 else:
                     X_list.pop()
@@ -190,14 +195,7 @@ class ModelTrainer:
         min_interactions: int = 50,
         min_group_size: int = 10
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[int]]]:
-        """
-        Generate ranking data with group sizes for LTR training.
-        Groups are weekly recommendation batches (merged to ensure min_group_size).
-
-        Args:
-            min_interactions: Minimum total interactions needed
-            min_group_size: Minimum items per group (smaller groups are merged)
-        """
+        """Generate (X, y, group_sizes) for LTR training, grouped by week."""
         interactions = self.db.query(UserInteraction).all()
 
         if len(interactions) < min_interactions:
@@ -221,11 +219,6 @@ class ModelTrainer:
             if key not in interaction_scores or score > interaction_scores[key]:
                 interaction_scores[key] = score
 
-        feature_names = [
-            "similarity", "recency", "impact", "category", "source",
-            "title_length", "content_length", "readability", "has_code",
-            "is_survey", "novelty", "venue"
-        ]
         recent_paper_texts = self._get_recent_texts("paper")
         recent_article_texts = self._get_recent_texts("article")
 
@@ -261,23 +254,27 @@ class ModelTrainer:
             items = grouped_items[group_key]
 
             for item_type, item in items:
-                if item_type == "paper":
-                    features = self.feature_extractor.extract_paper_features(
-                        item, self.embedding_manager, settings.USER_INTERESTS, recent_texts=recent_paper_texts
-                    )
-                else:
-                    features = self.feature_extractor.extract_article_features(
-                        item, self.embedding_manager, settings.USER_INTERESTS, recent_texts=recent_article_texts
-                    )
+                recent = recent_paper_texts if item_type == "paper" else recent_article_texts
+                features = self.feature_extractor.extract_features(
+                    item, item_type, self.embedding_manager, settings.USER_INTERESTS,
+                    recent_texts=recent,
+                )
 
-                feature_vec = [features.get(name, 0.0) for name in feature_names]
+                feature_vec = [features.get(name, 0.0) for name in self.FEATURE_NAMES]
 
                 key = (item_type, item.id)
                 if key in interaction_scores:
                     current_group_x.append(feature_vec)
                     current_group_y.append(interaction_scores[key])
                 elif settings.INCLUDE_IMPLICIT_NEGATIVES:
-                    if np.random.rand() <= settings.IMPLICIT_NEGATIVE_SAMPLE_RATE:
+                    # Position bias correction: items at top positions are sampled less often
+                    # to avoid learning "top position = good quality"
+                    position_in_group = len(current_group_x)
+                    # Decay sample rate: top items sampled at 50% rate, bottom at 100%
+                    position_factor = 0.5 + 0.5 * min(position_in_group / 20.0, 1.0)
+                    adjusted_sample_rate = settings.IMPLICIT_NEGATIVE_SAMPLE_RATE * position_factor
+
+                    if np.random.rand() <= adjusted_sample_rate:
                         current_group_x.append(feature_vec)
                         current_group_y.append(0)
 
@@ -315,17 +312,7 @@ class ModelTrainer:
         return X, y, group_sizes
 
     def retrain_model(self, recommender, min_interactions: int = 50, use_validation: bool = True):
-        """
-        Retrain the recommender model with collected user interactions
-
-        Args:
-            recommender: Recommender instance to retrain
-            min_interactions: Minimum interactions needed to retrain
-            use_validation: If True, use temporal validation split
-
-        Returns:
-            True if retraining succeeded, False otherwise
-        """
+        """Retrain recommender from interactions. Returns True on success."""
         if getattr(recommender, "model_type", "regressor") == "ltr":
             X, y, group_sizes = self.generate_ranking_data(min_interactions)
         else:
@@ -354,6 +341,13 @@ class ModelTrainer:
             except Exception as e:
                 logger.warning(f"Metric computation failed: {e}")
 
+        # Learn heuristic weights from the same interaction data
+        # This improves cold-start recommendations
+        try:
+            recommender.update_heuristic_weights(X, y)
+        except Exception as e:
+            logger.warning(f"Could not update heuristic weights: {e}")
+
         logger.info(f"Successfully retrained model with {len(X)} examples")
         return True
 
@@ -368,16 +362,19 @@ class ModelTrainer:
         y: np.ndarray,
         group_sizes: Optional[List[int]] = None
     ) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """
-        Train model with temporal validation split.
-        Uses 80% earliest data for training, 20% most recent for validation.
-
-        Returns:
-            Tuple of (train_metrics, val_metrics) dictionaries
-        """
+        """80/20 temporal split; returns (train_metrics, val_metrics) dicts."""
         if group_sizes:
             # For LTR, split by groups to maintain group integrity
-            train_size = int(len(group_sizes) * 0.8)
+            train_size = max(1, int(len(group_sizes) * 0.8))
+            if train_size >= len(group_sizes):
+                # Not enough groups to split — train on all, report train metrics as both
+                recommender.update_model(X, y, group=group_sizes)
+                preds = recommender.model.predict(X)
+                metrics = {
+                    'ndcg': compute_ndcg(y, preds, k=10, group_sizes=group_sizes),
+                    'mrr': compute_mrr(y, preds, group_sizes=group_sizes)
+                }
+                return metrics, metrics
             train_groups = group_sizes[:train_size]
             val_groups = group_sizes[train_size:]
 

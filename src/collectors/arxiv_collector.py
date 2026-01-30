@@ -152,7 +152,13 @@ class ArxivCollector:
             
             logger.info(f"Fetching time slice {slice_idx + 1}/{num_slices}: {slice_start.strftime('%Y-%m-%d')} to {slice_end.strftime('%Y-%m-%d')} (target: {candidates_per_slice} candidates)")
             
-            # Query for this slice
+            # Build date-range query so arXiv API returns papers from THIS slice
+            # arXiv query syntax: submittedDate:[YYYYMMDDHHMI TO YYYYMMDDHHMI]
+            date_start_str = slice_start.strftime("%Y%m%d0000")
+            date_end_str = slice_end.strftime("%Y%m%d2359")
+            date_range_query = f"submittedDate:[{date_start_str} TO {date_end_str}]"
+            slice_query = f"({category_query}) AND {date_range_query}"
+
             slice_papers = []
             try:
                 client = Client(
@@ -160,50 +166,33 @@ class ArxivCollector:
                     delay_seconds=3,
                 )
                 search = arxiv.Search(
-                    query=category_query,
+                    query=slice_query,
                     max_results=candidates_per_slice * 2,  # Overfetch then trim
                     sort_by=arxiv.SortCriterion.SubmittedDate,
                     sort_order=arxiv.SortOrder.Descending,
                 )
-                
+
                 for result in client.results(search):
                     if len(slice_papers) >= candidates_per_slice:
                         break
-                    
-                    pub_date = result.published
-                    # Normalize published date
-                    if isinstance(pub_date, datetime):
-                        pub_date_dt = pub_date
-                    else:
-                        pub_date_dt = datetime.combine(pub_date, datetime.min.time())
-                    
-                    # Remove timezone for comparison (if present)
-                    if pub_date_dt.tzinfo is not None:
-                        pub_date_dt = pub_date_dt.replace(tzinfo=None)
-                    
-                    # Normalize slice boundaries (ensure naive datetime)
-                    slice_start_naive = slice_start.replace(tzinfo=None) if hasattr(slice_start, 'tzinfo') and slice_start.tzinfo else slice_start
-                    slice_end_naive = slice_end.replace(tzinfo=None) if hasattr(slice_end, 'tzinfo') and slice_end.tzinfo else slice_end
-                    
-                    # Check if paper is in this time slice
-                    if slice_start_naive <= pub_date_dt <= slice_end_naive:
-                        paper_id = result.entry_id.split('/')[-1]
-                        # Extract DOI and journal_ref if available
-                        doi = getattr(result, 'doi', None) or None
-                        journal_ref = getattr(result, 'journal_ref', None) or None
-                        paper = PaperData(
-                            arxiv_id=paper_id,
-                            title=result.title,
-                            authors=[author.name for author in result.authors],
-                            abstract=result.summary,
-                            categories=result.categories,
-                            published_date=result.published,
-                            arxiv_url=result.entry_id,
-                            pdf_url=result.pdf_url,
-                            doi=doi,
-                            journal_ref=journal_ref,
-                        )
-                        slice_papers.append(paper)
+
+                    paper_id = result.entry_id.split('/')[-1]
+                    # Extract DOI and journal_ref if available
+                    doi = getattr(result, 'doi', None) or None
+                    journal_ref = getattr(result, 'journal_ref', None) or None
+                    paper = PaperData(
+                        arxiv_id=paper_id,
+                        title=result.title,
+                        authors=[author.name for author in result.authors],
+                        abstract=result.summary,
+                        categories=result.categories,
+                        published_date=result.published,
+                        arxiv_url=result.entry_id,
+                        pdf_url=result.pdf_url,
+                        doi=doi,
+                        journal_ref=journal_ref,
+                    )
+                    slice_papers.append(paper)
             except Exception as e:
                 logger.warning(f"Error fetching time slice {slice_idx + 1}: {e}")
             

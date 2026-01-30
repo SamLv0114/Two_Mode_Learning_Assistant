@@ -1,11 +1,9 @@
 """
 Configuration settings for the AI Learning Assistant
 """
-import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
-from typing import List, Optional, Union
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -56,17 +54,13 @@ class Settings(BaseSettings):
     NOVELTY_MAX_ITEMS: int = 50
 
     # Implicit feedback handling
-    INCLUDE_IMPLICIT_NEGATIVES: bool = False
-    IMPLICIT_NEGATIVE_SAMPLE_RATE: float = 0.2
+    INCLUDE_IMPLICIT_NEGATIVES: bool = True
+    IMPLICIT_NEGATIVE_SAMPLE_RATE: float = 0.15  # Sample 15% of non-interacted items
     
     # Vector database
     VECTOR_DB_COLLECTION_NAME: str = "ml_knowledge_base"
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
-
-    # Citation enrichment (disabled - using heuristic ranking instead)
-    CITATION_ENRICHMENT_ENABLED: bool = False
-    USE_HEURISTIC_RANKING: bool = True  # Use proxy signals instead of real citations
 
     # User preferences - read as string from .env, parsed to list
     USER_INTERESTS_STR: Optional[str] = None

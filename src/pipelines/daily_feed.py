@@ -53,7 +53,6 @@ class DailyFeedPipeline:
             time_window_days,
             selected_interests,
             paper_fetch_limit,
-            enrich_citations=settings.CITATION_ENRICHMENT_ENABLED,
             use_time_slices=use_time_slices,
         )
         new_articles = self._collect_articles(time_window_days, article_fetch_limit)
@@ -163,7 +162,7 @@ class DailyFeedPipeline:
             "interactions_needed": max(0, 50 - count)
         }
     
-    def _collect_papers(self, time_window_days: int, selected_interests: List[str], max_results: int, enrich_citations: bool = False, use_time_slices: bool = True,) -> List[PaperData]:
+    def _collect_papers(self, time_window_days: int, selected_interests: List[str], max_results: int, use_time_slices: bool = True) -> List[PaperData]:
         """Collect new papers from ArXiv"""
         collector = ArxivCollector()
         # Map focus areas to arXiv categories
@@ -207,25 +206,6 @@ class DailyFeedPipeline:
                 categories=category_override,
                 max_results=max_results,
             )
-
-        # # Try to fetch high impact papers in addition to the main feed
-        # impact_queries = [
-        #     "survey OR benchmark OR dataset",
-        #     "state-of-the-art OR sota",
-        # ]
-        # for q in impact_queries:
-        #     try:
-        #         extra = collector.fetch_by_query(
-        #             q,
-        #             max_results=max_results // 4,
-        #             categories=category_override,
-        #         )
-        #         cutoff = datetime.now(timezone.utc) - timedelta(days=time_window_days)
-        #         for p in extra:
-        #             if p.published_date and p.published_date >= cutoff:
-        #                 papers.append(p)
-        #     except Exception as e:
-        #         logger.debug(f"Impact lane fetch failed for query '{q}': {e}")
 
         # Deduplicate by arxiv_id
         dedup = {}
@@ -472,14 +452,10 @@ class DailyFeedPipeline:
         features = []
         recent_texts = self._get_recent_item_texts(item_type)
         for item in items:
-            if item_type == "paper":
-                feat = self.feature_extractor.extract_paper_features(
-                    item, self.embedding_manager, selected_interests, recent_texts=recent_texts
-                )
-            else:
-                feat = self.feature_extractor.extract_article_features(
-                    item, self.embedding_manager, selected_interests, recent_texts=recent_texts
-                )
+            feat = self.feature_extractor.extract_features(
+                item, item_type, self.embedding_manager, selected_interests,
+                recent_texts=recent_texts,
+            )
             features.append(feat)
 
         if use_ml:

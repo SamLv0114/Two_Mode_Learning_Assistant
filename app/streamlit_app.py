@@ -17,9 +17,6 @@ if str(project_root) not in sys.path:
 from src.pipelines import DailyFeedPipeline, QAAssistant
 from src.utils.config import settings
 from src.utils.preprocessing import extract_text_from_pdf
-from src.models import ModelTrainer
-from src.models.embeddings import EmbeddingManager
-from src.database.models import SessionLocal
 
 
 st.set_page_config(
@@ -67,9 +64,7 @@ if "focus_areas" not in st.session_state:
 if "interest_phrases" not in st.session_state:
     st.session_state.interest_phrases = []
 if "trainer" not in st.session_state:
-    db = SessionLocal()
-    embedding_manager = EmbeddingManager()
-    st.session_state.trainer = ModelTrainer(db, embedding_manager)
+    st.session_state.trainer = st.session_state.pipeline.trainer
 
 
 # Helper utilities for consistent interaction tracking
@@ -290,7 +285,7 @@ elif mode == "Q&A Assistant":
                     if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
                         content = extract_text_from_pdf(uploaded_file.getvalue())
                     else:
-                        cotent = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+                        content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
                 except Exception as e:
                     st.warning(f"Failed to read {uploaded_file.name}: {e}")
                     content = ""
