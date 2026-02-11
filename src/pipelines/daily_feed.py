@@ -9,8 +9,12 @@ import random
 
 from sqlalchemy import exc as sa_exc
 
+from sqlalchemy.orm import Session
+
 from src.collectors import ArxivCollector, PaperData, HNCollector, MediumCollector, DevToCollector
-from src.models import EmbeddingManager, Recommender, FeatureExtractor, ModelTrainer
+from src.models import EmbeddingManager, FeatureExtractor
+from src.models.user_recommender import UserRecommender
+from src.models.user_trainer import UserModelTrainer
 from src.rag import Generator
 from src.database.models import Paper, Article, SessionLocal, init_db
 from src.utils.config import settings
@@ -22,21 +26,24 @@ logger = logging.getLogger(__name__)
 class DailyFeedPipeline:
     """Main pipeline for daily feed generation"""
     
-    def __init__(self):
-        self.embedding_manager = EmbeddingManager()
+    def __init__(self, user_id: int, db_session: Session, embedding_manager: EmbeddingManager = None):
+        self.user_id = user_id
+        self.db = db_session
+        self.embedding_manager = embedding_manager or EmbeddingManager()
         self.generator = Generator()
         self.feature_extractor = FeatureExtractor()
-        self.recommender = Recommender()  # Unified: heuristic + ML personalization
-        self.db = SessionLocal()
-        self.trainer = ModelTrainer(self.db, self.embedding_manager)  # Learns from your clicks
+        self.recommender = UserRecommender(user_id, db_session)
+        self.trainer = UserModelTrainer(user_id, db_session, self.embedding_manager)
         init_db()
     
-    def run(self, time_window_days: int = 7, focus_areas: List[str] = None):
+    def run(self, time_window_days: int = 7, focus_areas: List[str] = None, user_interests: List[str] = None):
         logger.info("Starting daily feed pipeline...")
-        
+
         # Normalize user selections
         time_window_days = max(1, time_window_days)
         selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
+        # Store full interest phrases for personalized summaries
+        self._user_interests = user_interests or selected_interests
         logger.info("Daily feed mode")
         # Scale fetch budgets with time window (simple linear scale, capped)
         scale = min(time_window_days / 7.0, 52)  # up to ~1 year
@@ -283,6 +290,13 @@ class DailyFeedPipeline:
                     logger.error(f"Error saving article {article_data.url}: {e}")
         
         self.db.commit()
+
+        # Store db_id on each collector object for interaction tracking
+        for article_data in all_articles:
+            db_art = self.db.query(Article).filter(Article.url == article_data.url).first()
+            if db_art:
+                article_data.db_id = db_art.id
+
         logger.info(f"Stored {new_count} new articles in database")
         return all_articles
     
@@ -589,13 +603,14 @@ class DailyFeedPipeline:
                 content = item.abstract
             else:
                 content = item.content[:1000] if hasattr(item, 'content') else ""
-            
+
             summary = self.generator.generate_summary(
                 title=item.title,
-                content=content
+                content=content,
+                user_interests=getattr(self, '_user_interests', None)
             )
             item.personalized_summary = summary
-            
+
         return items
     
     def _store_results(self, papers: List[PaperData], articles: List):
@@ -694,8 +709,10 @@ class DailyFeedPipeline:
         
         for i, article in enumerate(articles, 1):
             # Get database ID for interaction tracking
-            db_article = self.db.query(Article).filter(Article.url == article.url).first()
-            db_id = db_article.id if db_article else None
+            db_id = getattr(article, 'db_id', None)
+            if db_id is None:
+                db_article = self.db.query(Article).filter(Article.url == article.url).first()
+                db_id = db_article.id if db_article else None
             
             output["articles"].append({
                 "rank": i,
@@ -746,6 +763,10 @@ class DailyFeedPipeline:
 
 
 if __name__ == "__main__":
-    pipeline = DailyFeedPipeline()
-    result = pipeline.run()
-    print(pipeline.format_for_display(result))
+    db = SessionLocal()
+    try:
+        pipeline = DailyFeedPipeline(user_id=1, db_session=db)
+        result = pipeline.run()
+        print(pipeline.format_for_display(result))
+    finally:
+        db.close()

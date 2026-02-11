@@ -36,6 +36,10 @@ ENV/
 
 # Environment variables
 .env
+.env.local
+
+# Node
+node_modules/
 
 # Data and models
 data/
@@ -62,4 +66,5 @@ Thumbs.db
 *.pkl
 *.h5
 *.ckpt
+.scratch
 

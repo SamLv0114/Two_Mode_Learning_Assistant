@@ -4,7 +4,6 @@ LLM answer generation for RAG
 from typing import List, Dict
 from src.utils.config import settings
 import openai
-from anthropic import Anthropic
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -125,12 +124,13 @@ Answer:"""
 Title: {title}
 Content: {content[:2000]}
 
-Provide:
-- One-sentence key insight
-- Why they should care (2-3 sentences)
-- How it relates to their interests
+Use EXACTLY this format (keep each section to 1-2 sentences, total under 100 words):
 
-Keep under 100 words. Be concise and actionable."""
+**Key Insight:** <one sentence>
+**Why Care:** <1-2 sentences>
+**Relation to Interests:** <1-2 sentences>
+
+Be concise and actionable. Do not add any other sections or headings."""
         
         return self._generate(prompt, max_tokens=200)
 

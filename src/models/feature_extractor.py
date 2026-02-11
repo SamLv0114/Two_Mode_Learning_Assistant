@@ -3,7 +3,7 @@ Feature extraction for ranking models
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
-from src.models.recommender import Recommender
+from src.models.user_recommender import UserRecommender
 
 
 class FeatureExtractor:
@@ -102,8 +102,10 @@ class FeatureExtractor:
 
         similarity = embedding_manager.get_similarity_score(interests_text, full_text)
 
-        # Recency
-        if hasattr(item, 'published_date') and item.published_date:
+        # Recency (articles only; papers remain valuable regardless of age)
+        if is_paper:
+            recency_score = 0.5
+        elif hasattr(item, 'published_date') and item.published_date:
             now = datetime.now(timezone.utc)
             pub_date = item.published_date
             if pub_date.tzinfo is None:
@@ -117,7 +119,7 @@ class FeatureExtractor:
 
         # Impact: papers use heuristic score, articles use upvote count
         if is_paper:
-            impact_score = Recommender.calculate_impact_score(item, include_venue=False)
+            impact_score = UserRecommender.calculate_impact_score(item, include_venue=False)
         else:
             upvotes = getattr(item, 'upvotes', 0)
             impact_score = min(upvotes / 500.0, 1.0)
