@@ -63,6 +63,23 @@ services:
       - api
     restart: unless-stopped
 
+  # Prometheus — scrapes /metrics from the API every 15s
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: learning_assistant_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - api
+    restart: unless-stopped
+
   # Nginx Reverse Proxy
   nginx:
     image: nginx:alpine
@@ -82,3 +99,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  prometheus_data:

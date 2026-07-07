@@ -4,13 +4,14 @@ Main FastAPI application
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import logging
 
 from src.utils.config import settings
 from src.database.models import init_db
-from src.api.routers import auth_router, feed_router, interactions_router, qa_router
+from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router
 
 # Configure logging
 logging.basicConfig(
@@ -131,6 +132,13 @@ app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
 app.include_router(feed_router, prefix=settings.API_V1_PREFIX)
 app.include_router(interactions_router, prefix=settings.API_V1_PREFIX)
 app.include_router(qa_router, prefix=settings.API_V1_PREFIX)
+app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
+
+
+# Prometheus metrics endpoint (scraped by Prometheus every 15s)
+@app.get("/metrics", tags=["Observability"], include_in_schema=False)
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # Health check endpoint
