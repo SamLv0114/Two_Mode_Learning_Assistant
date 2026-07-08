@@ -6,10 +6,14 @@ GET  /chat/history/{session_id}    — retrieve conversation history
 DELETE /chat/history/{session_id}  — clear a session
 POST /chat/eval/run                — batch LLM-as-Judge evaluation
 """
+import asyncio
+import json
 import logging
+import threading
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -203,6 +207,108 @@ async def clear_history(
     memory = ConversationMemory(redis_client=_get_redis(), user_id=current_user.id)
     memory.clear_session(session_id)
     return None
+
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
+):
+    """
+    Streaming chat endpoint using Server-Sent Events (SSE).
+
+    Yields a sequence of JSON events so the frontend can visualize the agent's
+    reasoning process in real time:
+
+      {"type": "intent",       "value": "research_qa", "method": "keyword", "confidence": 0.9}
+      {"type": "agent",        "value": "ResearchAgent"}
+      {"type": "tool_call",    "tool": "search_knowledge_base"}
+      {"type": "tool_result",  "tool": "search_knowledge_base", "count": 4}
+      {"type": "generating"}
+      {"type": "token",        "value": "The "}   ← repeats for each token
+      {"type": "done",         "tools_called": [...], "citations": [...]}
+
+    Connect with EventSource (browser) or any SSE client.
+    """
+    if not request.message.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
+
+    session_id = request.session_id or ConversationMemory.new_session_id()
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def run_in_thread():
+        from src.database.models import SessionLocal
+        from src.rag.retriever import Retriever
+
+        db = SessionLocal()
+        try:
+            retriever = Retriever(embedding_manager)
+            context = {
+                "db": db,
+                "user": current_user,
+                "retriever": retriever,
+                "embedding_manager": embedding_manager,
+            }
+
+            agent_router = _get_agent_router(embedding_manager)
+
+            # Stage 1: intent recognition
+            intent, confidence, method = agent_router.recognizer.recognize(request.message)
+            loop.call_soon_threadsafe(queue.put_nowait, {
+                "type": "intent",
+                "value": intent,
+                "method": method,
+                "confidence": round(confidence, 3),
+            })
+
+            # Stage 2: agent selected
+            agent = agent_router._get_agent(intent)
+            loop.call_soon_threadsafe(queue.put_nowait, {
+                "type": "agent",
+                "value": agent.name,
+            })
+
+            # Stage 3: stream agent events (tool calls → tokens)
+            memory = ConversationMemory(redis_client=None, user_id=current_user.id)
+            history = memory.get_history(session_id, max_messages=8)
+
+            reply_parts = []
+            for event in agent.stream(request.message, history, context):
+                if event.get("type") == "token":
+                    reply_parts.append(event["value"])
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+
+            # Persist conversation
+            full_reply = "".join(reply_parts)
+            if full_reply:
+                memory.add_message(session_id, "user", request.message)
+                memory.add_message(session_id, "assistant", full_reply)
+
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "value": str(e)})
+        finally:
+            db.close()
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread.start()
+
+    async def event_generator():
+        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/eval/run", response_model=EvalRunResponse)

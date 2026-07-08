@@ -1,6 +1,9 @@
 """
 Daily feed endpoints
 """
+import json
+import uuid
+import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -18,9 +21,99 @@ from src.utils.config import settings
 from src.models.embeddings import EmbeddingManager
 
 router = APIRouter(prefix="/feed", tags=["Daily Feed"])
+logger = logging.getLogger(__name__)
+
+# ── Job status store (Redis-backed, in-memory fallback) ───────────────────────
+_job_store: dict = {}
+_JOB_TTL = 3600  # 1 hour
 
 
-@router.post("/generate", response_model=FeedResponse)
+def _get_redis():
+    if not settings.REDIS_URL:
+        return None
+    try:
+        import redis
+        client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        client.ping()
+        return client
+    except Exception:
+        return None
+
+
+def _set_status(job_id: str, data: dict) -> None:
+    rc = _get_redis()
+    if rc:
+        try:
+            rc.setex(f"feed_job:{job_id}", _JOB_TTL, json.dumps(data))
+            return
+        except Exception:
+            pass
+    _job_store[job_id] = data
+
+
+def _get_status(job_id: str) -> dict:
+    rc = _get_redis()
+    if rc:
+        try:
+            raw = rc.get(f"feed_job:{job_id}")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    return _job_store.get(job_id, {"status": "not_found"})
+
+
+# ── Background pipeline runner ────────────────────────────────────────────────
+
+def _run_pipeline_background(
+    job_id: str,
+    user_id: int,
+    time_window_days: int,
+    focus_areas: List[str],
+    user_interests: List[str],
+) -> None:
+    """Runs the full feed pipeline in a background thread with its own DB session."""
+    from src.database.models import SessionLocal, User as UserModel
+    from src.api.deps import get_embedding_manager
+
+    try:
+        _set_status(job_id, {"status": "collecting", "message": "Collecting papers and articles..."})
+
+        db = SessionLocal()
+        try:
+            embedding_manager = get_embedding_manager()
+            from src.pipelines.daily_feed import DailyFeedPipeline
+
+            _set_status(job_id, {"status": "ranking", "message": "Ranking and summarizing content..."})
+
+            pipeline = DailyFeedPipeline(
+                user_id=user_id,
+                db_session=db,
+                embedding_manager=embedding_manager,
+            )
+            result = pipeline.run(
+                time_window_days=time_window_days,
+                focus_areas=focus_areas,
+                user_interests=user_interests,
+            )
+
+            _set_status(job_id, {
+                "status": "done",
+                "message": "Feed ready",
+                "papers_count": len(result.get("papers", [])),
+                "articles_count": len(result.get("articles", [])),
+                "used_ml_ranking": result.get("used_ml_ranking", False),
+            })
+            logger.info(f"Feed job {job_id} completed for user {user_id}")
+        finally:
+            db.close()
+
+    except Exception as e:
+        logger.error(f"Feed job {job_id} failed: {e}")
+        _set_status(job_id, {"status": "error", "message": str(e)})
+
+
+@router.post("/generate")
 async def generate_feed(
     request: FeedRequest,
     background_tasks: BackgroundTasks,
@@ -29,99 +122,52 @@ async def generate_feed(
     embedding_manager: EmbeddingManager = Depends(get_embedding_manager)
 ):
     """
-    Generate a personalized daily feed of papers and articles
+    Start personalized feed generation in the background.
+
+    Returns a job_id immediately. Poll GET /feed/status/{job_id} to track
+    progress, then fetch results from GET /feed/papers and GET /feed/articles.
 
     - **time_window_days**: How far back to look for content (1-365)
     - **focus_areas**: Optional list of focus areas to prioritize
     - **custom_interests**: Optional additional interest keywords
-    - **use_ml**: Whether to use ML ranking (if model is trained)
     """
-    try:
-        # Get user interests
-        user_interests = current_user.get_interests_list()
-        if request.custom_interests:
-            user_interests = user_interests + request.custom_interests
+    user_interests = current_user.get_interests_list()
+    if request.custom_interests:
+        user_interests = user_interests + request.custom_interests
+    focus_areas = request.focus_areas or current_user.get_focus_areas_list()
 
-        focus_areas = request.focus_areas or current_user.get_focus_areas_list()
+    job_id = str(uuid.uuid4())
+    _set_status(job_id, {"status": "generating", "message": "Starting feed generation..."})
 
-        # Import pipeline
-        from src.pipelines.daily_feed import DailyFeedPipeline
+    background_tasks.add_task(
+        _run_pipeline_background,
+        job_id=job_id,
+        user_id=current_user.id,
+        time_window_days=request.time_window_days,
+        focus_areas=focus_areas or user_interests,
+        user_interests=user_interests,
+    )
 
-        # Create per-user pipeline
-        pipeline = DailyFeedPipeline(
-            user_id=current_user.id,
-            db_session=db,
-            embedding_manager=embedding_manager,
-        )
+    return {"job_id": job_id, "status": "generating", "message": "Feed generation started"}
 
-        # Run pipeline
-        result = pipeline.run(
-            time_window_days=request.time_window_days,
-            focus_areas=focus_areas or user_interests,
-            user_interests=user_interests,
-        )
 
-        # Format response
-        papers = []
-        for i, paper_data in enumerate(result.get("papers", []), 1):
-            # Handle None values - .get() returns None when key exists with None value
-            impact = paper_data.get("impact_score")
-            if isinstance(impact, str):
-                try:
-                    impact = float(impact)
-                except (ValueError, TypeError):
-                    impact = None
+@router.get("/status/{job_id}")
+async def feed_status(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Poll the status of a feed generation job.
 
-            papers.append(PaperResponse(
-                id=paper_data.get("db_id") or 0,
-                rank=i,
-                arxiv_id=paper_data.get("arxiv_id") or "",
-                title=paper_data.get("title") or "",
-                authors=paper_data.get("authors"),
-                abstract=paper_data.get("abstract"),
-                categories=paper_data.get("categories"),
-                published_date=paper_data.get("published_date"),
-                arxiv_url=paper_data.get("url"),
-                pdf_url=paper_data.get("pdf_url"),
-                citation_count=paper_data.get("citation_count") or 0,
-                relevance_score=paper_data.get("relevance_score") or 0.0,
-                impact_score=impact,
-                summary=paper_data.get("summary")
-            ))
-
-        articles = []
-        for i, article_data in enumerate(result.get("articles", []), 1):
-            articles.append(ArticleResponse(
-                id=article_data.get("db_id") or 0,
-                rank=i,
-                source=article_data.get("source") or "",
-                title=article_data.get("title") or "",
-                url=article_data.get("url") or "",
-                author=article_data.get("author"),
-                published_date=article_data.get("published_date"),
-                upvotes=article_data.get("upvotes") or 0,
-                relevance_score=article_data.get("relevance_score") or 0.0,
-                summary=article_data.get("summary")
-            ))
-
-        return FeedResponse(
-            papers=papers,
-            articles=articles,
-            generated_at=datetime.now(timezone.utc),
-            time_window_days=request.time_window_days,
-            focus_areas=focus_areas or [],
-            used_ml_ranking=result.get("used_ml_ranking", False),
-            total_papers_considered=result.get("total_papers_considered", 0),
-            total_articles_considered=result.get("total_articles_considered", 0)
-        )
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate feed: {str(e)}"
-        )
+    Status values:
+    - **generating** — pipeline is starting up
+    - **collecting** — fetching papers and articles
+    - **ranking**    — ML ranking and LLM summarization in progress
+    - **done**       — complete, fetch results from /feed/papers
+    - **error**      — pipeline failed (message contains reason)
+    - **not_found**  — job_id unknown or expired (TTL: 1 hour)
+    """
+    return _get_status(job_id)
 
 
 @router.get("/papers", response_model=List[PaperResponse])
