@@ -1,11 +1,15 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
-import { feedApi, interactionsApi, qaApi, authApi, Paper, Article, FeedResponse, InteractionStats } from '@/lib/api';
+import {
+  feedApi, interactionsApi, qaApi, authApi, chatApi,
+  Paper, Article, FeedResponse, InteractionStats, FeedJobStatus, AgentEvent,
+  API_BASE_URL,
+} from '@/lib/api';
 import toast from 'react-hot-toast';
-import { BookOpen, FileText, Save, Eye, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp } from 'lucide-react';
+import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send } from 'lucide-react';
 
 const AVAILABLE_AREAS = ['ML', 'NLP', 'CV', 'AI', 'DL'];
 const EXAMPLE_INTERESTS = [
@@ -23,8 +27,10 @@ export default function DashboardPage() {
   const [feed, setFeed] = useState<FeedResponse | null>(null);
   const [stats, setStats] = useState<InteractionStats | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [feedProgress, setFeedProgress] = useState('');
   const [timeWindow, setTimeWindow] = useState(7);
-  const [activeTab, setActiveTab] = useState<'feed' | 'saved' | 'qa' | 'settings'>('feed');
+  const [activeTab, setActiveTab] = useState<'feed' | 'saved' | 'chat' | 'qa' | 'settings'>('feed');
+  const feedPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     fetchProfile();
@@ -42,6 +48,12 @@ export default function DashboardPage() {
     }
   }, [isAuthenticated]);
 
+  useEffect(() => {
+    return () => {
+      if (feedPollRef.current) clearInterval(feedPollRef.current);
+    };
+  }, []);
+
   const loadStats = async () => {
     try {
       const data = await interactionsApi.getStats();
@@ -52,19 +64,63 @@ export default function DashboardPage() {
   };
 
   const generateFeed = async () => {
+    if (feedPollRef.current) clearInterval(feedPollRef.current);
     setIsGenerating(true);
+    setFeedProgress('Starting feed generation...');
+    setFeed(null);
     try {
-      const data = await feedApi.generate({
+      const { job_id } = await feedApi.generate({
         time_window_days: timeWindow,
         focus_areas: user?.focus_areas,
         use_ml: true,
       });
-      setFeed(data);
-      toast.success('Feed generated!');
-      loadStats();
+
+      feedPollRef.current = setInterval(async () => {
+        try {
+          const status: FeedJobStatus = await feedApi.getJobStatus(job_id);
+
+          const msgMap: Record<string, string> = {
+            generating: 'Starting feed generation...',
+            collecting: 'Collecting papers and articles...',
+            ranking: 'Ranking and summarizing content (this takes 1-2 min)...',
+            done: 'Feed ready!',
+            error: status.message || 'Pipeline error',
+            not_found: 'Job expired',
+          };
+          setFeedProgress(msgMap[status.status] || status.message || status.status);
+
+          if (status.status === 'done') {
+            clearInterval(feedPollRef.current!);
+            feedPollRef.current = null;
+            const [papers, articles] = await Promise.all([
+              feedApi.getPapers(20),
+              feedApi.getArticles(20),
+            ]);
+            setFeed({
+              papers,
+              articles,
+              generated_at: new Date().toISOString(),
+              time_window_days: timeWindow,
+              focus_areas: user?.focus_areas || [],
+              used_ml_ranking: status.used_ml_ranking ?? false,
+              total_papers_considered: status.papers_count ?? papers.length,
+              total_articles_considered: status.articles_count ?? articles.length,
+            });
+            toast.success('Feed ready!');
+            loadStats();
+            setIsGenerating(false);
+          } else if (status.status === 'error' || status.status === 'not_found') {
+            clearInterval(feedPollRef.current!);
+            feedPollRef.current = null;
+            toast.error(status.message || 'Feed generation failed');
+            setIsGenerating(false);
+          }
+        } catch (_) {
+          // transient error — keep polling
+        }
+      }, 2500);
     } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Failed to generate feed');
-    } finally {
+      toast.error(error.response?.data?.detail || 'Failed to start feed generation');
       setIsGenerating(false);
     }
   };
@@ -176,6 +232,17 @@ export default function DashboardPage() {
             Saved Items
           </button>
           <button
+            onClick={() => setActiveTab('chat')}
+            className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-1.5 ${
+              activeTab === 'chat'
+                ? 'bg-primary-600 text-white'
+                : 'bg-white text-gray-700 hover:bg-gray-100'
+            }`}
+          >
+            <Bot className="w-4 h-4" />
+            Agent Chat
+          </button>
+          <button
             onClick={() => setActiveTab('qa')}
             className={`px-4 py-2 rounded-lg font-medium transition-colors ${
               activeTab === 'qa'
@@ -205,6 +272,7 @@ export default function DashboardPage() {
               timeWindow={timeWindow}
               setTimeWindow={setTimeWindow}
               isGenerating={isGenerating}
+              feedProgress={feedProgress}
               onGenerate={generateFeed}
               onProfileUpdate={fetchProfile}
             />
@@ -273,6 +341,8 @@ export default function DashboardPage() {
 
         {activeTab === 'saved' && <SavedItems />}
 
+        {activeTab === 'chat' && <AgentChat />}
+
         {activeTab === 'qa' && <QAAssistant />}
 
         {activeTab === 'settings' && <UserSettings user={user} onUpdate={fetchProfile} />}
@@ -287,6 +357,7 @@ function FeedControls({
   timeWindow,
   setTimeWindow,
   isGenerating,
+  feedProgress,
   onGenerate,
   onProfileUpdate,
 }: {
@@ -294,6 +365,7 @@ function FeedControls({
   timeWindow: number;
   setTimeWindow: (v: number) => void;
   isGenerating: boolean;
+  feedProgress: string;
   onGenerate: () => void;
   onProfileUpdate: () => void;
 }) {
@@ -423,6 +495,17 @@ function FeedControls({
           </button>
         </div>
       </div>
+
+      {/* Feed generation progress */}
+      {isGenerating && feedProgress && (
+        <div className="mt-4 flex items-start gap-3 bg-blue-50 border border-blue-100 rounded-lg px-4 py-3">
+          <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-medium text-blue-800">{feedProgress}</p>
+            <p className="text-xs text-blue-500 mt-0.5">Feed generation takes 1-2 minutes on first run</p>
+          </div>
+        </div>
+      )}
 
       {/* Expandable personalization section */}
       {expanded && (
@@ -824,6 +907,361 @@ function UserSettings({ user, onUpdate }: { user: any; onUpdate: () => void }) {
           </>
         )}
       </button>
+    </div>
+  );
+}
+
+// ── Agent Chat constants ──────────────────────────────────────────────────────
+
+const INTENT_COLORS: Record<string, string> = {
+  research_qa: 'bg-blue-100 text-blue-700',
+  recommendation: 'bg-green-100 text-green-700',
+  document_management: 'bg-amber-100 text-amber-700',
+  general_chat: 'bg-gray-100 text-gray-600',
+};
+
+const INTENT_LABELS: Record<string, string> = {
+  research_qa: 'Research Q&A',
+  recommendation: 'Recommendations',
+  document_management: 'Documents',
+  general_chat: 'General Chat',
+};
+
+const TOOL_LABELS: Record<string, string> = {
+  search_knowledge_base: 'Search KB',
+  get_personalized_feed: 'Get Feed',
+  list_user_documents: 'List Docs',
+  search_user_documents: 'Search Docs',
+};
+
+const TOOL_ICONS: Record<string, string> = {
+  search_knowledge_base: '🔍',
+  get_personalized_feed: '📰',
+  list_user_documents: '📁',
+  search_user_documents: '🔎',
+};
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  intent?: string;
+  intentMethod?: string;
+  intentConfidence?: number;
+  agentUsed?: string;
+  toolCalls?: { tool: string; count: number }[];
+  citations?: { title: string; url: string; type: string }[];
+  isStreaming?: boolean;
+}
+
+/* ── Agent Chat ── */
+function AgentChat() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const sendMessage = async () => {
+    if (!input.trim() || isStreaming) return;
+
+    const userMsg: ChatMessage = { id: `u-${Date.now()}`, role: 'user', content: input };
+    const assistantId = `a-${Date.now() + 1}`;
+    const assistantMsg: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      isStreaming: true,
+      toolCalls: [],
+    };
+
+    setMessages(prev => [...prev, userMsg, assistantMsg]);
+    const text = input;
+    setInput('');
+    setIsStreaming(true);
+
+    abortRef.current = new AbortController();
+
+    try {
+      const token = chatApi.getAuthToken();
+      const res = await fetch(chatApi.getStreamUrl(), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ message: text, session_id: sessionId }),
+        signal: abortRef.current.signal,
+      });
+
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      const applyEvent = (event: AgentEvent) => {
+        setMessages(prev =>
+          prev.map(m => {
+            if (m.id !== assistantId) return m;
+            switch (event.type) {
+              case 'session':
+                setSessionId(event.session_id);
+                return m;
+              case 'intent':
+                return { ...m, intent: event.value, intentMethod: event.method, intentConfidence: event.confidence };
+              case 'agent':
+                return { ...m, agentUsed: event.value };
+              case 'tool_call':
+                return { ...m, toolCalls: [...(m.toolCalls || []), { tool: event.tool, count: -1 }] };
+              case 'tool_result': {
+                const updated = (m.toolCalls || []).map(tc =>
+                  tc.tool === event.tool && tc.count === -1 ? { ...tc, count: event.count } : tc
+                );
+                return { ...m, toolCalls: updated };
+              }
+              case 'token':
+                return { ...m, content: m.content + event.value };
+              case 'done':
+                return { ...m, isStreaming: false, citations: event.citations };
+              case 'error':
+                return { ...m, isStreaming: false, content: m.content || `Error: ${event.value}` };
+              default:
+                return m;
+            }
+          })
+        );
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          if (line.startsWith('data: ')) {
+            try {
+              applyEvent(JSON.parse(line.slice(6)) as AgentEvent);
+            } catch (_) { /* skip malformed */ }
+          }
+        }
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === assistantId
+              ? { ...m, isStreaming: false, content: m.content || 'Failed to get a response. Please try again.' }
+              : m
+          )
+        );
+      }
+    } finally {
+      setIsStreaming(false);
+      setMessages(prev =>
+        prev.map(m => m.id === assistantId ? { ...m, isStreaming: false } : m)
+      );
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const clearChat = () => {
+    abortRef.current?.abort();
+    setMessages([]);
+    setSessionId(null);
+    setIsStreaming(false);
+  };
+
+  return (
+    <div className="flex flex-col" style={{ height: 'calc(100vh - 320px)', minHeight: 480 }}>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+            <Bot className="w-5 h-5 text-primary-600" />
+            Agent Chat
+          </h2>
+          <p className="text-xs text-gray-400 mt-0.5">
+            Powered by multi-agent routing — ask research questions, get recommendations, or manage documents
+          </p>
+        </div>
+        <button
+          onClick={clearChat}
+          className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1 px-2 py-1 rounded hover:bg-gray-100"
+        >
+          <X className="w-3.5 h-3.5" />
+          New Chat
+        </button>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full text-center py-12">
+            <Bot className="w-12 h-12 text-gray-200 mb-3" />
+            <p className="text-gray-500 font-medium">Ask me anything</p>
+            <p className="text-sm text-gray-400 mt-1 max-w-sm">
+              Research questions, paper recommendations, or searches across your uploaded documents
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2 justify-center">
+              {[
+                'What are recent advances in transformers?',
+                'Recommend papers on reinforcement learning',
+                'List my uploaded documents',
+              ].map(ex => (
+                <button
+                  key={ex}
+                  onClick={() => setInput(ex)}
+                  className="text-xs bg-gray-50 border border-gray-200 rounded-full px-3 py-1.5 text-gray-600 hover:bg-primary-50 hover:border-primary-200 hover:text-primary-700 transition-colors"
+                >
+                  {ex}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {messages.map(msg => (
+          <ChatBubble key={msg.id} message={msg} />
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Input */}
+      <div className="flex gap-2 mt-4 pt-4 border-t">
+        <input
+          type="text"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Ask a question..."
+          className="input-field flex-1"
+          disabled={isStreaming}
+        />
+        <button
+          onClick={sendMessage}
+          disabled={isStreaming || !input.trim()}
+          className="btn-primary flex items-center gap-2 disabled:opacity-50 shrink-0"
+        >
+          {isStreaming ? (
+            <RefreshCw className="w-4 h-4 animate-spin" />
+          ) : (
+            <Send className="w-4 h-4" />
+          )}
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── Chat Bubble ── */
+function ChatBubble({ message }: { message: ChatMessage }) {
+  if (message.role === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className="bg-primary-600 text-white rounded-2xl rounded-tr-sm px-4 py-3 max-w-[80%] text-sm leading-relaxed">
+          {message.content}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex justify-start">
+      <div className="flex-1 max-w-[88%] space-y-2">
+        {/* Intent + agent badges */}
+        {(message.intent || message.agentUsed) && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {message.intent && (
+              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${INTENT_COLORS[message.intent] || 'bg-gray-100 text-gray-600'}`}>
+                {INTENT_LABELS[message.intent] || message.intent}
+              </span>
+            )}
+            {message.agentUsed && (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 font-medium">
+                {message.agentUsed}
+              </span>
+            )}
+            {message.intentMethod && message.intentConfidence !== undefined && (
+              <span className="text-xs text-gray-400">
+                via {message.intentMethod} · {Math.round(message.intentConfidence * 100)}%
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Tool calls */}
+        {message.toolCalls && message.toolCalls.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {message.toolCalls.map((tc, i) => (
+              <span
+                key={i}
+                className={`text-xs px-2 py-0.5 rounded-full border font-medium ${
+                  tc.count === -1
+                    ? 'bg-yellow-50 border-yellow-200 text-yellow-700 animate-pulse'
+                    : 'bg-green-50 border-green-200 text-green-700'
+                }`}
+              >
+                {TOOL_ICONS[tc.tool] || '⚙'} {TOOL_LABELS[tc.tool] || tc.tool}
+                {tc.count >= 0 && ` (${tc.count})`}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Reply */}
+        <div className="bg-white border border-gray-100 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
+          {message.content ? (
+            <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{message.content}</p>
+          ) : (
+            <div className="flex items-center gap-2 text-gray-400 text-sm">
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              Thinking...
+            </div>
+          )}
+          {message.isStreaming && message.content && (
+            <span className="inline-block w-0.5 h-4 bg-gray-400 animate-pulse align-middle ml-0.5" />
+          )}
+        </div>
+
+        {/* Citations */}
+        {message.citations && message.citations.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {message.citations.map((c, i) => (
+              <a
+                key={i}
+                href={c.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs px-2 py-0.5 rounded bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-100 max-w-[200px] truncate"
+              >
+                {c.title || 'Source'} &rarr;
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
