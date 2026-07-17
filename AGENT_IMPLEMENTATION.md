@@ -159,8 +159,24 @@ Each agent uses OpenAI function calling (structured tool use):
 - [x] `prometheus/prometheus.yml` — scrape config (job: researchmate_api, interval: 15s)
 - [x] `docker-compose.yml` — Prometheus service + `prometheus_data` volume
 - [x] `prometheus-client>=0.19.0` added to `requirements.txt`
-- [ ] Frontend integration (new chat UI panel)
+- [x] Frontend integration — `AgentChat` + `ChatBubble` components with SSE streaming (`fetch` + `ReadableStream`); intent badges, tool chips, citations
 - [ ] End-to-end smoke test with real API keys
+
+---
+
+## Feed Pipeline Performance Optimizations (2026-07)
+
+Changes made to reduce feed generation time from ~5-6 min toward ~2 min:
+
+| Change | File | Before | After |
+|--------|------|--------|-------|
+| Medium content | `src/collectors/medium_collector.py` | Scraped each article URL (30+ HTTP requests × 10s timeout) | RSS `<summary>` field parsed with BeautifulSoup |
+| Dev.to content | `src/collectors/devto_collector.py` | Scraped each article URL | RSS `<summary>` field parsed with BeautifulSoup |
+| HN item timeout | `src/collectors/hn_collector.py` | 10s per request | 3s per request |
+| LLM summarization | `src/pipelines/daily_feed.py` | Sequential (one call at a time) | Parallel via `ThreadPoolExecutor(max_workers=4)` |
+| Novelty comparison | `src/utils/config.py` `NOVELTY_MAX_ITEMS` | 50 | 10 |
+
+**ArXiv time-slice bucketing was intentionally left unchanged** — it exists to give even coverage across the full 7-day window and avoid bias toward the most recent day.
 
 ---
 

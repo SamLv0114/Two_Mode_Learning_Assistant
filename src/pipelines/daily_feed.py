@@ -2,6 +2,7 @@
 """
 MODE 1: Daily Recommendation Feed Pipeline
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 import logging
@@ -598,19 +599,29 @@ class DailyFeedPipeline:
         return candidates
     
     def _generate_summaries(self, items: List, item_type: str) -> List:
-        """Generate personalized summaries for items"""
-        for item in items:
-            if item_type == "paper":
-                content = item.abstract
-            else:
-                content = item.content[:1000] if hasattr(item, 'content') else ""
+        """Generate personalized summaries for items (parallel API calls)."""
+        if not items:
+            return items
 
-            summary = self.generator.generate_summary(
+        user_interests = getattr(self, '_user_interests', None)
+
+        def summarize(item):
+            content = item.abstract if item_type == "paper" else (
+                item.content[:1000] if hasattr(item, 'content') else ""
+            )
+            item.personalized_summary = self.generator.generate_summary(
                 title=item.title,
                 content=content,
-                user_interests=getattr(self, '_user_interests', None)
+                user_interests=user_interests,
             )
-            item.personalized_summary = summary
+
+        with ThreadPoolExecutor(max_workers=min(len(items), 4)) as executor:
+            futures = {executor.submit(summarize, item): item for item in items}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.warning(f"Summary generation failed for an item: {e}")
 
         return items
     

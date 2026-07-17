@@ -40,12 +40,12 @@ class HNCollector:
         try:
             # Hacker News API
             top_stories_url = "https://hacker-news.firebaseio.com/v0/topstories.json"
-            response = requests.get(top_stories_url, timeout=10)
+            response = requests.get(top_stories_url, timeout=3)
             story_ids = response.json()[:limit * 2]  # Fetch more to account for date filtering
             
             for story_id in story_ids:
                 story_url = f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json"
-                story_data = requests.get(story_url, timeout=10).json()
+                story_data = requests.get(story_url, timeout=3).json()
                 
                 if story_data and story_data.get("type") == "story" and story_data.get("url"):
                     # Parse published date
@@ -84,7 +84,7 @@ class HNCollector:
     def _extract_content(self, url: str) -> str:
         """Extract text content from a URL"""
         try:
-            response = requests.get(url, timeout=10, headers={
+            response = requests.get(url, timeout=3, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             })
             soup = BeautifulSoup(response.content, "html.parser")

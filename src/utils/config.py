@@ -52,7 +52,7 @@ class Settings(BaseSettings):
 
     # Novelty settings
     NOVELTY_LOOKBACK_DAYS: int = 14
-    NOVELTY_MAX_ITEMS: int = 50
+    NOVELTY_MAX_ITEMS: int = 10
 
     # Implicit feedback handling
     INCLUDE_IMPLICIT_NEGATIVES: bool = True

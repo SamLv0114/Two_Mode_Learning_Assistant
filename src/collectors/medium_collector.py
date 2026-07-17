@@ -2,7 +2,6 @@
 Medium article collector
 """
 import feedparser
-import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -54,14 +53,16 @@ class MediumCollector:
                     if published_date < cutoff_date:
                         continue
                 
-                content = self._extract_content(entry.link)
-                
+                # Use RSS summary directly — avoids scraping each article URL
+                raw_summary = entry.get("summary", "") or entry.get("description", "")
+                content = BeautifulSoup(raw_summary, "html.parser").get_text()[:5000] if raw_summary else entry.title
+
                 article = ArticleData(
                     source="medium",
                     source_id=entry.get("id", entry.link),
                     title=entry.title,
                     url=entry.link,
-                    content=content or entry.get("summary", ""),
+                    content=content,
                     author=entry.get("author"),
                     published_date=published_date,
                     upvotes=0
@@ -70,35 +71,9 @@ class MediumCollector:
                 
                 if len(articles) >= limit:
                     break
-                
+
         except Exception as e:
             logger.error(f"Error fetching Medium articles: {e}")
-        
+
         return articles
-    
-    def _extract_content(self, url: str) -> str:
-        """Extract text content from a URL"""
-        try:
-            response = requests.get(url, timeout=10, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            })
-            soup = BeautifulSoup(response.content, "html.parser")
-            
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # Get text
-            text = soup.get_text()
-            
-            # Clean up whitespace
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = " ".join(chunk for chunk in chunks if chunk)
-            
-            return text[:5000]  # Limit content length
-            
-        except Exception as e:
-            logger.debug(f"Could not extract content from {url}: {e}")
-            return ""
 
