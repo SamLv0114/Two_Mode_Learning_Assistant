@@ -12,6 +12,7 @@ class FeedRequest(BaseModel):
     focus_areas: Optional[List[str]] = None
     custom_interests: Optional[List[str]] = None
     use_ml: bool = True  # Whether to use ML ranking if available
+    mode: str = Field(default="recommended", pattern="^(recommended|latest)$")
 
 
 class PaperResponse(BaseModel):

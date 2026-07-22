@@ -71,6 +71,7 @@ def _run_pipeline_background(
     time_window_days: int,
     focus_areas: List[str],
     user_interests: List[str],
+    mode: str = "recommended",
 ) -> None:
     """Runs the full feed pipeline in a background thread with its own DB session."""
     from src.database.models import SessionLocal, User as UserModel
@@ -95,6 +96,7 @@ def _run_pipeline_background(
                 time_window_days=time_window_days,
                 focus_areas=focus_areas,
                 user_interests=user_interests,
+                mode=mode,
             )
 
             _set_status(job_id, {
@@ -146,6 +148,7 @@ async def generate_feed(
         time_window_days=request.time_window_days,
         focus_areas=focus_areas or user_interests,
         user_interests=user_interests,
+        mode=request.mode,
     )
 
     return {"job_id": job_id, "status": "generating", "message": "Feed generation started"}

@@ -7,11 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from apscheduler.schedulers.background import BackgroundScheduler
 import logging
 
 from src.utils.config import settings
 from src.database.models import init_db
 from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router
+from src.jobs.nightly_indexer import run_nightly_index
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +21,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Module-level scheduler (shared across lifespan)
+_scheduler = BackgroundScheduler(timezone="UTC")
 
 
 @asynccontextmanager
@@ -47,12 +52,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Could not pre-load embedding manager: {e}")
 
+    # Start nightly indexer — runs at 06:00 UTC daily (ArXiv RSS updates ~05:00 UTC)
+    try:
+        _scheduler.add_job(run_nightly_index, "cron", hour=6, minute=0, id="nightly_index")
+        _scheduler.start()
+        logger.info("Nightly indexer scheduled at 06:00 UTC daily")
+    except Exception as e:
+        logger.warning(f"Could not start scheduler: {e}")
+
     logger.info("API startup complete")
 
     yield
 
     # Shutdown
     logger.info("Shutting down Learning Assistant API...")
+    if _scheduler.running:
+        _scheduler.shutdown(wait=False)
 
 
 # Create FastAPI application
@@ -139,6 +154,16 @@ app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
 @app.get("/metrics", tags=["Observability"], include_in_schema=False)
 async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# Manual trigger for the nightly indexer — useful for testing and first-run seeding
+@app.post("/api/v1/admin/index-now", tags=["Admin"])
+async def trigger_index():
+    """Run the nightly paper indexer immediately (for testing/manual refresh)."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, run_nightly_index)
+    return result
 
 
 # Health check endpoint

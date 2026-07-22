@@ -29,6 +29,7 @@ export default function DashboardPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [feedProgress, setFeedProgress] = useState('');
   const [timeWindow, setTimeWindow] = useState(7);
+  const [feedMode, setFeedMode] = useState<'recommended' | 'latest'>('recommended');
   const [activeTab, setActiveTab] = useState<'feed' | 'saved' | 'chat' | 'qa' | 'settings'>('feed');
   const feedPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -73,6 +74,7 @@ export default function DashboardPage() {
         time_window_days: timeWindow,
         focus_areas: user?.focus_areas,
         use_ml: true,
+        mode: feedMode,
       });
 
       feedPollRef.current = setInterval(async () => {
@@ -271,6 +273,8 @@ export default function DashboardPage() {
               user={user}
               timeWindow={timeWindow}
               setTimeWindow={setTimeWindow}
+              feedMode={feedMode}
+              setFeedMode={setFeedMode}
               isGenerating={isGenerating}
               feedProgress={feedProgress}
               onGenerate={generateFeed}
@@ -356,6 +360,8 @@ function FeedControls({
   user,
   timeWindow,
   setTimeWindow,
+  feedMode,
+  setFeedMode,
   isGenerating,
   feedProgress,
   onGenerate,
@@ -364,6 +370,8 @@ function FeedControls({
   user: any;
   timeWindow: number;
   setTimeWindow: (v: number) => void;
+  feedMode: 'recommended' | 'latest';
+  setFeedMode: (v: 'recommended' | 'latest') => void;
   isGenerating: boolean;
   feedProgress: string;
   onGenerate: () => void;
@@ -428,23 +436,51 @@ function FeedControls({
 
   return (
     <div className="card mb-6">
-      {/* Top row: time window + generate */}
+      {/* Top row: mode + time window + generate */}
       <div className="flex flex-wrap items-center gap-4">
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Time window
-          </label>
-          <select
-            value={timeWindow}
-            onChange={(e) => setTimeWindow(Number(e.target.value))}
-            className="input-field w-40"
-          >
-            <option value={1}>1 day</option>
-            <option value={7}>1 week</option>
-            <option value={30}>1 month</option>
-            <option value={365}>1 year</option>
-          </select>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Mode</label>
+          <div className="flex rounded-lg border border-gray-200 overflow-hidden">
+            <button
+              onClick={() => setFeedMode('recommended')}
+              className={`px-3 py-1.5 text-sm font-medium transition-colors ${
+                feedMode === 'recommended'
+                  ? 'bg-primary-600 text-white'
+                  : 'bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              Recommended
+            </button>
+            <button
+              onClick={() => setFeedMode('latest')}
+              className={`px-3 py-1.5 text-sm font-medium transition-colors border-l border-gray-200 ${
+                feedMode === 'latest'
+                  ? 'bg-primary-600 text-white'
+                  : 'bg-white text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              Latest
+            </button>
+          </div>
         </div>
+
+        {feedMode === 'latest' && (
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Time window
+            </label>
+            <select
+              value={timeWindow}
+              onChange={(e) => setTimeWindow(Number(e.target.value))}
+              className="input-field w-40"
+            >
+              <option value={1}>1 day</option>
+              <option value={7}>1 week</option>
+              <option value={30}>1 month</option>
+              <option value={365}>1 year</option>
+            </select>
+          </div>
+        )}
 
         {/* Current focus areas preview */}
         <div className="flex-1 min-w-0">

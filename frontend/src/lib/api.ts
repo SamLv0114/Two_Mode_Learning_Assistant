@@ -170,6 +170,7 @@ export const feedApi = {
     focus_areas?: string[];
     custom_interests?: string[];
     use_ml?: boolean;
+    mode?: 'recommended' | 'latest';
   }) => {
     const response = await api.post<{ job_id: string; status: string; message: string }>(
       '/feed/generate',

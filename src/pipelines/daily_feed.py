@@ -14,11 +14,12 @@ from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import Session
 
 from src.collectors import ArxivCollector, PaperData, HNCollector, MediumCollector, DevToCollector
+from src.collectors.semantic_scholar_collector import SemanticScholarCollector
 from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
 from src.rag import Generator
-from src.database.models import Paper, Article, SessionLocal, init_db
+from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction
 from src.utils.config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -38,116 +39,220 @@ class DailyFeedPipeline:
         self.trainer = UserModelTrainer(user_id, db_session, self.embedding_manager)
         init_db()
     
-    def run(self, time_window_days: int = 7, focus_areas: List[str] = None, user_interests: List[str] = None):
-        logger.info("Starting daily feed pipeline...")
+    def run(self, time_window_days: int = 7, focus_areas: List[str] = None, user_interests: List[str] = None, mode: str = "recommended"):
+        logger.info(f"Starting daily feed pipeline (mode={mode})...")
 
-        # Normalize user selections
-        time_window_days = max(1, time_window_days)
         selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
-        # Store full interest phrases for personalized summaries
         self._user_interests = user_interests or selected_interests
-        logger.info("Daily feed mode")
-        # Scale fetch budgets with time window (simple linear scale, capped)
-        scale = min(time_window_days / 7.0, 52)  # up to ~1 year
-        paper_fetch_limit = int(settings.MAX_PAPERS_PER_DAY * scale)
-        article_fetch_limit = int(30 * scale)  # base 30 per source
-        logger.info(f"Fetch scale factor={scale:.2f}, paper_limit={paper_fetch_limit}, article_limit_per_source={article_fetch_limit}")
 
-        # Step 1: Collect new content
-        logger.info("Step 1: Collecting new content...")
-        # Use time-slice bucketing to ensure coverage across the time window
-        # This divides the time window into equal slices and samples from each
-        use_time_slices = True
-        new_papers = self._collect_papers(
-            time_window_days,
-            selected_interests,
-            paper_fetch_limit,
-            use_time_slices=use_time_slices,
-        )
-        new_articles = self._collect_articles(time_window_days, article_fetch_limit)
-        
-        # Step 2: Filter candidates with quality hard filter
-        logger.info(f"Step 2: Filtering candidates with interests: {', '.join(selected_interests)}...")
-        # Calculate min papers per slice for auto-relaxation
-        # Divide time window into slices (same logic as collection)
-        if time_window_days >= 365:
-            num_slices = 12
-        elif time_window_days >= 30:
-            num_slices = 4
-        elif time_window_days >= 7:
-            num_slices = 7
+        # Step 1: Papers — "latest" queries ChromaDB/DB for recent papers,
+        #                   "recommended" uses Semantic Scholar API
+        logger.info(f"Step 1: Fetching papers (mode={mode})...")
+        if mode == "latest":
+            top_papers = self._fetch_papers_latest(selected_interests, days=time_window_days)
         else:
-            num_slices = time_window_days
-        min_papers_per_slice = max(5, settings.TOP_PAPERS_COUNT // num_slices)
-        
-        candidate_papers = self._filter_candidates(
-            new_papers,
-            item_type="paper",
-            selected_interests=selected_interests,
-            min_threshold=0.25,  # slightly lower than default for broader windows
-            min_papers_per_slice=min_papers_per_slice,
-        )
-        candidate_articles = self._filter_candidates(
-            new_articles,
-            item_type="article",
-            selected_interests=selected_interests,
-            min_threshold=0.15,  # articles often have shorter content; lower threshold
-        )
-        
-        # Step 3: Rank items (heuristic before training threshold, ML after)
-        logger.info("Step 3: Ranking items using unified signals...")
-        interaction_count = self.trainer.get_interaction_count()
-        use_ml = interaction_count >= 50
-        # Calculate heuristic impact scores for all papers
-        if candidate_papers:
-            logger.info(f"Computing heuristic scores for {len(candidate_papers)} papers...")
-            for paper in candidate_papers:
-                # Calculate impact using proxy signals (part of unified Ranker)
-                impact_score = self.recommender.calculate_impact_score(paper)
-                # Store heuristic impact separately from citations
-                paper.heuristic_impact_score = impact_score
-            logger.info("Heuristic scoring complete (no API calls needed)")
-        top_papers = self._rank_and_select(
-            candidate_papers,
-            settings.TOP_PAPERS_COUNT,
-            item_type="paper",
-            selected_interests=selected_interests,
-            use_ml=use_ml,
-        )
-        top_articles = self._rank_and_select(
-            candidate_articles,
-            settings.TOP_ARTICLES_COUNT,
-            item_type="article",
-            selected_interests=selected_interests,
-            use_ml=use_ml,
-        )
-        
-        # Step 4: Generate personalized summaries
-        logger.info("Step 4: Generating personalized summaries...")
+            top_papers = self._fetch_papers_semantic_scholar(selected_interests)
+
+        # Step 2: Articles — disabled for now, re-enable once papers are stable
+        # scale = min(max(1, time_window_days) / 7.0, 52)
+        # article_fetch_limit = int(10 * scale)
+        # logger.info("Step 2: Collecting and filtering articles...")
+        # raw_articles = self._collect_articles(time_window_days, article_fetch_limit)
+        # candidate_articles = self._filter_articles(raw_articles, selected_interests, min_threshold=0.15)
+        # top_articles = sorted(
+        #     candidate_articles,
+        #     key=lambda a: (getattr(a, "relevance_score", 0) or 0) * 0.7 + min((getattr(a, "upvotes", 0) or 0) / 500, 1.0) * 0.3,
+        #     reverse=True,
+        # )[:settings.TOP_ARTICLES_COUNT]
+        top_articles = []
+
+        # Step 3: Summarize papers (parallel LLM calls)
+        logger.info("Step 3: Generating personalized summaries...")
         top_papers = self._generate_summaries(top_papers, item_type="paper")
-        top_articles = self._generate_summaries(top_articles, item_type="article")
-        
-        # Step 5: Store in database and vector DB
-        logger.info("Step 5: Storing results...")
+
+        # Step 4: Store and return
+        logger.info("Step 4: Storing results...")
         self._store_results(top_papers, top_articles)
-        
-        # Step 6: Format and return
-        logger.info("Step 6: Formatting output...")
         output = self._format_output(top_papers, top_articles)
-        
-        # Step 7: Check if model should be retrained
-        if use_ml:
-            logger.info(f"Step 7: Retraining model with {interaction_count} interactions...")
-            # Use validation split if we have enough data (>=100 examples)
-            if self.trainer.retrain_model(self.recommender, min_interactions=50, use_validation=True):
-                logger.info("Model retrained successfully! Recommendations will be more personalized.")
+
+        # Step 5: Retrain if enough interactions
+        interaction_count = self.trainer.get_interaction_count()
+        if interaction_count >= 50:
+            logger.info(f"Step 5: Retraining model with {interaction_count} interactions...")
+            self.trainer.retrain_model(self.recommender, min_interactions=50, use_validation=True)
         else:
-            logger.info(f"Step 7: Skipping retrain ({interaction_count}/50 interactions)")
-        
-        # Note: Interactions are recorded when user explicitly clicks Save/View/Dismiss via the Streamlit UI
-        
+            logger.info(f"Step 5: Skipping retrain ({interaction_count}/50 interactions)")
+
         logger.info("Daily feed pipeline completed!")
         return output
+
+    def _fetch_papers_semantic_scholar(self, selected_interests: List[str]) -> List[PaperData]:
+        """
+        Fetch papers from Semantic Scholar — no local embedding computation.
+        Uses Recommendations API when user has history, Search API for cold start.
+        Falls back to empty list on failure (caller still has articles).
+        """
+        s2 = SemanticScholarCollector()
+        limit = settings.TOP_PAPERS_COUNT * 4  # fetch more candidates than we need
+
+        # Check if user has saved/viewed papers to use as positive signals
+        saved_ids = self._get_user_saved_arxiv_ids(max_ids=10)
+
+        if saved_ids:
+            logger.info(f"Using Recommendations API with {len(saved_ids)} saved papers")
+            papers = s2.recommend(saved_ids, limit=limit)
+            if not papers:
+                logger.info("Recommendations returned empty — falling back to search")
+                papers = s2.search(" ".join(selected_interests), limit=limit)
+        else:
+            logger.info("Cold start — using Search API")
+            papers = s2.search(" ".join(selected_interests), limit=limit)
+
+        if not papers:
+            logger.warning("Semantic Scholar returned no papers")
+            return []
+
+        # Filter out papers already recommended recently
+        recently_seen = self._get_recently_recommended_arxiv_ids()
+        papers = [p for p in papers if p.arxiv_id not in recently_seen]
+
+        # Save new papers to PostgreSQL so _store_results can find them
+        self._save_papers_to_db(papers)
+
+        # Three-tier ranking:
+        # Tier 3 — LightGBM behavioral re-ranker (active after 50 interactions)
+        # Tier 1/2 — signal-based fallback (citation + recency + S2 position)
+        interaction_count = self.trainer.get_interaction_count()
+        if interaction_count >= 50:
+            logger.info(f"Tier 3: LightGBM re-ranking ({interaction_count} interactions)")
+            return self._rank_and_select(
+                papers,
+                settings.TOP_PAPERS_COUNT,
+                item_type="paper",
+                selected_interests=selected_interests,
+                use_ml=True,
+            )
+        else:
+            logger.info(f"Tier 1/2: signal-based ranking ({interaction_count}/50 interactions for LightGBM)")
+            return self._rank_papers_by_signals(papers)[:settings.TOP_PAPERS_COUNT]
+
+    def _fetch_papers_latest(self, selected_interests: List[str], days: int = 7) -> List[PaperData]:
+        """
+        Latest mode: pull papers from PostgreSQL that the nightly indexer already stored.
+        Falls back to recommended mode if no recent papers exist in the DB.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        db_papers = (
+            self.db.query(Paper)
+            .filter(Paper.published_date >= cutoff)
+            .order_by(Paper.published_date.desc())
+            .limit(settings.TOP_PAPERS_COUNT * 4)
+            .all()
+        )
+
+        if not db_papers:
+            logger.warning(f"No papers in DB for last {days} days — falling back to recommended mode")
+            return self._fetch_papers_semantic_scholar(selected_interests)
+
+        papers = [
+            PaperData(
+                arxiv_id=p.arxiv_id,
+                title=p.title,
+                abstract=p.abstract or "",
+                authors=p.authors.split(", ") if p.authors else [],
+                categories=p.categories.split(", ") if p.categories else [],
+                published_date=p.published_date,
+                arxiv_url=p.arxiv_url or f"https://arxiv.org/abs/{p.arxiv_id}",
+                pdf_url=p.pdf_url or f"https://arxiv.org/pdf/{p.arxiv_id}",
+                citation_count=p.citation_count,
+            )
+            for p in db_papers
+        ]
+
+        recently_seen = self._get_recently_recommended_arxiv_ids()
+        papers = [p for p in papers if p.arxiv_id not in recently_seen]
+
+        logger.info(f"Latest mode: {len(papers)} papers from last {days} days")
+
+        interaction_count = self.trainer.get_interaction_count()
+        if interaction_count >= 50:
+            logger.info(f"Tier 3: LightGBM re-ranking ({interaction_count} interactions)")
+            return self._rank_and_select(
+                papers, settings.TOP_PAPERS_COUNT,
+                item_type="paper", selected_interests=selected_interests, use_ml=True,
+            )
+        else:
+            return self._rank_papers_by_signals(papers)[:settings.TOP_PAPERS_COUNT]
+
+    def _get_user_saved_arxiv_ids(self, max_ids: int = 10) -> List[str]:
+        """Return ArXiv IDs of papers the user has saved or viewed (most recent first)."""
+        rows = (
+            self.db.query(UserInteraction, Paper.arxiv_id)
+            .join(Paper, UserInteraction.item_id == Paper.id)
+            .filter(
+                UserInteraction.user_id == self.user_id,
+                UserInteraction.item_type == "paper",
+                UserInteraction.interaction_type.in_(["saved", "viewed"]),
+            )
+            .order_by(UserInteraction.timestamp.desc())
+            .limit(max_ids)
+            .all()
+        )
+        return [arxiv_id for _, arxiv_id in rows]
+
+    def _get_recently_recommended_arxiv_ids(self) -> set:
+        """ArXiv IDs already recommended to this user in the novelty lookback window."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.NOVELTY_LOOKBACK_DAYS)
+        rows = (
+            self.db.query(Paper.arxiv_id)
+            .filter(Paper.recommended == True, Paper.recommended_date >= cutoff)
+            .all()
+        )
+        return {r[0] for r in rows}
+
+    def _save_papers_to_db(self, papers: List[PaperData]) -> None:
+        """Upsert papers from Semantic Scholar into PostgreSQL."""
+        existing_ids = {
+            r[0] for r in self.db.query(Paper.arxiv_id)
+            .filter(Paper.arxiv_id.in_([p.arxiv_id for p in papers])).all()
+        }
+        for p in papers:
+            if p.arxiv_id not in existing_ids:
+                self.db.add(Paper(
+                    arxiv_id=p.arxiv_id,
+                    title=p.title,
+                    authors=", ".join(p.authors),
+                    abstract=p.abstract,
+                    categories=", ".join(p.categories),
+                    published_date=p.published_date,
+                    arxiv_url=p.arxiv_url,
+                    pdf_url=p.pdf_url,
+                    citation_count=p.citation_count,
+                ))
+        self.db.commit()
+
+    def _rank_papers_by_signals(self, papers: List[PaperData]) -> List[PaperData]:
+        """
+        Rank papers without embedding.
+        Score = 0.6 * normalized_citations + 0.4 * recency
+        """
+        now = datetime.now(timezone.utc)
+        citations = [p.citation_count or 0 for p in papers]
+        max_cit = max(citations) if citations else 1
+
+        def score(p: PaperData) -> float:
+            cit_score = (p.citation_count or 0) / max(max_cit, 1)
+            if p.published_date:
+                age_days = (now - p.published_date.replace(tzinfo=timezone.utc) if p.published_date.tzinfo is None else now - p.published_date).days
+                recency = max(0.0, 1.0 - age_days / 365)
+            else:
+                recency = 0.0
+            return 0.6 * cit_score + 0.4 * recency
+
+        ranked = sorted(papers, key=score, reverse=True)
+        for p in ranked:
+            p.relevance_score = score(p)
+        return ranked
     
     def record_interaction(self, item_type: str, item_id: int, interaction_type: str):
         """
@@ -201,7 +306,7 @@ class DailyFeedPipeline:
             else:
                 num_slices = time_window_days  # Daily slices for < 7 days
             
-            candidates_per_slice = min(500, max(200, max_results // num_slices))
+            candidates_per_slice = min(20, max(5, max_results // num_slices * 2))
             logger.info(f"Using time-slice bucketing: {num_slices} slices, ~{candidates_per_slice} candidates/slice")
             papers = collector.fetch_by_time_slices(
                 days=time_window_days,
@@ -430,32 +535,28 @@ class DailyFeedPipeline:
         return filtered
     
     def _filter_articles(self, articles: List, selected_interests: List[str], min_threshold: float = None) -> List:
-        """Simple relevance filter for articles"""
-        
+        """Simple relevance filter for articles. Sets relevance_score on each passing item."""
         filtered = []
         interests_text = " ".join(selected_interests)
         threshold = min_threshold if min_threshold is not None else settings.MIN_SIMILARITY_THRESHOLD
-
-        # simple seen titles set to drop near-duplicates (case-insensitive exact)
         seen_titles = set()
         similarities = []
+
         for item in articles:
             item_text = f"{item.title} {item.content if hasattr(item, 'content') else ''}"
             similarity = self.embedding_manager.get_similarity_score(interests_text, item_text)
             similarities.append(similarity)
-            
+            item.relevance_score = similarity  # store for downstream sorting
+
             if similarity >= threshold:
                 title_key = getattr(item, "title", "").strip().lower()
                 if title_key in seen_titles:
                     continue
                 seen_titles.add(title_key)
                 filtered.append(item)
-        
+
         if similarities:
-            max_sim = max(similarities)
-            avg_sim = sum(similarities) / len(similarities)
-            logger.info(f"Article similarity stats: max={max_sim:.3f}, avg={avg_sim:.3f}, threshold={threshold}")
-        
+            logger.info(f"Article similarity stats: max={max(similarities):.3f}, avg={sum(similarities)/len(similarities):.3f}, threshold={threshold}")
         logger.info(f"Filtered {len(filtered)}/{len(articles)} articles above threshold {threshold}")
         return filtered
     

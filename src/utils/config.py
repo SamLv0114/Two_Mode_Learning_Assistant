@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # ArXiv settings
     ARXIV_CATEGORIES: List[str] = ["cs.LG", "cs.AI", "cs.CV", "cs.CL", "cs.NE"]
-    MAX_PAPERS_PER_DAY: int = 50
+    MAX_PAPERS_PER_DAY: int = 15
 
     # Tech article sources
     TECH_SOURCES: List[str] = ["hackernews", "devto", "medium"]
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     USE_LTR: bool = True
 
     # Diversity settings
-    USE_MMR_DIVERSITY: bool = True
+    USE_MMR_DIVERSITY: bool = False
     MMR_LAMBDA: float = 0.7
     MMR_CANDIDATE_MULTIPLIER: int = 5
 
