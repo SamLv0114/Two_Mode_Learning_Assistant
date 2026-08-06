@@ -57,7 +57,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: https://api.researchmate.site
+        NEXT_PUBLIC_API_URL: https://researchmate.site
     container_name: learning_assistant_frontend
     depends_on:
       - api

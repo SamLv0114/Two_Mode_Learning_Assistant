@@ -15,12 +15,33 @@ const DEFAULT_INTERESTS = [
   'reinforcement learning',
 ];
 
+function PasswordChecklist({ password }: { password: string }) {
+  const checks = [
+    { label: 'At least 8 characters', ok: password.length >= 8 },
+    { label: 'Uppercase letter', ok: /[A-Z]/.test(password) },
+    { label: 'Lowercase letter', ok: /[a-z]/.test(password) },
+    { label: 'Number', ok: /[0-9]/.test(password) },
+  ];
+  if (!password) return null;
+  return (
+    <ul className="mt-2 space-y-1">
+      {checks.map((c) => (
+        <li key={c.label} className={`text-xs flex items-center gap-1.5 ${c.ok ? 'text-green-600' : 'text-red-500'}`}>
+          <span>{c.ok ? '✓' : '✗'}</span>
+          {c.label}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export default function RegisterPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [focusAreas, setFocusAreas] = useState<string[]>(['ML', 'AI']);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
   const { register } = useAuth();
   const router = useRouter();
 
@@ -28,6 +49,7 @@ export default function RegisterPage() {
     e.preventDefault();
     setIsSubmitting(true);
 
+    setErrorMsg('');
     try {
       await register({
         email,
@@ -40,7 +62,7 @@ export default function RegisterPage() {
       router.push('/dashboard');
     } catch (error: any) {
       const message = error.response?.data?.detail || 'Registration failed';
-      toast.error(message);
+      setErrorMsg(message);
     } finally {
       setIsSubmitting(false);
     }
@@ -71,6 +93,12 @@ export default function RegisterPage() {
             </Link>
           </p>
         </div>
+
+        {errorMsg && (
+          <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3">
+            {errorMsg}
+          </div>
+        )}
 
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
           <div className="rounded-md shadow-sm space-y-4">
@@ -106,9 +134,7 @@ export default function RegisterPage() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
-              <p className="mt-1 text-xs text-gray-500">
-                Must include uppercase, lowercase, and a number
-              </p>
+              <PasswordChecklist password={password} />
             </div>
 
             <div>
