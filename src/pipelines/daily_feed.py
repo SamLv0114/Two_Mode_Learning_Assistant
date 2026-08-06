@@ -26,6 +26,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+FOCUS_AREA_TERMS = {
+    "ML": "machine learning",
+    "NLP": "natural language processing",
+    "CV": "computer vision",
+    "AI": "artificial intelligence",
+    "DL": "deep learning",
+}
+
+
+def _expand_focus_areas(areas: List[str]) -> List[str]:
+    return [FOCUS_AREA_TERMS.get(a.upper(), a) for a in areas]
+
+
 class DailyFeedPipeline:
     """Main pipeline for daily feed generation"""
     
@@ -98,15 +111,17 @@ class DailyFeedPipeline:
         # Check if user has saved/viewed papers to use as positive signals
         saved_ids = self._get_user_saved_arxiv_ids(max_ids=10)
 
+        search_terms = _expand_focus_areas(selected_interests)
+
         if saved_ids:
             logger.info(f"Using Recommendations API with {len(saved_ids)} saved papers")
             papers = s2.recommend(saved_ids, limit=limit)
             if not papers:
                 logger.info("Recommendations returned empty — falling back to search")
-                papers = s2.search(" ".join(selected_interests), limit=limit)
+                papers = s2.search(" ".join(search_terms), limit=limit)
         else:
             logger.info("Cold start — using Search API")
-            papers = s2.search(" ".join(selected_interests), limit=limit)
+            papers = s2.search(" ".join(search_terms), limit=limit)
 
         if not papers:
             logger.warning("Semantic Scholar returned no papers")
