@@ -171,6 +171,40 @@ class UserInteraction(Base):
         return f"<UserInteraction(user_id={self.user_id}, type='{self.interaction_type}', item_id={self.item_id})>"
 
 
+class UserPaperRecommendation(Base):
+    """Per-user recommended papers with personalized summaries"""
+    __tablename__ = "user_paper_recommendations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    paper_id = Column(Integer, ForeignKey("papers.id", ondelete="CASCADE"), nullable=False)
+    recommended_date = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    personalized_summary = Column(Text, nullable=True)
+    relevance_score = Column(Float, nullable=True)
+    rank = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index('ix_user_paper_rec', 'user_id', 'paper_id', unique=True),
+    )
+
+
+class UserArticleRecommendation(Base):
+    """Per-user recommended articles with personalized summaries"""
+    __tablename__ = "user_article_recommendations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    article_id = Column(Integer, ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
+    recommended_date = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    personalized_summary = Column(Text, nullable=True)
+    relevance_score = Column(Float, nullable=True)
+    rank = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index('ix_user_article_rec', 'user_id', 'article_id', unique=True),
+    )
+
+
 class UserDocument(Base):
     """User-uploaded documents for Q&A"""
     __tablename__ = "user_documents"

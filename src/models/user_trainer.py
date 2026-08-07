@@ -7,7 +7,7 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
-from src.database.models import UserInteraction, Paper, Article
+from src.database.models import UserInteraction, Paper, Article, UserPaperRecommendation, UserArticleRecommendation
 from src.models.feature_extractor import FeatureExtractor
 from src.models.embeddings import EmbeddingManager
 from src.models.evaluator import compute_ndcg, compute_mrr
@@ -103,9 +103,12 @@ class UserModelTrainer:
         if item_type == "paper":
             items = (
                 self.db.query(Paper)
-                .filter(Paper.recommended == True)
-                .filter(Paper.recommended_date >= cutoff)
-                .order_by(Paper.recommended_date.desc())
+                .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+                .filter(
+                    UserPaperRecommendation.user_id == self.user_id,
+                    UserPaperRecommendation.recommended_date >= cutoff,
+                )
+                .order_by(UserPaperRecommendation.recommended_date.desc())
                 .limit(settings.NOVELTY_MAX_ITEMS)
                 .all()
             )
@@ -114,9 +117,12 @@ class UserModelTrainer:
         else:
             items = (
                 self.db.query(Article)
-                .filter(Article.recommended == True)
-                .filter(Article.recommended_date >= cutoff)
-                .order_by(Article.recommended_date.desc())
+                .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
+                .filter(
+                    UserArticleRecommendation.user_id == self.user_id,
+                    UserArticleRecommendation.recommended_date >= cutoff,
+                )
+                .order_by(UserArticleRecommendation.recommended_date.desc())
                 .limit(settings.NOVELTY_MAX_ITEMS)
                 .all()
             )
@@ -146,9 +152,19 @@ class UserModelTrainer:
         # Get user interests
         user_interests = self._get_user_interests()
 
-        # Get all recommended items
-        recommended_papers = self.db.query(Paper).filter(Paper.recommended == True).all()
-        recommended_articles = self.db.query(Article).filter(Article.recommended == True).all()
+        # Get all items recommended to this user
+        recommended_papers = (
+            self.db.query(Paper)
+            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+            .filter(UserPaperRecommendation.user_id == self.user_id)
+            .all()
+        )
+        recommended_articles = (
+            self.db.query(Article)
+            .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
+            .filter(UserArticleRecommendation.user_id == self.user_id)
+            .all()
+        )
 
         # Build interaction score map
         interaction_scores = {}
@@ -240,8 +256,18 @@ class UserModelTrainer:
 
         user_interests = self._get_user_interests()
 
-        recommended_papers = self.db.query(Paper).filter(Paper.recommended == True).all()
-        recommended_articles = self.db.query(Article).filter(Article.recommended == True).all()
+        paper_recs = (
+            self.db.query(Paper, UserPaperRecommendation.recommended_date)
+            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+            .filter(UserPaperRecommendation.user_id == self.user_id)
+            .all()
+        )
+        article_recs = (
+            self.db.query(Article, UserArticleRecommendation.recommended_date)
+            .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
+            .filter(UserArticleRecommendation.user_id == self.user_id)
+            .all()
+        )
 
         interaction_scores = {}
         for interaction in interactions:
@@ -260,18 +286,18 @@ class UserModelTrainer:
         recent_paper_texts = self._get_recent_texts("paper")
         recent_article_texts = self._get_recent_texts("article")
 
-        # Group by week
+        # Group by week using per-user recommended_date from junction table
         grouped_items = {}
-        for paper in recommended_papers:
-            if not paper.recommended_date:
+        for paper, rec_date in paper_recs:
+            if not rec_date:
                 continue
-            group_key = (paper.recommended_date.isocalendar()[0], paper.recommended_date.isocalendar()[1])
+            group_key = (rec_date.isocalendar()[0], rec_date.isocalendar()[1])
             grouped_items.setdefault(group_key, []).append(("paper", paper))
 
-        for article in recommended_articles:
-            if not article.recommended_date:
+        for article, rec_date in article_recs:
+            if not rec_date:
                 continue
-            group_key = (article.recommended_date.isocalendar()[0], article.recommended_date.isocalendar()[1])
+            group_key = (rec_date.isocalendar()[0], rec_date.isocalendar()[1])
             grouped_items.setdefault(group_key, []).append(("article", article))
 
         if not grouped_items:

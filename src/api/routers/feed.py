@@ -9,7 +9,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from src.database.models import User, Paper, Article, UserInteraction
+from src.database.models import User, Paper, Article, UserInteraction, UserPaperRecommendation, UserArticleRecommendation
 from src.api.deps import get_db_session, get_current_user, get_embedding_manager
 from src.schemas.feed import (
     FeedRequest,
@@ -180,22 +180,21 @@ async def get_recommended_papers(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
 ):
-    """
-    Get previously recommended papers
+    """Get this user's most recently generated paper feed, ordered by rank."""
+    rows = (
+        db.query(Paper, UserPaperRecommendation)
+        .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+        .filter(UserPaperRecommendation.user_id == current_user.id)
+        .order_by(UserPaperRecommendation.rank.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
-    Returns papers that were marked as recommended.
-    """
-    papers = db.query(Paper).filter(
-        Paper.recommended == True
-    ).order_by(
-        Paper.recommended_date.desc()
-    ).offset(offset).limit(limit).all()
-
-    result = []
-    for i, paper in enumerate(papers, offset + 1):
-        result.append(PaperResponse(
+    return [
+        PaperResponse(
             id=paper.id,
-            rank=i,
+            rank=rec.rank or (offset + i),
             arxiv_id=paper.arxiv_id,
             title=paper.title,
             authors=paper.authors,
@@ -205,12 +204,12 @@ async def get_recommended_papers(
             arxiv_url=paper.arxiv_url,
             pdf_url=paper.pdf_url,
             citation_count=paper.citation_count,
-            relevance_score=paper.relevance_score,
+            relevance_score=rec.relevance_score,
             impact_score=paper.heuristic_impact_score,
-            summary=paper.personalized_summary
-        ))
-
-    return result
+            summary=rec.personalized_summary,
+        )
+        for i, (paper, rec) in enumerate(rows, offset + 1)
+    ]
 
 
 @router.get("/articles", response_model=List[ArticleResponse])
@@ -220,33 +219,32 @@ async def get_recommended_articles(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
 ):
-    """
-    Get previously recommended articles
+    """Get this user's most recently generated article feed, ordered by rank."""
+    rows = (
+        db.query(Article, UserArticleRecommendation)
+        .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
+        .filter(UserArticleRecommendation.user_id == current_user.id)
+        .order_by(UserArticleRecommendation.rank.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
-    Returns articles that were marked as recommended.
-    """
-    articles = db.query(Article).filter(
-        Article.recommended == True
-    ).order_by(
-        Article.recommended_date.desc()
-    ).offset(offset).limit(limit).all()
-
-    result = []
-    for i, article in enumerate(articles, offset + 1):
-        result.append(ArticleResponse(
+    return [
+        ArticleResponse(
             id=article.id,
-            rank=i,
+            rank=rec.rank or (offset + i),
             source=article.source,
             title=article.title,
             url=article.url,
             author=article.author,
             published_date=article.published_date,
             upvotes=article.upvotes,
-            relevance_score=article.relevance_score,
-            summary=article.personalized_summary
-        ))
-
-    return result
+            relevance_score=rec.relevance_score,
+            summary=rec.personalized_summary,
+        )
+        for i, (article, rec) in enumerate(rows, offset + 1)
+    ]
 
 
 @router.get("/saved", response_model=dict)
@@ -259,7 +257,11 @@ async def get_saved_items(
     """
     Get items the user has saved
     """
-    # Get saved interactions
+    total_saved = db.query(UserInteraction).filter(
+        UserInteraction.user_id == current_user.id,
+        UserInteraction.interaction_type == "saved"
+    ).count()
+
     saved_interactions = db.query(UserInteraction).filter(
         UserInteraction.user_id == current_user.id,
         UserInteraction.interaction_type == "saved"
@@ -272,6 +274,10 @@ async def get_saved_items(
         if interaction.item_type == "paper":
             paper = db.query(Paper).filter(Paper.id == interaction.item_id).first()
             if paper:
+                rec = db.query(UserPaperRecommendation).filter(
+                    UserPaperRecommendation.user_id == current_user.id,
+                    UserPaperRecommendation.paper_id == paper.id,
+                ).first()
                 papers.append(PaperResponse(
                     id=paper.id,
                     rank=len(papers) + 1,
@@ -284,13 +290,17 @@ async def get_saved_items(
                     arxiv_url=paper.arxiv_url,
                     pdf_url=paper.pdf_url,
                     citation_count=paper.citation_count,
-                    relevance_score=paper.relevance_score,
+                    relevance_score=rec.relevance_score if rec else paper.relevance_score,
                     impact_score=paper.heuristic_impact_score,
-                    summary=paper.personalized_summary
+                    summary=rec.personalized_summary if rec else None,
                 ))
         else:
             article = db.query(Article).filter(Article.id == interaction.item_id).first()
             if article:
+                rec = db.query(UserArticleRecommendation).filter(
+                    UserArticleRecommendation.user_id == current_user.id,
+                    UserArticleRecommendation.article_id == article.id,
+                ).first()
                 articles.append(ArticleResponse(
                     id=article.id,
                     rank=len(articles) + 1,
@@ -300,12 +310,12 @@ async def get_saved_items(
                     author=article.author,
                     published_date=article.published_date,
                     upvotes=article.upvotes,
-                    relevance_score=article.relevance_score,
-                    summary=article.personalized_summary
+                    relevance_score=rec.relevance_score if rec else article.relevance_score,
+                    summary=rec.personalized_summary if rec else None,
                 ))
 
     return {
         "papers": papers,
         "articles": articles,
-        "total_saved": len(saved_interactions)
+        "total_saved": total_saved
     }

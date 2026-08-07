@@ -1,4 +1,3 @@
-# ssh -i C:\Users\baodu\Downloads\ssh-key-2026-02-07.key ubuntu@150.136.79.149
 """
 MODE 1: Daily Recommendation Feed Pipeline
 """
@@ -19,7 +18,7 @@ from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
 from src.rag import Generator
-from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction
+from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction, UserPaperRecommendation, UserArticleRecommendation
 from src.utils.config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -50,13 +49,12 @@ class DailyFeedPipeline:
         self.feature_extractor = FeatureExtractor()
         self.recommender = UserRecommender(user_id, db_session)
         self.trainer = UserModelTrainer(user_id, db_session, self.embedding_manager)
-        init_db()
     
     def run(self, time_window_days: int = 7, focus_areas: List[str] = None, user_interests: List[str] = None, mode: str = "recommended"):
         logger.info(f"Starting daily feed pipeline (mode={mode})...")
 
         selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
-        self._user_interests = user_interests or selected_interests
+        self._user_interests = _expand_focus_areas(focus_areas) if focus_areas else (user_interests or selected_interests)
 
         # Step 1: Papers — "latest" queries ChromaDB/DB for recent papers,
         #                   "recommended" uses Semantic Scholar API
@@ -220,7 +218,11 @@ class DailyFeedPipeline:
         cutoff = datetime.now(timezone.utc) - timedelta(days=settings.NOVELTY_LOOKBACK_DAYS)
         rows = (
             self.db.query(Paper.arxiv_id)
-            .filter(Paper.recommended == True, Paper.recommended_date >= cutoff)
+            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+            .filter(
+                UserPaperRecommendation.user_id == self.user_id,
+                UserPaperRecommendation.recommended_date >= cutoff,
+            )
             .all()
         )
         return {r[0] for r in rows}
@@ -626,9 +628,12 @@ class DailyFeedPipeline:
         if item_type == "paper":
             items = (
                 self.db.query(Paper)
-                .filter(Paper.recommended == True)
-                .filter(Paper.recommended_date >= cutoff)
-                .order_by(Paper.recommended_date.desc())
+                .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+                .filter(
+                    UserPaperRecommendation.user_id == self.user_id,
+                    UserPaperRecommendation.recommended_date >= cutoff,
+                )
+                .order_by(UserPaperRecommendation.recommended_date.desc())
                 .limit(settings.NOVELTY_MAX_ITEMS)
                 .all()
             )
@@ -637,9 +642,12 @@ class DailyFeedPipeline:
         else:
             items = (
                 self.db.query(Article)
-                .filter(Article.recommended == True)
-                .filter(Article.recommended_date >= cutoff)
-                .order_by(Article.recommended_date.desc())
+                .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
+                .filter(
+                    UserArticleRecommendation.user_id == self.user_id,
+                    UserArticleRecommendation.recommended_date >= cutoff,
+                )
+                .order_by(UserArticleRecommendation.recommended_date.desc())
                 .limit(settings.NOVELTY_MAX_ITEMS)
                 .all()
             )
@@ -743,21 +751,35 @@ class DailyFeedPipeline:
     
     def _store_results(self, papers: List[PaperData], articles: List):
         """Store recommended items in database and vector DB"""
-        # Update database
-        for paper_data in papers:
+        now = datetime.now(timezone.utc)
+
+        # Clear this user's previous feed (same transaction as inserts below)
+        self.db.query(UserPaperRecommendation).filter(
+            UserPaperRecommendation.user_id == self.user_id
+        ).delete(synchronize_session=False)
+        self.db.query(UserArticleRecommendation).filter(
+            UserArticleRecommendation.user_id == self.user_id
+        ).delete(synchronize_session=False)
+
+        for rank, paper_data in enumerate(papers, 1):
             paper = self.db.query(Paper).filter(Paper.arxiv_id == paper_data.arxiv_id).first()
             if paper:
-                paper.relevance_score = paper_data.relevance_score
-                paper.personalized_summary = paper_data.personalized_summary
-                paper.recommended = True
-                paper.recommended_date = datetime.now(timezone.utc)
-                # Update citation count if fetched
+                # Update shared paper fields (citation count, impact score)
                 if paper_data.citation_count is not None:
                     paper.citation_count = paper_data.citation_count
                 if getattr(paper_data, "heuristic_impact_score", None) is not None:
                     paper.heuristic_impact_score = paper_data.heuristic_impact_score
-                
-                # Add to vector DB if not already there
+
+                # Per-user recommendation row
+                self.db.add(UserPaperRecommendation(
+                    user_id=self.user_id,
+                    paper_id=paper.id,
+                    recommended_date=now,
+                    personalized_summary=paper_data.personalized_summary,
+                    relevance_score=paper_data.relevance_score,
+                    rank=rank,
+                ))
+
                 try:
                     self.embedding_manager.add_paper(
                         paper_data.arxiv_id,
@@ -772,16 +794,19 @@ class DailyFeedPipeline:
                     )
                 except Exception as e:
                     logger.debug(f"Paper already in vector DB or error: {e}")
-        
-        for article_data in articles:
+
+        for rank, article_data in enumerate(articles, 1):
             article = self.db.query(Article).filter(Article.url == article_data.url).first()
             if article:
-                article.relevance_score = article_data.relevance_score
-                article.personalized_summary = article_data.personalized_summary
-                article.recommended = True
-                article.recommended_date = datetime.now(timezone.utc)
-                
-                # Add to vector DB
+                self.db.add(UserArticleRecommendation(
+                    user_id=self.user_id,
+                    article_id=article.id,
+                    recommended_date=now,
+                    personalized_summary=article_data.personalized_summary,
+                    relevance_score=article_data.relevance_score,
+                    rank=rank,
+                ))
+
                 try:
                     self.embedding_manager.add_article(
                         article_data.source_id,
@@ -796,7 +821,7 @@ class DailyFeedPipeline:
                     )
                 except Exception as e:
                     logger.debug(f"Article already in vector DB or error: {e}")
-        
+
         self.db.commit()
     
     def _format_output(self, papers: List[PaperData], articles: List) -> Dict:
