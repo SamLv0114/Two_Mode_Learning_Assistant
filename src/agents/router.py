@@ -9,12 +9,13 @@ from src.agents.base_agent import AgentResult, BaseAgent
 from src.agents.research_agent import ResearchAgent
 from src.agents.recommendation_agent import RecommendationAgent
 from src.agents.document_agent import DocumentAgent
+from src.agents.tools import SEARCH_WEB
 
 logger = logging.getLogger(__name__)
 
 
 class GeneralAgent(BaseAgent):
-    """Fallback for greetings and meta-questions — no tools needed."""
+    """Fallback for greetings and meta-questions — can search the web."""
 
     name = "GeneralAgent"
     system_prompt = """\
@@ -25,9 +26,10 @@ This platform helps researchers:
 - Ask questions about ML concepts (RAG-powered Q&A)
 - Manage an uploaded document knowledge base
 
+You can search the web for current information when needed.
 Answer general questions concisely. For capability questions, explain what the platform \
 can do and guide the user toward the right feature."""
-    tool_schemas = []
+    tool_schemas = [SEARCH_WEB]
 
 
 _INTENT_TO_AGENT: Dict[str, type] = {

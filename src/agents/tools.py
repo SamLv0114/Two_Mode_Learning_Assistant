@@ -108,6 +108,33 @@ SEARCH_USER_DOCUMENTS = {
     },
 }
 
+SEARCH_WEB = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": (
+            "Search the web for recent information, news, tutorials, or external sources "
+            "not in the user's knowledge base. Use when the user asks about recent events, "
+            "cutting-edge tools, new model releases, or anything that may not be in the local database."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The web search query",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Number of results to return (1-5)",
+                    "default": 3,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 
 # ── Executors ─────────────────────────────────────────────────────────────────
 
@@ -236,6 +263,39 @@ def _exec_search_user_documents(args: Dict[str, Any], context: Dict) -> Dict:
         return {"error": str(e), "results": [], "count": 0}
 
 
+def _exec_search_web(args: Dict[str, Any], context: Dict) -> Dict:
+    try:
+        from tavily import TavilyClient
+        from src.utils.config import settings
+
+        api_key = settings.TAVILY_API_KEY
+        if not api_key:
+            return {"error": "TAVILY_API_KEY not configured", "results": [], "count": 0}
+
+        client = TavilyClient(api_key=api_key)
+        response = client.search(
+            query=args["query"],
+            max_results=min(args.get("max_results", 3), 5),
+            search_depth="basic",
+        )
+
+        results = [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "content": r.get("content", "")[:500],
+                "score": round(r.get("score", 0), 3),
+            }
+            for r in response.get("results", [])
+        ]
+        return {"results": results, "count": len(results)}
+    except ImportError:
+        return {"error": "tavily-python not installed", "results": [], "count": 0}
+    except Exception as e:
+        logger.error(f"search_web error: {e}")
+        return {"error": str(e), "results": [], "count": 0}
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 _EXECUTORS = {
@@ -243,6 +303,7 @@ _EXECUTORS = {
     "get_personalized_feed": _exec_get_personalized_feed,
     "list_user_documents": _exec_list_user_documents,
     "search_user_documents": _exec_search_user_documents,
+    "search_web": _exec_search_web,
 }
 
 

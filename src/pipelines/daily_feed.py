@@ -13,7 +13,6 @@ from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import Session
 
 from src.collectors import ArxivCollector, PaperData, HNCollector, MediumCollector, DevToCollector
-from src.collectors.semantic_scholar_collector import SemanticScholarCollector
 from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
@@ -56,13 +55,14 @@ class DailyFeedPipeline:
         selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
         self._user_interests = _expand_focus_areas(focus_areas) if focus_areas else (user_interests or selected_interests)
 
-        # Step 1: Papers — "latest" queries ChromaDB/DB for recent papers,
-        #                   "recommended" uses Semantic Scholar API
+        # Step 1: Papers
+        # latest      — published_date >= cutoff, ranked by interest match + influence
+        # recommended — no date filter, ranked by interest match + influence across all DB papers
         logger.info(f"Step 1: Fetching papers (mode={mode})...")
         if mode == "latest":
             top_papers = self._fetch_papers_latest(selected_interests, days=time_window_days)
         else:
-            top_papers = self._fetch_papers_semantic_scholar(selected_interests)
+            top_papers = self._fetch_papers_recommended(selected_interests)
 
         # Step 2: Articles — disabled for now, re-enable once papers are stable
         # scale = min(max(1, time_window_days) / 7.0, 52)
@@ -97,105 +97,88 @@ class DailyFeedPipeline:
         logger.info("Daily feed pipeline completed!")
         return output
 
-    def _fetch_papers_semantic_scholar(self, selected_interests: List[str]) -> List[PaperData]:
+    def _fetch_papers_recommended(self, selected_interests: List[str]) -> List[PaperData]:
         """
-        Fetch papers from Semantic Scholar — no local embedding computation.
-        Uses Recommendations API when user has history, Search API for cold start.
-        Falls back to empty list on failure (caller still has articles).
+        Recommended mode: no time limit, ranks all DB papers by interest match + influence.
+        Pulls top-N candidates by heuristic_impact_score, then re-ranks with user interests.
+        No external API dependency — pure local DB + embeddings.
         """
-        s2 = SemanticScholarCollector()
-        limit = settings.TOP_PAPERS_COUNT * 4  # fetch more candidates than we need
+        candidate_limit = settings.TOP_PAPERS_COUNT * 100  # e.g. 500 for TOP_PAPERS_COUNT=5
 
-        # Check if user has saved/viewed papers to use as positive signals
-        saved_ids = self._get_user_saved_arxiv_ids(max_ids=10)
+        db_papers = (
+            self.db.query(Paper)
+            .filter(Paper.heuristic_impact_score.isnot(None))
+            .order_by(Paper.heuristic_impact_score.desc())
+            .limit(candidate_limit)
+            .all()
+        )
 
-        search_terms = _expand_focus_areas(selected_interests)
+        # Fallback: no impact scores computed yet — take most-cited
+        if not db_papers:
+            db_papers = (
+                self.db.query(Paper)
+                .order_by(Paper.citation_count.desc().nullslast())
+                .limit(candidate_limit)
+                .all()
+            )
 
-        if saved_ids:
-            logger.info(f"Using Recommendations API with {len(saved_ids)} saved papers")
-            papers = s2.recommend(saved_ids, limit=limit)
-            if not papers:
-                logger.info("Recommendations returned empty — falling back to search")
-                papers = s2.search(" ".join(search_terms), limit=limit)
-        else:
-            logger.info("Cold start — using Search API")
-            papers = s2.search(" ".join(search_terms), limit=limit)
-
-        if not papers:
-            logger.warning("Semantic Scholar returned no papers")
+        if not db_papers:
+            logger.warning("No papers in DB for recommended mode")
             return []
 
-        # Filter out papers already recommended recently
         recently_seen = self._get_recently_recommended_arxiv_ids()
-        papers = [p for p in papers if p.arxiv_id not in recently_seen]
+        db_papers = [p for p in db_papers if p.arxiv_id not in recently_seen]
 
-        # Save new papers to PostgreSQL so _store_results can find them
-        self._save_papers_to_db(papers)
+        logger.info(f"Recommended mode: {len(db_papers)} candidates from local DB")
 
-        # Three-tier ranking:
-        # Tier 3 — LightGBM behavioral re-ranker (active after 50 interactions)
-        # Tier 1/2 — signal-based fallback (citation + recency + S2 position)
+        papers = [self._db_paper_to_paperdata(p) for p in db_papers]
+
         interaction_count = self.trainer.get_interaction_count()
         if interaction_count >= 50:
-            logger.info(f"Tier 3: LightGBM re-ranking ({interaction_count} interactions)")
+            logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
             return self._rank_and_select(
-                papers,
-                settings.TOP_PAPERS_COUNT,
-                item_type="paper",
-                selected_interests=selected_interests,
-                use_ml=True,
+                papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
             )
         else:
-            logger.info(f"Tier 1/2: signal-based ranking ({interaction_count}/50 interactions for LightGBM)")
-            return self._rank_papers_by_signals(papers)[:settings.TOP_PAPERS_COUNT]
+            logger.info(f"Interest+influence ranking ({interaction_count}/50 interactions for LightGBM)")
+            return self._rank_with_interests(papers, selected_interests, settings.TOP_PAPERS_COUNT)
 
     def _fetch_papers_latest(self, selected_interests: List[str], days: int = 7) -> List[PaperData]:
         """
-        Latest mode: pull papers from PostgreSQL that the nightly indexer already stored.
-        Falls back to recommended mode if no recent papers exist in the DB.
+        Latest mode: papers published within the time window, ranked by interest match + influence.
+        No external API — pure local DB + embeddings.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        candidate_limit = settings.TOP_PAPERS_COUNT * 20  # broader pool for latest mode
+
         db_papers = (
             self.db.query(Paper)
             .filter(Paper.published_date >= cutoff)
             .order_by(Paper.published_date.desc())
-            .limit(settings.TOP_PAPERS_COUNT * 4)
+            .limit(candidate_limit)
             .all()
         )
 
         if not db_papers:
-            logger.warning(f"No papers in DB for last {days} days — falling back to recommended mode")
-            return self._fetch_papers_semantic_scholar(selected_interests)
-
-        papers = [
-            PaperData(
-                arxiv_id=p.arxiv_id,
-                title=p.title,
-                abstract=p.abstract or "",
-                authors=p.authors.split(", ") if p.authors else [],
-                categories=p.categories.split(", ") if p.categories else [],
-                published_date=p.published_date,
-                arxiv_url=p.arxiv_url or f"https://arxiv.org/abs/{p.arxiv_id}",
-                pdf_url=p.pdf_url or f"https://arxiv.org/pdf/{p.arxiv_id}",
-                citation_count=p.citation_count,
-            )
-            for p in db_papers
-        ]
+            logger.warning(f"No papers in DB for last {days} days")
+            return []
 
         recently_seen = self._get_recently_recommended_arxiv_ids()
-        papers = [p for p in papers if p.arxiv_id not in recently_seen]
+        db_papers = [p for p in db_papers if p.arxiv_id not in recently_seen]
 
-        logger.info(f"Latest mode: {len(papers)} papers from last {days} days")
+        logger.info(f"Latest mode: {len(db_papers)} papers from last {days} days")
+
+        papers = [self._db_paper_to_paperdata(p) for p in db_papers]
 
         interaction_count = self.trainer.get_interaction_count()
         if interaction_count >= 50:
-            logger.info(f"Tier 3: LightGBM re-ranking ({interaction_count} interactions)")
+            logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
             return self._rank_and_select(
-                papers, settings.TOP_PAPERS_COUNT,
-                item_type="paper", selected_interests=selected_interests, use_ml=True,
+                papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
             )
         else:
-            return self._rank_papers_by_signals(papers)[:settings.TOP_PAPERS_COUNT]
+            logger.info(f"Interest+influence ranking ({interaction_count}/50 interactions for LightGBM)")
+            return self._rank_with_interests(papers, selected_interests, settings.TOP_PAPERS_COUNT)
 
     def _get_user_saved_arxiv_ids(self, max_ids: int = 10) -> List[str]:
         """Return ArXiv IDs of papers the user has saved or viewed (most recent first)."""
@@ -226,6 +209,55 @@ class DailyFeedPipeline:
             .all()
         )
         return {r[0] for r in rows}
+
+    def _db_paper_to_paperdata(self, p: Paper) -> PaperData:
+        return PaperData(
+            arxiv_id=p.arxiv_id,
+            title=p.title,
+            abstract=p.abstract or "",
+            authors=p.authors.split(", ") if p.authors else [],
+            categories=p.categories.split(", ") if p.categories else [],
+            published_date=p.published_date,
+            arxiv_url=p.arxiv_url or (f"https://arxiv.org/abs/{p.arxiv_id}" if p.arxiv_id else ""),
+            pdf_url=p.pdf_url or (f"https://arxiv.org/pdf/{p.arxiv_id}" if p.arxiv_id else ""),
+            citation_count=p.citation_count,
+        )
+
+    def _rank_with_interests(self, papers: List[PaperData], selected_interests: List[str], top_k: int) -> List[PaperData]:
+        """
+        Rank papers by combining embedding cosine similarity to user interests + normalized citations.
+        Uses batch embedding for efficiency (one model.encode call per batch).
+        Combined score = 0.6 * similarity + 0.4 * normalized_citation_count
+        """
+        if not papers:
+            return []
+
+        interests_text = " ".join(_expand_focus_areas(selected_interests))
+        paper_texts = [f"{p.title} {(p.abstract or '')[:400]}" for p in papers]
+
+        all_texts = [interests_text] + paper_texts
+        all_embeddings = np.array(self.embedding_manager.generate_embeddings(all_texts))
+
+        interest_emb = all_embeddings[0]
+        paper_embs = all_embeddings[1:]
+
+        interest_norm = interest_emb / (np.linalg.norm(interest_emb) + 1e-8)
+        norms = np.linalg.norm(paper_embs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        paper_embs_norm = paper_embs / norms
+        similarities = paper_embs_norm @ interest_norm
+
+        citations = np.array([p.citation_count or 0 for p in papers], dtype=float)
+        max_cit = citations.max() if citations.max() > 0 else 1.0
+        cit_scores = citations / max_cit
+
+        combined = 0.6 * similarities + 0.4 * cit_scores
+
+        for paper, score in zip(papers, combined.tolist()):
+            paper.relevance_score = round(float(score), 4)
+
+        ranked_indices = np.argsort(combined)[::-1][:top_k]
+        return [papers[i] for i in ranked_indices]
 
     def _save_papers_to_db(self, papers: List[PaperData]) -> None:
         """Upsert papers from Semantic Scholar into PostgreSQL."""

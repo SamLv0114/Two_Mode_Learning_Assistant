@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # API Keys
     OPENAI_API_KEY: Optional[str] = None
     SEMANTIC_SCHOLAR_API_KEY: Optional[str] = None
+    TAVILY_API_KEY: Optional[str] = None
 
     # LLM Settings
     LLM_PROVIDER: str = "openai"
