@@ -99,11 +99,103 @@ class DailyFeedPipeline:
 
     def _fetch_papers_recommended(self, selected_interests: List[str]) -> List[PaperData]:
         """
-        Recommended mode: no time limit, ranks all DB papers by interest match + influence.
-        Pulls top-N candidates by heuristic_impact_score, then re-ranks with user interests.
-        No external API dependency — pure local DB + embeddings.
+        Recommended mode — two-stage retrieval:
+
+        Stage 1 (ChromaDB ANN, ~10ms):
+            Semantic search across ALL indexed papers using HNSW.
+            Returns top-N candidates with cosine similarity scores.
+
+        Stage 2 (PostgreSQL join + re-rank):
+            Fetch full metadata + citation counts for those candidates.
+            Score = 0.6 * semantic_similarity + 0.4 * normalized_citations.
+
+        Fallback: impact-score DB query if ChromaDB returns too few results.
         """
-        candidate_limit = settings.TOP_PAPERS_COUNT * 100  # e.g. 500 for TOP_PAPERS_COUNT=5
+        interests_text = " ".join(_expand_focus_areas(selected_interests))
+        candidate_limit = settings.TOP_PAPERS_COUNT * 20  # e.g. 100
+
+        # ── Stage 1: ChromaDB ANN search ──────────────────────────────────────
+        vector_results = self.embedding_manager.search(
+            interests_text, n_results=candidate_limit, filter_type="paper"
+        )
+
+        MIN_CHROMA_RESULTS = settings.TOP_PAPERS_COUNT * 2
+        if len(vector_results) < MIN_CHROMA_RESULTS:
+            logger.warning(
+                f"ChromaDB returned only {len(vector_results)} results "
+                f"(need {MIN_CHROMA_RESULTS}) — using impact-score fallback"
+            )
+            return self._fetch_papers_recommended_fallback(selected_interests)
+
+        # Extract arxiv_ids and semantic similarity scores
+        # ChromaDB cosine space: distance = 1 - cosine_similarity → similarity = 1 - distance
+        arxiv_ids = []
+        semantic_scores: Dict[str, float] = {}
+        for r in vector_results:
+            arxiv_id = r.get("metadata", {}).get("paper_id")
+            if arxiv_id:
+                arxiv_ids.append(arxiv_id)
+                distance = r.get("distance") if r.get("distance") is not None else 1.0
+                semantic_scores[arxiv_id] = max(0.0, 1.0 - float(distance))
+
+        # ── Stage 2: PostgreSQL join ───────────────────────────────────────────
+        db_papers = (
+            self.db.query(Paper)
+            .filter(Paper.arxiv_id.in_(arxiv_ids))
+            .all()
+        )
+
+        recently_seen = self._get_recently_recommended_arxiv_ids()
+        db_papers = [p for p in db_papers if p.arxiv_id not in recently_seen]
+
+        if not db_papers:
+            logger.warning("All ChromaDB candidates were recently recommended — using fallback")
+            return self._fetch_papers_recommended_fallback(selected_interests)
+
+        logger.info(
+            f"Recommended mode: {len(db_papers)} candidates "
+            f"(ChromaDB ANN → PostgreSQL join)"
+        )
+
+        # ── Re-rank: semantic similarity + citation influence ──────────────────
+        interaction_count = self.trainer.get_interaction_count()
+        if interaction_count >= 50:
+            # LightGBM knows citation counts via feature extractor — just pass candidates
+            logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
+            papers = [self._db_paper_to_paperdata(p) for p in db_papers]
+            return self._rank_and_select(
+                papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
+            )
+
+        # Heuristic: 0.6 * semantic + 0.4 * normalized citations
+        citations = [p.citation_count or 0 for p in db_papers]
+        max_cit = max(citations) if max(citations) > 0 else 1
+
+        scored = []
+        for p in db_papers:
+            sem = semantic_scores.get(p.arxiv_id, 0.0)
+            cit = (p.citation_count or 0) / max_cit
+            score = 0.6 * sem + 0.4 * cit
+            scored.append((p, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:settings.TOP_PAPERS_COUNT]
+
+        papers = []
+        for p, score in top:
+            pd = self._db_paper_to_paperdata(p)
+            pd.relevance_score = round(score, 4)
+            papers.append(pd)
+
+        return papers
+
+    def _fetch_papers_recommended_fallback(self, selected_interests: List[str]) -> List[PaperData]:
+        """
+        Fallback for Recommended mode when ChromaDB has too few papers indexed.
+        Uses batch embeddings on top-100 papers by impact score.
+        Typically only needed before the backfill script has been run.
+        """
+        candidate_limit = settings.TOP_PAPERS_COUNT * 20
 
         db_papers = (
             self.db.query(Paper)
@@ -112,8 +204,6 @@ class DailyFeedPipeline:
             .limit(candidate_limit)
             .all()
         )
-
-        # Fallback: no impact scores computed yet — take most-cited
         if not db_papers:
             db_papers = (
                 self.db.query(Paper)
@@ -123,25 +213,15 @@ class DailyFeedPipeline:
             )
 
         if not db_papers:
-            logger.warning("No papers in DB for recommended mode")
+            logger.warning("No papers in DB — cannot generate recommendations")
             return []
 
         recently_seen = self._get_recently_recommended_arxiv_ids()
         db_papers = [p for p in db_papers if p.arxiv_id not in recently_seen]
 
-        logger.info(f"Recommended mode: {len(db_papers)} candidates from local DB")
-
+        logger.info(f"Recommended fallback: {len(db_papers)} candidates by impact score")
         papers = [self._db_paper_to_paperdata(p) for p in db_papers]
-
-        interaction_count = self.trainer.get_interaction_count()
-        if interaction_count >= 50:
-            logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
-            return self._rank_and_select(
-                papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
-            )
-        else:
-            logger.info(f"Interest+influence ranking ({interaction_count}/50 interactions for LightGBM)")
-            return self._rank_with_interests(papers, selected_interests, settings.TOP_PAPERS_COUNT)
+        return self._rank_with_interests(papers, selected_interests, settings.TOP_PAPERS_COUNT)
 
     def _fetch_papers_latest(self, selected_interests: List[str], days: int = 7) -> List[PaperData]:
         """
