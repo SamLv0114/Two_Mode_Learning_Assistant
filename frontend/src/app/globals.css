@@ -2,45 +2,94 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --foreground-rgb: 0, 0, 0;
-  --background-start-rgb: 250, 250, 250;
-  --background-end-rgb: 255, 255, 255;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --foreground-rgb: 255, 255, 255;
-    --background-start-rgb: 15, 23, 42;
-    --background-end-rgb: 30, 41, 59;
+@layer base {
+  html {
+    scroll-behavior: smooth;
   }
-}
-
-body {
-  color: rgb(var(--foreground-rgb));
-  background: linear-gradient(
-      to bottom,
-      transparent,
-      rgb(var(--background-end-rgb))
-    )
-    rgb(var(--background-start-rgb));
-  min-height: 100vh;
+  body {
+    @apply antialiased text-gray-900;
+    background: #f8fafc;
+    min-height: 100vh;
+  }
+  ::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-300 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-400;
+  }
 }
 
 @layer components {
   .btn-primary {
-    @apply bg-primary-600 hover:bg-primary-700 text-white font-medium py-2 px-4 rounded-lg transition-colors;
+    @apply inline-flex items-center justify-center gap-2
+           bg-primary-600 hover:bg-primary-700 active:scale-[0.97]
+           text-white font-semibold py-2 px-4 rounded-xl
+           transition-all duration-150 shadow-sm hover:shadow-md
+           disabled:opacity-60 disabled:cursor-not-allowed disabled:pointer-events-none
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2;
   }
 
   .btn-secondary {
-    @apply bg-gray-200 hover:bg-gray-300 text-gray-800 font-medium py-2 px-4 rounded-lg transition-colors;
+    @apply inline-flex items-center justify-center gap-2
+           bg-white hover:bg-gray-50 active:scale-[0.97]
+           text-gray-700 border border-gray-200 font-medium py-2 px-4 rounded-xl
+           transition-all duration-150 shadow-sm hover:shadow
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300 focus-visible:ring-offset-2;
   }
 
   .input-field {
-    @apply w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none transition-all;
+    @apply w-full px-4 py-2.5 bg-white border border-gray-200 rounded-xl
+           text-gray-900 placeholder-gray-400 outline-none transition-all duration-150
+           focus:border-primary-400 focus:ring-4 focus:ring-primary-50;
   }
 
   .card {
-    @apply bg-white rounded-xl shadow-sm border border-gray-100 p-6;
+    @apply bg-white rounded-2xl border border-gray-100 shadow-sm p-6;
   }
+
+  .card-lift {
+    @apply bg-white rounded-2xl border border-gray-100 shadow-sm p-6
+           transition-all duration-200 hover:shadow-md hover:-translate-y-px;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-gradient-to-br from-primary-600 to-violet-600 bg-clip-text text-transparent;
+  }
+  .animate-in {
+    animation: slideUp 0.35s ease-out both;
+  }
+  .fade-in {
+    animation: fadeIn 0.25s ease-out both;
+  }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes gradientPan {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.bg-animated {
+  background: linear-gradient(-45deg, #0ea5e9, #6366f1, #8b5cf6, #0284c7);
+  background-size: 400% 400%;
+  animation: gradientPan 14s ease infinite;
 }

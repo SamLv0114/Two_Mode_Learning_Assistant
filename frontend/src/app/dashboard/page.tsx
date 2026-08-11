@@ -151,25 +151,30 @@ export default function DashboardPage() {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="animate-spin rounded-full h-10 w-10 border-[3px] border-gray-200 border-t-primary-600" />
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-slate-50">
       {/* Header */}
-      <header className="bg-white shadow-sm">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-          <h1 className="text-2xl font-bold text-gray-900">Learning Assistant</h1>
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-gray-600">
-              {user?.email}
-            </span>
+      <header className="bg-white border-b border-gray-100 sticky top-0 z-20">
+        <div className="h-0.5 bg-gradient-to-r from-primary-500 via-indigo-500 to-violet-500" />
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex justify-between items-center">
+          <div className="flex items-center gap-2.5">
+            <span className="text-xl">🔬</span>
+            <h1 className="text-lg font-bold text-gray-900 tracking-tight">ResearchMate</h1>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-gray-400 hidden sm:block">{user?.email}</span>
+            <div className="w-8 h-8 rounded-full bg-primary-100 text-primary-700 flex items-center justify-center text-sm font-bold select-none">
+              {(user?.full_name?.[0] ?? user?.email?.[0] ?? '?').toUpperCase()}
+            </div>
             <button
               onClick={logout}
-              className="text-sm text-gray-500 hover:text-gray-700"
+              className="text-sm text-gray-400 hover:text-gray-700 px-3 py-1.5 rounded-lg hover:bg-gray-100 transition-colors"
             >
               Sign out
             </button>
@@ -179,91 +184,64 @@ export default function DashboardPage() {
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Stats Bar */}
-        <div className="card mb-6">
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 items-center">
-            <div>
-              <p className="text-sm text-gray-500">Total Interactions</p>
-              <p className="text-2xl font-bold text-gray-900">{stats?.total || 0}</p>
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">Saved</p>
-              <p className="text-2xl font-bold text-green-600">{stats?.saved || 0}</p>
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">Viewed</p>
-              <p className="text-2xl font-bold text-blue-600">{stats?.viewed || 0}</p>
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">Dismissed</p>
-              <p className="text-2xl font-bold text-red-500">{stats?.dismissed || 0}</p>
-            </div>
-            <div className="text-right">
-              {stats?.ready_for_training ? (
-                <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">
-                  Model ready to train
-                </span>
-              ) : (
-                <span className="text-sm text-gray-500">
-                  {stats?.interactions_until_training || 50} more interactions until training
-                </span>
-              )}
-            </div>
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-1">Total</p>
+            <p className="text-2xl font-bold text-gray-800">{stats?.total || 0}</p>
+          </div>
+          <div className="bg-emerald-50 rounded-2xl border border-emerald-100 shadow-sm p-4">
+            <p className="text-xs font-medium text-emerald-600 uppercase tracking-wide mb-1">Saved</p>
+            <p className="text-2xl font-bold text-emerald-700">{stats?.saved || 0}</p>
+          </div>
+          <div className="bg-sky-50 rounded-2xl border border-sky-100 shadow-sm p-4">
+            <p className="text-xs font-medium text-sky-600 uppercase tracking-wide mb-1">Viewed</p>
+            <p className="text-2xl font-bold text-sky-700">{stats?.viewed || 0}</p>
+          </div>
+          <div className="bg-rose-50 rounded-2xl border border-rose-100 shadow-sm p-4">
+            <p className="text-xs font-medium text-rose-500 uppercase tracking-wide mb-1">Dismissed</p>
+            <p className="text-2xl font-bold text-rose-600">{stats?.dismissed || 0}</p>
+          </div>
+          <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex items-center">
+            {stats?.ready_for_training ? (
+              <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-emerald-700">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                ML model active
+              </span>
+            ) : (
+              <span className="text-xs text-gray-400 leading-relaxed">
+                <span className="font-semibold text-gray-600">{stats?.interactions_until_training ?? 50}</span> more interactions to enable ML ranking
+              </span>
+            )}
           </div>
         </div>
 
         {/* Tabs */}
-        <div className="flex gap-4 mb-6">
-          <button
-            onClick={() => setActiveTab('feed')}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              activeTab === 'feed'
-                ? 'bg-primary-600 text-white'
-                : 'bg-white text-gray-700 hover:bg-gray-100'
-            }`}
-          >
-            Daily Feed
-          </button>
-          <button
-            onClick={() => setActiveTab('saved')}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              activeTab === 'saved'
-                ? 'bg-primary-600 text-white'
-                : 'bg-white text-gray-700 hover:bg-gray-100'
-            }`}
-          >
-            Saved Items
-          </button>
-          <button
-            onClick={() => setActiveTab('chat')}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-1.5 ${
-              activeTab === 'chat'
-                ? 'bg-primary-600 text-white'
-                : 'bg-white text-gray-700 hover:bg-gray-100'
-            }`}
-          >
-            <Bot className="w-4 h-4" />
-            Agent Chat
-          </button>
-          <button
-            onClick={() => setActiveTab('qa')}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              activeTab === 'qa'
-                ? 'bg-primary-600 text-white'
-                : 'bg-white text-gray-700 hover:bg-gray-100'
-            }`}
-          >
-            Q&A Assistant
-          </button>
-          <button
-            onClick={() => setActiveTab('settings')}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              activeTab === 'settings'
-                ? 'bg-primary-600 text-white'
-                : 'bg-white text-gray-700 hover:bg-gray-100'
-            }`}
-          >
-            Settings
-          </button>
+        <div className="flex border-b border-gray-200 mb-6 -mx-0 overflow-x-auto scrollbar-none">
+          {(
+            [
+              { id: 'feed', label: 'Daily Feed' },
+              { id: 'saved', label: 'Saved Items' },
+              { id: 'chat', label: 'Agent Chat', Icon: Bot },
+              { id: 'qa', label: 'Q&A' },
+              { id: 'settings', label: 'Settings' },
+            ] as { id: string; label: string; Icon?: typeof Bot }[]
+          ).map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id as typeof activeTab)}
+              className={`relative flex items-center gap-1.5 px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors duration-150 ${
+                activeTab === id
+                  ? 'text-primary-600'
+                  : 'text-gray-500 hover:text-gray-900'
+              }`}
+            >
+              {Icon && <Icon className="w-4 h-4" />}
+              {label}
+              {activeTab === id && (
+                <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-600 rounded-t-full" />
+              )}
+            </button>
+          ))}
         </div>
 
         {activeTab === 'feed' && (
@@ -287,10 +265,15 @@ export default function DashboardPage() {
                 {/* Papers */}
                 {feed.papers.length > 0 && (
                   <div>
-                    <h2 className="text-xl font-semibold text-gray-900 mb-4 flex items-center gap-2">
-                      <BookOpen className="w-5 h-5" />
-                      Research Papers ({feed.papers.length})
-                    </h2>
+                    <div className="flex items-center gap-2.5 mb-4">
+                      <div className="w-8 h-8 rounded-xl bg-sky-100 flex items-center justify-center">
+                        <BookOpen className="w-4 h-4 text-sky-600" />
+                      </div>
+                      <h2 className="text-base font-bold text-gray-900">
+                        Research Papers
+                        <span className="ml-2 text-sm font-normal text-gray-400">({feed.papers.length})</span>
+                      </h2>
+                    </div>
                     <div className="space-y-4">
                       {feed.papers.map((paper) => (
                         <PaperCard
@@ -306,10 +289,15 @@ export default function DashboardPage() {
                 {/* Articles */}
                 {feed.articles.length > 0 && (
                   <div>
-                    <h2 className="text-xl font-semibold text-gray-900 mb-4 flex items-center gap-2">
-                      <FileText className="w-5 h-5" />
-                      Tech Articles ({feed.articles.length})
-                    </h2>
+                    <div className="flex items-center gap-2.5 mb-4">
+                      <div className="w-8 h-8 rounded-xl bg-violet-100 flex items-center justify-center">
+                        <FileText className="w-4 h-4 text-violet-600" />
+                      </div>
+                      <h2 className="text-base font-bold text-gray-900">
+                        Tech Articles
+                        <span className="ml-2 text-sm font-normal text-gray-400">({feed.articles.length})</span>
+                      </h2>
+                    </div>
                     <div className="space-y-4">
                       {feed.articles.map((article) => (
                         <ArticleCard
@@ -323,21 +311,24 @@ export default function DashboardPage() {
                 )}
 
                 {/* Meta info */}
-                <div className="text-sm text-gray-500 text-center">
-                  {feed.used_ml_ranking ? (
-                    <span>Using personalized ML ranking</span>
-                  ) : (
-                    <span>Using heuristic ranking (interact more to enable ML)</span>
-                  )}
-                  {' | '}
-                  Considered {feed.total_papers_considered} papers, {feed.total_articles_considered} articles
+                <div className="flex items-center justify-center gap-2 pt-2">
+                  <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full ${feed.used_ml_ranking ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
+                    {feed.used_ml_ranking ? '🧠 Personalized ML ranking' : '📊 Heuristic ranking — interact more to unlock ML'}
+                  </span>
+                  <span className="text-xs text-gray-400">
+                    {feed.total_papers_considered} papers · {feed.total_articles_considered} articles considered
+                  </span>
                 </div>
               </div>
             )}
 
             {!feed && !isGenerating && (
-              <div className="text-center py-12 text-gray-500">
-                Click &quot;Generate Feed&quot; to get personalized recommendations
+              <div className="text-center py-16 animate-in">
+                <div className="text-5xl mb-4">🔬</div>
+                <h3 className="text-lg font-semibold text-gray-700 mb-2">Your feed is empty</h3>
+                <p className="text-sm text-gray-400 max-w-sm mx-auto">
+                  Click <strong>Generate Feed</strong> to discover personalized research papers and articles based on your interests.
+                </p>
               </div>
             )}
           </>
@@ -439,24 +430,24 @@ function FeedControls({
       {/* Top row: mode + time window + generate */}
       <div className="flex flex-wrap items-center gap-4">
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Mode</label>
-          <div className="flex rounded-lg border border-gray-200 overflow-hidden">
+          <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Mode</label>
+          <div className="flex rounded-xl border border-gray-200 overflow-hidden bg-gray-50 p-0.5 gap-0.5">
             <button
               onClick={() => setFeedMode('recommended')}
-              className={`px-3 py-1.5 text-sm font-medium transition-colors ${
+              className={`px-3 py-1.5 text-sm font-medium transition-all duration-150 rounded-lg ${
                 feedMode === 'recommended'
-                  ? 'bg-primary-600 text-white'
-                  : 'bg-white text-gray-600 hover:bg-gray-50'
+                  ? 'bg-white text-primary-600 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-700'
               }`}
             >
               Recommended
             </button>
             <button
               onClick={() => setFeedMode('latest')}
-              className={`px-3 py-1.5 text-sm font-medium transition-colors border-l border-gray-200 ${
+              className={`px-3 py-1.5 text-sm font-medium transition-all duration-150 rounded-lg ${
                 feedMode === 'latest'
-                  ? 'bg-primary-600 text-white'
-                  : 'bg-white text-gray-600 hover:bg-gray-50'
+                  ? 'bg-white text-primary-600 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-700'
               }`}
             >
               Latest
@@ -466,7 +457,7 @@ function FeedControls({
 
         {feedMode === 'latest' && (
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
               Time window
             </label>
             <select
@@ -484,7 +475,7 @@ function FeedControls({
 
         {/* Current focus areas preview */}
         <div className="flex-1 min-w-0">
-          <label className="block text-sm font-medium text-gray-700 mb-1">Focus areas</label>
+          <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Focus areas</label>
           <div className="flex flex-wrap gap-1.5">
             {(user?.focus_areas || []).length > 0 ? (
               (user.focus_areas as string[]).map((area: string) => (
@@ -534,11 +525,11 @@ function FeedControls({
 
       {/* Feed generation progress */}
       {isGenerating && feedProgress && (
-        <div className="mt-4 flex items-start gap-3 bg-blue-50 border border-blue-100 rounded-lg px-4 py-3">
-          <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0 mt-0.5" />
+        <div className="mt-4 flex items-start gap-3 bg-primary-50 border border-primary-100 rounded-xl px-4 py-3">
+          <RefreshCw className="w-4 h-4 text-primary-600 animate-spin shrink-0 mt-0.5" />
           <div>
-            <p className="text-sm font-medium text-blue-800">{feedProgress}</p>
-            <p className="text-xs text-blue-500 mt-0.5">Feed generation takes 1-2 minutes on first run</p>
+            <p className="text-sm font-semibold text-primary-800">{feedProgress}</p>
+            <p className="text-xs text-primary-400 mt-0.5">Generation takes 30–90 seconds — this runs in the background</p>
           </div>
         </div>
       )}
@@ -692,46 +683,53 @@ function PaperCard({
   onInteraction: (type: 'paper' | 'article', id: number, interaction: 'viewed' | 'saved' | 'dismissed') => void;
 }) {
   return (
-    <div className="card">
-      <div className="flex justify-between items-start gap-4">
-        <div className="flex-1">
-          <h3 className="font-semibold text-gray-900 mb-1">
-            {paper.rank}. {paper.title}
+    <div
+      className="card-lift animate-in"
+      style={{ borderLeft: '3px solid #0ea5e9' }}
+    >
+      <div className="flex-1">
+        <div className="flex items-start justify-between gap-3 mb-2">
+          <h3 className="font-semibold text-gray-900 leading-snug">
+            <span className="text-gray-400 mr-1.5">#{paper.rank}</span>
+            {paper.title}
           </h3>
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
-            <span>arXiv:{paper.arxiv_id}</span>
-            <span>Score: {paper.relevance_score.toFixed(3)}</span>
-            {paper.impact_score != null && (
-              <span>Impact: {paper.impact_score.toFixed(2)}</span>
-            )}
-            {paper.citation_count > 0 && (
-              <span>{paper.citation_count} citations</span>
-            )}
-          </div>
-          {paper.summary && <FormattedSummary text={paper.summary} />}
+          {paper.citation_count > 50 && (
+            <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-100">
+              ⭐ {paper.citation_count} citations
+            </span>
+          )}
         </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-400 mb-3">
+          <span>arXiv:{paper.arxiv_id}</span>
+          <span className="text-primary-600 font-medium">Score: {paper.relevance_score.toFixed(3)}</span>
+          {paper.impact_score != null && (
+            <span>Impact: {paper.impact_score.toFixed(2)}</span>
+          )}
+        </div>
+        {paper.summary && <FormattedSummary text={paper.summary} />}
       </div>
-      <div className="flex items-center gap-2 mt-4 pt-4 border-t">
+      <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
         <a
           href={paper.arxiv_url}
           target="_blank"
           rel="noopener noreferrer"
           onClick={() => onInteraction('paper', paper.id, 'viewed')}
-          className="btn-secondary text-sm flex items-center gap-1"
+          className="btn-secondary text-sm py-1.5"
         >
-          <ExternalLink className="w-4 h-4" />
-          View
+          <ExternalLink className="w-3.5 h-3.5" />
+          View paper
         </a>
         <button
           onClick={() => onInteraction('paper', paper.id, 'saved')}
-          className="btn-secondary text-sm flex items-center gap-1"
+          className="btn-secondary text-sm py-1.5"
         >
-          <Save className="w-4 h-4" />
+          <Save className="w-3.5 h-3.5" />
           Save
         </button>
         <button
           onClick={() => onInteraction('paper', paper.id, 'dismissed')}
-          className="text-gray-400 hover:text-gray-600 p-2"
+          className="ml-auto text-gray-300 hover:text-rose-400 p-2 rounded-lg hover:bg-rose-50 transition-colors"
+          title="Dismiss"
         >
           <X className="w-4 h-4" />
         </button>
@@ -749,41 +747,51 @@ function ArticleCard({
   onInteraction: (type: 'paper' | 'article', id: number, interaction: 'viewed' | 'saved' | 'dismissed') => void;
 }) {
   return (
-    <div className="card">
-      <div className="flex justify-between items-start gap-4">
-        <div className="flex-1">
-          <h3 className="font-semibold text-gray-900 mb-1">
-            {article.rank}. {article.title}
+    <div
+      className="card-lift animate-in"
+      style={{ borderLeft: '3px solid #8b5cf6' }}
+    >
+      <div className="flex-1">
+        <div className="flex items-start justify-between gap-3 mb-2">
+          <h3 className="font-semibold text-gray-900 leading-snug">
+            <span className="text-gray-400 mr-1.5">#{article.rank}</span>
+            {article.title}
           </h3>
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 mb-3">
-            <span>{article.source}</span>
-            <span>{article.upvotes} upvotes</span>
-            <span>Score: {article.relevance_score.toFixed(3)}</span>
-          </div>
-          {article.summary && <FormattedSummary text={article.summary} />}
+          {article.upvotes > 100 && (
+            <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-rose-50 text-rose-600 border border-rose-100">
+              🔥 {article.upvotes} pts
+            </span>
+          )}
         </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-400 mb-3">
+          <span className="capitalize">{article.source}</span>
+          <span>{article.upvotes} upvotes</span>
+          <span className="text-violet-600 font-medium">Score: {article.relevance_score.toFixed(3)}</span>
+        </div>
+        {article.summary && <FormattedSummary text={article.summary} />}
       </div>
-      <div className="flex items-center gap-2 mt-4 pt-4 border-t">
+      <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
         <a
           href={article.url}
           target="_blank"
           rel="noopener noreferrer"
           onClick={() => onInteraction('article', article.id, 'viewed')}
-          className="btn-secondary text-sm flex items-center gap-1"
+          className="btn-secondary text-sm py-1.5"
         >
-          <ExternalLink className="w-4 h-4" />
-          Read
+          <ExternalLink className="w-3.5 h-3.5" />
+          Read article
         </a>
         <button
           onClick={() => onInteraction('article', article.id, 'saved')}
-          className="btn-secondary text-sm flex items-center gap-1"
+          className="btn-secondary text-sm py-1.5"
         >
-          <Save className="w-4 h-4" />
+          <Save className="w-3.5 h-3.5" />
           Save
         </button>
         <button
           onClick={() => onInteraction('article', article.id, 'dismissed')}
-          className="text-gray-400 hover:text-gray-600 p-2"
+          className="ml-auto text-gray-300 hover:text-rose-400 p-2 rounded-lg hover:bg-rose-50 transition-colors"
+          title="Dismiss"
         >
           <X className="w-4 h-4" />
         </button>
