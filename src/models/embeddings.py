@@ -244,7 +244,27 @@ class EmbeddingManager:
 
         return len(chunks)
 
-    
+    def delete_user_document(self, doc_id: str) -> int:
+        """
+        Delete all ChromaDB chunks that belong to a user document.
+
+        Args:
+            doc_id: The doc_id value stored in chunk metadata (e.g. "userdoc_3_a1b2c3d4").
+
+        Returns:
+            Number of chunks deleted (0 if none found or on error).
+        """
+        try:
+            results = self.collection.get(where={"doc_id": doc_id}, include=[])
+            chunk_ids = results.get("ids", [])
+            if chunk_ids:
+                self.collection.delete(ids=chunk_ids)
+                logger.info(f"Deleted {len(chunk_ids)} chunks for doc_id={doc_id}")
+            return len(chunk_ids)
+        except Exception as e:
+            logger.warning(f"Failed to delete ChromaDB chunks for doc_id={doc_id}: {e}")
+            return 0
+
     def search(self, query: str, n_results: int = 10, filter_type: Optional[str] = None) -> List[Dict]:
         """
         Search the vector database

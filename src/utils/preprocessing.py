@@ -7,9 +7,9 @@ import re
 from bs4 import BeautifulSoup
 
 try:
-    from PyPDF2 import PdfReader
+    import fitz as _fitz  # PyMuPDF
 except Exception:  # Optional dependency for PDF support
-    PdfReader = None
+    _fitz = None
 
 
 def clean_text(text: str) -> str:
@@ -46,16 +46,12 @@ def extract_text_from_html(html: str) -> str:
 
 
 def extract_text_from_pdf(data: bytes) -> str:
-    """Extract text from a PDF byte stream"""
-    if PdfReader is None:
-        raise RuntimeError("PyPDF2 is not installed; PDF extraction is unavailable.")
+    """Extract text from a PDF byte stream using PyMuPDF."""
+    if _fitz is None:
+        raise RuntimeError("PyMuPDF is not installed; PDF extraction is unavailable.")
 
-    reader = PdfReader(io.BytesIO(data))
-    pages_text = []
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        pages_text.append(page_text)
-    return "\n".join(pages_text).strip()
+    doc = _fitz.open(stream=data, filetype="pdf")
+    return "\n".join(page.get_text() for page in doc).strip()
 
 
 

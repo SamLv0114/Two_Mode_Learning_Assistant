@@ -235,14 +235,10 @@ async def list_documents(
 async def delete_document(
     doc_id: int,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
 ):
-    """
-    Delete a user-uploaded document
-
-    Note: This removes the document from the database but may not
-    immediately remove it from the vector database.
-    """
+    """Delete a user-uploaded document from both the database and the vector store."""
     doc = db.query(UserDocument).filter(
         UserDocument.id == doc_id,
         UserDocument.user_id == current_user.id
@@ -253,6 +249,11 @@ async def delete_document(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found"
         )
+
+    # Remove vectors from ChromaDB before deleting the DB record
+    if doc.content_hash:
+        chroma_doc_id = f"userdoc_{doc.user_id}_{doc.content_hash[:8]}"
+        embedding_manager.delete_user_document(chroma_doc_id)
 
     db.delete(doc)
     db.commit()

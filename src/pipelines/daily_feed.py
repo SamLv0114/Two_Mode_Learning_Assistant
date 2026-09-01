@@ -12,7 +12,7 @@ from sqlalchemy import exc as sa_exc
 
 from sqlalchemy.orm import Session
 
-from src.collectors import ArxivCollector, PaperData, HNCollector, MediumCollector, DevToCollector
+from src.collectors import ArxivCollector, PaperData
 from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
@@ -64,18 +64,9 @@ class DailyFeedPipeline:
         else:
             top_papers = self._fetch_papers_recommended(selected_interests)
 
-        # Step 2: Articles — disabled for now, re-enable once papers are stable
-        # scale = min(max(1, time_window_days) / 7.0, 52)
-        # article_fetch_limit = int(10 * scale)
-        # logger.info("Step 2: Collecting and filtering articles...")
-        # raw_articles = self._collect_articles(time_window_days, article_fetch_limit)
-        # candidate_articles = self._filter_articles(raw_articles, selected_interests, min_threshold=0.15)
-        # top_articles = sorted(
-        #     candidate_articles,
-        #     key=lambda a: (getattr(a, "relevance_score", 0) or 0) * 0.7 + min((getattr(a, "upvotes", 0) or 0) / 500, 1.0) * 0.3,
-        #     reverse=True,
-        # )[:settings.TOP_ARTICLES_COUNT]
-        top_articles = []
+        # Step 2: Articles — Tavily agent-based discovery (replaces static scrapers)
+        logger.info("Step 2: Discovering articles via WebArticleAgent (Tavily)...")
+        top_articles = self._discover_articles(self._user_interests)
 
         # Step 3: Summarize papers (parallel LLM calls)
         logger.info("Step 3: Generating personalized summaries...")
@@ -475,66 +466,6 @@ class DailyFeedPipeline:
         self.db.commit()
         return papers
     
-    def _collect_articles(self, time_window_days: int, per_source_limit: int) -> List:
-        """Collect new articles from tech sources"""
-        all_articles = []
-        
-        if "hackernews" in settings.TECH_SOURCES:
-            collector = HNCollector()
-            hn_articles = collector.fetch(days=time_window_days, limit=per_source_limit)
-            logger.info(f"Collected {len(hn_articles)} articles from Hacker News (last {time_window_days} days)")
-            all_articles.extend(hn_articles)
-        
-        if "devto" in settings.TECH_SOURCES:
-            collector = DevToCollector()
-            devto_articles = collector.fetch(days=time_window_days, limit=per_source_limit)
-            logger.info(f"Collected {len(devto_articles)} articles from Dev.to (last {time_window_days} days)")
-            all_articles.extend(devto_articles)
-        
-        if "medium" in settings.TECH_SOURCES:
-            collector = MediumCollector()
-            medium_articles = collector.fetch(days=time_window_days, limit=per_source_limit)
-            logger.info(f"Collected {len(medium_articles)} articles from Medium (last {time_window_days} days)")
-            all_articles.extend(medium_articles)
-        
-        logger.info(f"Total articles collected: {len(all_articles)} (from last {time_window_days} days)")
-        
-        # Store in database
-        new_count = 0
-        for article_data in all_articles:
-            existing = self.db.query(Article).filter(Article.url == article_data.url).first()
-            if not existing:
-                article = Article(
-                    source=article_data.source,
-                    source_id=article_data.source_id,
-                    title=article_data.title,
-                    url=article_data.url,
-                    content=article_data.content[:5000],  # Limit content length
-                    author=article_data.author,
-                    published_date=article_data.published_date,
-                    upvotes=article_data.upvotes
-                )
-                try:
-                    self.db.add(article)
-                    self.db.flush()  # detect unique violations early
-                    new_count += 1
-                except sa_exc.IntegrityError:
-                    self.db.rollback()
-                    logger.debug(f"Duplicate article skipped (url={article_data.url})")
-                except Exception as e:
-                    self.db.rollback()
-                    logger.error(f"Error saving article {article_data.url}: {e}")
-        
-        self.db.commit()
-
-        # Store db_id on each collector object for interaction tracking
-        for article_data in all_articles:
-            db_art = self.db.query(Article).filter(Article.url == article_data.url).first()
-            if db_art:
-                article_data.db_id = db_art.id
-
-        logger.info(f"Stored {new_count} new articles in database")
-        return all_articles
     
     
     def _filter_candidates(
@@ -834,6 +765,63 @@ class DailyFeedPipeline:
             candidates.extend(sampled)
         return candidates
     
+    def _discover_articles(self, interests: List[str]) -> List:
+        """
+        Discover CS/AI articles using WebArticleAgent (Tavily web search).
+        Upserts results into the Article table and returns DB Article objects
+        scored by relevance to user interests, ready for summary generation
+        and storage in UserArticleRecommendation.
+        """
+        from src.agents.web_article_agent import WebArticleAgent
+        from sqlalchemy import exc as sa_exc
+
+        agent = WebArticleAgent()
+        raw = agent.discover(interests, max_articles=settings.TOP_ARTICLES_COUNT * 4)
+
+        if not raw:
+            return []
+
+        article_objs = []
+        for art in raw:
+            try:
+                existing = self.db.query(Article).filter(Article.url == art["url"]).first()
+                if existing:
+                    db_art = existing
+                else:
+                    db_art = Article(
+                        source=art["source"],
+                        source_id=art["source_id"],
+                        title=art["title"],
+                        url=art["url"],
+                        content=art["content"],
+                        author=art["author"],
+                        published_date=datetime.now(timezone.utc),
+                        upvotes=0,
+                    )
+                    self.db.add(db_art)
+                    self.db.flush()
+
+                article_objs.append(db_art)
+            except sa_exc.IntegrityError:
+                self.db.rollback()
+                logger.debug(f"Duplicate article skipped: {art.get('url')}")
+            except Exception as e:
+                self.db.rollback()
+                logger.warning(f"Article upsert failed ({art.get('url')}): {e}")
+
+        if not article_objs:
+            return []
+
+        self.db.commit()
+
+        # Score by semantic similarity to interests
+        scored = self._filter_articles(article_objs, interests, min_threshold=0.05)
+        if not scored:
+            scored = article_objs  # keep all if none pass low threshold
+
+        top = sorted(scored, key=lambda a: getattr(a, "relevance_score", 0), reverse=True)
+        return top[: settings.TOP_ARTICLES_COUNT]
+
     def _generate_summaries(self, items: List, item_type: str) -> List:
         """Generate personalized summaries for items (parallel API calls)."""
         if not items:

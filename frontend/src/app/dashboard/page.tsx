@@ -30,7 +30,13 @@ export default function DashboardPage() {
   const [feedProgress, setFeedProgress] = useState('');
   const [timeWindow, setTimeWindow] = useState(7);
   const [feedMode, setFeedMode] = useState<'recommended' | 'latest'>('recommended');
-  const [activeTab, setActiveTab] = useState<'feed' | 'saved' | 'chat' | 'qa' | 'settings'>('feed');
+  const [activeTab, setActiveTab] = useState<'feed' | 'saved' | 'chat' | 'settings'>('feed');
+  const [activePaperContext, setActivePaperContext] = useState<{
+    title: string;
+    abstract: string | null;
+    arxivId: string;
+    arxivUrl: string;
+  } | null>(null);
   const feedPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -222,7 +228,6 @@ export default function DashboardPage() {
               { id: 'feed', label: 'Daily Feed' },
               { id: 'saved', label: 'Saved Items' },
               { id: 'chat', label: 'Agent Chat', Icon: Bot },
-              { id: 'qa', label: 'Q&A' },
               { id: 'settings', label: 'Settings' },
             ] as { id: string; label: string; Icon?: typeof Bot }[]
           ).map(({ id, label, Icon }) => (
@@ -280,6 +285,7 @@ export default function DashboardPage() {
                           key={paper.id}
                           paper={paper}
                           onInteraction={handleInteraction}
+                          onAskAgent={(ctx) => { setActivePaperContext(ctx); setActiveTab('chat'); }}
                         />
                       ))}
                     </div>
@@ -336,9 +342,12 @@ export default function DashboardPage() {
 
         {activeTab === 'saved' && <SavedItems />}
 
-        {activeTab === 'chat' && <AgentChat />}
-
-        {activeTab === 'qa' && <QAAssistant />}
+        {activeTab === 'chat' && (
+          <AgentChat
+            paperContext={activePaperContext}
+            onClearPaperContext={() => setActivePaperContext(null)}
+          />
+        )}
 
         {activeTab === 'settings' && <UserSettings user={user} onUpdate={fetchProfile} />}
       </main>
@@ -678,9 +687,11 @@ function FormattedSummary({ text }: { text: string }) {
 function PaperCard({
   paper,
   onInteraction,
+  onAskAgent,
 }: {
   paper: Paper;
   onInteraction: (type: 'paper' | 'article', id: number, interaction: 'viewed' | 'saved' | 'dismissed') => void;
+  onAskAgent: (ctx: { title: string; abstract: string | null; arxivId: string; arxivUrl: string }) => void;
 }) {
   return (
     <div
@@ -725,6 +736,18 @@ function PaperCard({
         >
           <Save className="w-3.5 h-3.5" />
           Save
+        </button>
+        <button
+          onClick={() => onAskAgent({
+            title: paper.title,
+            abstract: paper.abstract ?? null,
+            arxivId: paper.arxiv_id,
+            arxivUrl: paper.arxiv_url ?? '',
+          })}
+          className="btn-secondary text-sm py-1.5 text-primary-600 border-primary-200 hover:bg-primary-50"
+        >
+          <Bot className="w-3.5 h-3.5" />
+          Ask Agent
         </button>
         <button
           onClick={() => onInteraction('paper', paper.id, 'dismissed')}
@@ -999,23 +1022,76 @@ interface ChatMessage {
 }
 
 /* ── Agent Chat ── */
-function AgentChat() {
+function AgentChat({
+  paperContext = null,
+  onClearPaperContext,
+}: {
+  paperContext?: { title: string; abstract: string | null; arxivId: string; arxivUrl: string } | null;
+  onClearPaperContext?: () => void;
+}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [showKB, setShowKB] = useState(false);
+  const [kbDocs, setKbDocs] = useState<any[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const paperContextInjected = useRef(false);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   useEffect(() => {
+    loadKbDocs();
     return () => {
       abortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    paperContextInjected.current = false;
+  }, [paperContext]);
+
+  const loadKbDocs = async () => {
+    try {
+      const data = await qaApi.listDocuments();
+      setKbDocs(data.documents || data || []);
+    } catch {}
+  };
+
+  const handleKbUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setIsUploading(true);
+    let uploaded = 0;
+    for (let i = 0; i < files.length; i++) {
+      try {
+        await qaApi.uploadDocument(files[i], files[i].name);
+        uploaded++;
+      } catch (err: any) {
+        toast.error(`Failed to upload ${files[i].name}: ${err.response?.data?.detail || 'Unknown error'}`);
+      }
+    }
+    if (uploaded > 0) {
+      toast.success(`Uploaded ${uploaded} document(s) to knowledge base`);
+      loadKbDocs();
+    }
+    setIsUploading(false);
+    e.target.value = '';
+  };
+
+  const handleKbDelete = async (docId: number, title: string) => {
+    try {
+      await qaApi.deleteDocument(docId);
+      toast.success(`Deleted "${title}"`);
+      loadKbDocs();
+    } catch {
+      toast.error('Failed to delete document');
+    }
+  };
 
   const sendMessage = async () => {
     if (!input.trim() || isStreaming) return;
@@ -1031,7 +1107,14 @@ function AgentChat() {
     };
 
     setMessages(prev => [...prev, userMsg, assistantMsg]);
-    const text = input;
+    let text = input;
+    if (paperContext && !paperContextInjected.current) {
+      const abstractPreview = paperContext.abstract
+        ? paperContext.abstract.slice(0, 800)
+        : 'Not available';
+      text = `I want to ask about this research paper:\n\nTitle: ${paperContext.title}\narXiv: ${paperContext.arxivId}\n\nAbstract: ${abstractPreview}\n\n---\n\nMy question: ${input}`;
+      paperContextInjected.current = true;
+    }
     setInput('');
     setIsStreaming(true);
 
@@ -1159,6 +1242,92 @@ function AgentChat() {
         </button>
       </div>
 
+      {/* Paper Context Banner */}
+      {paperContext && (
+        <div className="shrink-0 mb-3 flex items-start gap-3 bg-sky-50 border border-sky-200 rounded-xl px-4 py-3">
+          <BookOpen className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-semibold text-sky-700 mb-0.5">Discussing paper</p>
+            <p className="text-sm text-sky-900 font-medium leading-snug line-clamp-2">{paperContext.title}</p>
+            {paperContext.arxivUrl && (
+              <a
+                href={paperContext.arxivUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-sky-600 hover:underline"
+              >
+                arXiv:{paperContext.arxivId} →
+              </a>
+            )}
+          </div>
+          <button
+            onClick={onClearPaperContext}
+            className="text-sky-400 hover:text-sky-600 p-1 shrink-0 transition-colors"
+            title="Clear paper context"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* Knowledge Base Panel */}
+      <div className="shrink-0 mb-3 border border-gray-200 rounded-xl overflow-hidden">
+        <button
+          onClick={() => setShowKB(!showKB)}
+          className="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 text-sm font-medium text-gray-700 transition-colors"
+        >
+          <div className="flex items-center gap-2">
+            <Upload className="w-4 h-4 text-gray-500" />
+            Knowledge Base
+            {kbDocs.length > 0 && (
+              <span className="text-xs bg-primary-100 text-primary-700 px-2 py-0.5 rounded-full font-medium">
+                {kbDocs.length} doc{kbDocs.length !== 1 ? 's' : ''}
+              </span>
+            )}
+          </div>
+          {showKB ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
+        </button>
+        {showKB && (
+          <div className="p-4 space-y-3 bg-white">
+            <label className="inline-flex items-center gap-2 btn-secondary text-sm cursor-pointer">
+              <Upload className="w-4 h-4" />
+              {isUploading ? 'Uploading...' : 'Upload Files (.txt, .md, .pdf)'}
+              <input
+                type="file"
+                accept=".txt,.md,.pdf"
+                multiple
+                onChange={handleKbUpload}
+                disabled={isUploading}
+                className="hidden"
+              />
+            </label>
+            {kbDocs.length > 0 ? (
+              <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                {kbDocs.map((doc: any) => (
+                  <div key={doc.id} className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-1.5">
+                    <div className="min-w-0">
+                      <span className="text-sm text-gray-700 truncate block">{doc.title}</span>
+                      {doc.chunk_count > 0 && (
+                        <span className="text-xs text-gray-400">{doc.chunk_count} chunks</span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => handleKbDelete(doc.id, doc.title)}
+                      className="text-gray-300 hover:text-rose-400 p-1 ml-2 shrink-0 transition-colors"
+                      title="Delete document"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-gray-400">No documents yet. Uploaded files will be searchable in Agent Chat.</p>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Messages */}
       <div className="flex-1 overflow-y-auto space-y-4 pr-1">
         {messages.length === 0 && (
@@ -1169,11 +1338,15 @@ function AgentChat() {
               Research questions, paper recommendations, or searches across your uploaded documents
             </p>
             <div className="mt-4 flex flex-wrap gap-2 justify-center">
-              {[
+              {(paperContext ? [
+                '这篇论文的核心贡献是什么？',
+                '它有哪些局限性和不足？',
+                '帮我找引用了这篇论文的相关工作',
+              ] : [
                 'What are recent advances in transformers?',
                 'Recommend papers on reinforcement learning',
                 'List my uploaded documents',
-              ].map(ex => (
+              ]).map(ex => (
                 <button
                   key={ex}
                   onClick={() => setInput(ex)}
@@ -1306,236 +1479,6 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           </div>
         )}
       </div>
-    </div>
-  );
-}
-
-/* ── Q&A Assistant ── */
-function QAAssistant() {
-  const [question, setQuestion] = useState('');
-  const [answer, setAnswer] = useState<{ answer: string; citations: any[] } | null>(null);
-  const [isAsking, setIsAsking] = useState(false);
-  const [nContext, setNContext] = useState(5);
-  const [uploadsOnly, setUploadsOnly] = useState(false);
-  const [documents, setDocuments] = useState<any[]>([]);
-  const [isUploading, setIsUploading] = useState(false);
-
-  useEffect(() => {
-    loadDocuments();
-  }, []);
-
-  const loadDocuments = async () => {
-    try {
-      const data = await qaApi.listDocuments();
-      setDocuments(data.documents || data || []);
-    } catch (error) {
-      console.error('Failed to load documents:', error);
-    }
-  };
-
-  const handleAsk = async () => {
-    if (!question.trim()) return;
-    setIsAsking(true);
-    setAnswer(null);
-    try {
-      const data = await qaApi.ask({
-        question,
-        n_context: nContext,
-        filter_type: uploadsOnly ? 'user_doc' : undefined,
-      });
-      setAnswer(data);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Failed to get answer');
-    } finally {
-      setIsAsking(false);
-    }
-  };
-
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    setIsUploading(true);
-    let uploaded = 0;
-    for (let i = 0; i < files.length; i++) {
-      try {
-        await qaApi.uploadDocument(files[i], files[i].name);
-        uploaded++;
-      } catch (error: any) {
-        toast.error(`Failed to upload ${files[i].name}: ${error.response?.data?.detail || 'Unknown error'}`);
-      }
-    }
-    if (uploaded > 0) {
-      toast.success(`Uploaded ${uploaded} document(s)`);
-      loadDocuments();
-    }
-    setIsUploading(false);
-    e.target.value = '';
-  };
-
-  const handleDelete = async (docId: number, title: string) => {
-    try {
-      await qaApi.deleteDocument(docId);
-      toast.success(`Deleted "${title}"`);
-      loadDocuments();
-    } catch (error) {
-      toast.error('Failed to delete document');
-    }
-  };
-
-  return (
-    <div className="space-y-6">
-      {/* Document Upload */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
-          <Upload className="w-5 h-5" />
-          Upload Study Materials
-        </h2>
-        <p className="text-sm text-gray-500 mb-4">
-          Upload .txt, .md, or .pdf files to build your knowledge base
-        </p>
-        <label className="inline-flex items-center gap-2 btn-secondary text-sm cursor-pointer">
-          <Upload className="w-4 h-4" />
-          {isUploading ? 'Uploading...' : 'Choose Files'}
-          <input
-            type="file"
-            accept=".txt,.md,.pdf"
-            multiple
-            onChange={handleUpload}
-            disabled={isUploading}
-            className="hidden"
-          />
-        </label>
-
-        {/* Document List */}
-        {documents.length > 0 && (
-          <div className="mt-4">
-            <h3 className="text-sm font-medium text-gray-700 mb-2">
-              Your Documents ({documents.length})
-            </h3>
-            <div className="space-y-2">
-              {documents.map((doc: any) => (
-                <div
-                  key={doc.id}
-                  className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2"
-                >
-                  <div>
-                    <span className="text-sm font-medium text-gray-900">{doc.title}</span>
-                    <span className="text-xs text-gray-500 ml-2">
-                      {doc.chunk_count ? `${doc.chunk_count} chunks` : ''}
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => handleDelete(doc.id, doc.title)}
-                    className="text-red-400 hover:text-red-600 p-1"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Question Input */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
-          <MessageCircle className="w-5 h-5" />
-          Ask a Question
-        </h2>
-        <textarea
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          placeholder="e.g., Explain the attention mechanism in transformers"
-          rows={3}
-          className="input-field w-full mb-4"
-        />
-        <div className="flex flex-wrap items-center gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Context documents
-            </label>
-            <select
-              value={nContext}
-              onChange={(e) => setNContext(Number(e.target.value))}
-              className="input-field w-24"
-            >
-              {[3, 5, 7, 10].map((n) => (
-                <option key={n} value={n}>{n}</option>
-              ))}
-            </select>
-          </div>
-          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer mt-5">
-            <input
-              type="checkbox"
-              checked={uploadsOnly}
-              onChange={(e) => setUploadsOnly(e.target.checked)}
-              className="rounded border-gray-300"
-            />
-            Use only my uploaded documents
-          </label>
-          <div className="flex-1" />
-          <button
-            onClick={handleAsk}
-            disabled={isAsking || !question.trim()}
-            className="btn-primary flex items-center gap-2 disabled:opacity-50 mt-5"
-          >
-            {isAsking ? (
-              <>
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                Thinking...
-              </>
-            ) : (
-              <>
-                <Search className="w-4 h-4" />
-                Ask Question
-              </>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* Answer */}
-      {answer && (
-        <div className="card">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Answer</h2>
-          <div className="prose prose-sm max-w-none text-gray-700 whitespace-pre-wrap">
-            {answer.answer}
-          </div>
-
-          {/* Citations */}
-          {answer.citations && answer.citations.length > 0 && (
-            <div className="mt-6 pt-4 border-t">
-              <h3 className="text-sm font-semibold text-gray-900 mb-3">Sources</h3>
-              <div className="space-y-2">
-                {answer.citations.map((citation: any, i: number) => (
-                  <div key={i} className="bg-gray-50 rounded-lg px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs font-medium bg-gray-200 rounded px-1.5 py-0.5">
-                        {citation.type === 'paper' ? 'Paper' :
-                         citation.type === 'article' ? 'Article' : 'Document'}
-                      </span>
-                      <span className="text-sm font-medium text-gray-900">
-                        {citation.title}
-                      </span>
-                    </div>
-                    {citation.url && (
-                      <a
-                        href={citation.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-xs text-primary-600 hover:text-primary-700 mt-1 inline-block"
-                      >
-                        Open source &rarr;
-                      </a>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

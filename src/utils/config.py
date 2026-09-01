@@ -3,7 +3,9 @@ Configuration settings for the AI Learning Assistant
 """
 from pathlib import Path
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from typing import List, Optional
+import logging
 import secrets
 
 
@@ -31,9 +33,6 @@ class Settings(BaseSettings):
     # ArXiv settings
     ARXIV_CATEGORIES: List[str] = ["cs.LG", "cs.AI", "cs.CV", "cs.CL", "cs.NE"]
     MAX_PAPERS_PER_DAY: int = 15
-
-    # Tech article sources
-    TECH_SOURCES: List[str] = ["hackernews", "devto", "medium"]
 
     # Recommendation settings
     TOP_PAPERS_COUNT: int = 5
@@ -75,7 +74,21 @@ class Settings(BaseSettings):
     # ============================================================
 
     # JWT Configuration
-    SECRET_KEY: str = secrets.token_urlsafe(32)  # Override in .env for production!
+    # Set SECRET_KEY=<fixed-value> in .env. An empty/missing value falls back to an
+    # ephemeral random key that changes on every restart, invalidating all JWT sessions.
+    SECRET_KEY: str = ""
+
+    @field_validator("SECRET_KEY", mode="before")
+    @classmethod
+    def require_secret_key(cls, v: str) -> str:
+        if not v:
+            logging.getLogger(__name__).warning(
+                "SECRET_KEY is not set in .env — using an ephemeral random key. "
+                "All user sessions will be lost on every server restart. "
+                "Add SECRET_KEY=<fixed-random-string> to your .env file."
+            )
+            return secrets.token_urlsafe(32)
+        return v
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7

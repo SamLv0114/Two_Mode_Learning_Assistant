@@ -40,6 +40,9 @@ ENV/
 
 # Node
 node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
 
 # Data and models
 data/
