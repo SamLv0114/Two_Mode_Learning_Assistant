@@ -1008,6 +1008,14 @@ const TOOL_ICONS: Record<string, string> = {
   search_user_documents: '🔎',
 };
 
+interface ResearchTask {
+  id: number;
+  title: string;
+  intent: string;
+  status: 'pending' | 'running' | 'done';
+  citations?: number;
+}
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -1019,6 +1027,7 @@ interface ChatMessage {
   toolCalls?: { tool: string; count: number }[];
   citations?: { title: string; url: string; type: string }[];
   isStreaming?: boolean;
+  researchPlan?: ResearchTask[];
 }
 
 /* ── Agent Chat ── */
@@ -1166,6 +1175,23 @@ function AgentChat({
                 return { ...m, isStreaming: false, citations: event.citations };
               case 'error':
                 return { ...m, isStreaming: false, content: m.content || `Error: ${event.value}` };
+              case 'plan':
+                return {
+                  ...m,
+                  researchPlan: event.tasks.map(t => ({ ...t, status: 'pending' as const })),
+                };
+              case 'task_started': {
+                const updated = (m.researchPlan || []).map(t =>
+                  t.id === event.id ? { ...t, status: 'running' as const } : t
+                );
+                return { ...m, researchPlan: updated };
+              }
+              case 'task_done': {
+                const updated = (m.researchPlan || []).map(t =>
+                  t.id === event.id ? { ...t, status: 'done' as const, citations: event.citations } : t
+                );
+                return { ...m, researchPlan: updated };
+              }
               default:
                 return m;
             }
@@ -1443,6 +1469,30 @@ function ChatBubble({ message }: { message: ChatMessage }) {
                 {TOOL_ICONS[tc.tool] || '⚙'} {TOOL_LABELS[tc.tool] || tc.tool}
                 {tc.count >= 0 && ` (${tc.count})`}
               </span>
+            ))}
+          </div>
+        )}
+
+        {/* Deep research plan */}
+        {message.researchPlan && message.researchPlan.length > 0 && (
+          <div className="bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2 space-y-1">
+            <p className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-1.5">Research Plan</p>
+            {message.researchPlan.map(task => (
+              <div key={task.id} className="flex items-center gap-2 text-xs">
+                {task.status === 'done' ? (
+                  <span className="text-green-500">✓</span>
+                ) : task.status === 'running' ? (
+                  <RefreshCw className="w-3 h-3 text-indigo-500 animate-spin shrink-0" />
+                ) : (
+                  <span className="w-3 h-3 rounded-full border border-gray-300 shrink-0 inline-block" />
+                )}
+                <span className={`flex-1 ${task.status === 'done' ? 'text-gray-500 line-through' : task.status === 'running' ? 'text-indigo-700 font-medium' : 'text-gray-500'}`}>
+                  {task.title}
+                </span>
+                {task.status === 'done' && task.citations !== undefined && task.citations > 0 && (
+                  <span className="text-gray-400">{task.citations} src</span>
+                )}
+              </div>
             ))}
           </div>
         )}

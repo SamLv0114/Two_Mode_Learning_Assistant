@@ -121,7 +121,10 @@ export type AgentEvent =
   | { type: 'generating' }
   | { type: 'token'; value: string }
   | { type: 'done'; tools_called: string[]; citations: { title: string; url: string; type: string }[] }
-  | { type: 'error'; value: string };
+  | { type: 'error'; value: string }
+  | { type: 'plan'; tasks: { id: number; title: string; intent: string }[] }
+  | { type: 'task_started'; id: number; title: string }
+  | { type: 'task_done'; id: number; citations: number };
 
 // Auth API
 export const authApi = {
