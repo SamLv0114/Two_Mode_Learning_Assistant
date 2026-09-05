@@ -19,6 +19,7 @@ real-time research progress:
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List
 
@@ -315,11 +316,20 @@ class DeepResearchAgent(BaseAgent):
         # Stage 1: plan
         plan = self.planner.plan(message)
 
-        # Stage 2: execute each task
-        notes: List[ResearchNote] = []
-        for task in plan:
-            note = self.summarizer.summarize(task, context)
-            notes.append(note)
+        # Stage 2: execute tasks concurrently (V4: ThreadPoolExecutor, max 3 workers)
+        notes_by_id: Dict[int, "ResearchNote"] = {}
+
+        def _run_task(task):
+            return task.id, self.summarizer.summarize(task, context)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_run_task, task): task for task in plan}
+            for future in as_completed(futures):
+                task_id, note = future.result()
+                notes_by_id[task_id] = note
+
+        # Preserve task order for coherent report
+        notes: List[ResearchNote] = [notes_by_id[t.id] for t in plan if t.id in notes_by_id]
 
         # Stage 3: synthesize report
         report = self.writer.write(message, notes)
@@ -361,22 +371,33 @@ class DeepResearchAgent(BaseAgent):
             "tasks": [{"id": t.id, "title": t.title, "intent": t.intent} for t in plan],
         }
 
-        # Stage 2: execute tasks
-        notes: List[ResearchNote] = []
-        all_tools: List[str] = []
-        all_citations: List[Dict] = []
-
+        # Stage 2: execute tasks concurrently (V4)
+        # Emit all task_started events upfront so the UI shows the full plan immediately
         for task in plan:
             yield {"type": "task_started", "id": task.id, "title": task.title}
-            note = self.summarizer.summarize(task, context)
-            notes.append(note)
-            all_tools.extend(note.tools_called)
-            all_citations.extend(note.citations)
-            yield {
-                "type": "task_done",
-                "id": task.id,
-                "citations": len(note.citations),
-            }
+
+        all_tools: List[str] = []
+        all_citations: List[Dict] = []
+        notes_by_id: Dict[int, "ResearchNote"] = {}
+        done_events = []
+
+        def _run_task(task):
+            return task.id, self.summarizer.summarize(task, context)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_run_task, task): task for task in plan}
+            for future in as_completed(futures):
+                task_id, note = future.result()
+                notes_by_id[task_id] = note
+                all_tools.extend(note.tools_called)
+                all_citations.extend(note.citations)
+                done_events.append({"type": "task_done", "id": task_id, "citations": len(note.citations)})
+
+        for evt in done_events:
+            yield evt
+
+        # Preserve original task order for the report
+        notes = [notes_by_id[t.id] for t in plan if t.id in notes_by_id]
 
         # Stage 3: stream the report
         yield {"type": "generating"}

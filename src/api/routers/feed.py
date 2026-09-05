@@ -242,9 +242,97 @@ async def get_recommended_articles(
             upvotes=article.upvotes,
             relevance_score=rec.relevance_score,
             summary=rec.personalized_summary,
+            digest_summary=article.digest_summary,
         )
         for i, (article, rec) in enumerate(rows, offset + 1)
     ]
+
+
+@router.post("/refine")
+async def refine_feed(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    """
+    V4: Evaluator-Optimizer refinement pass on the current feed.
+
+    Reads feed_ctx:{user_id} from Redis (stored by the last /generate run),
+    runs IterativeRefinementAgent (up to 3 rounds, threshold=0.70),
+    and returns the improved paper list along with the evaluation score.
+
+    Returns 404 if no feed context is found (call /generate first).
+    """
+    rc = _get_redis()
+    ctx_raw = None
+    if rc:
+        try:
+            ctx_raw = rc.get(f"feed_ctx:{current_user.id}")
+        except Exception:
+            pass
+
+    if not ctx_raw:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No feed context found. Run /feed/generate first.",
+        )
+
+    ctx = json.loads(ctx_raw)
+    # The Evaluator reasons about research intent (learning/frontier/balanced),
+    # not the feed mode (recommended/latest).
+    user_mode = ctx.get("research_mode", "balanced")
+    user_interests = current_user.get_interests_list()
+
+    # Load current papers from DB
+    from src.database.models import Paper, UserPaperRecommendation
+    rows = (
+        db.query(Paper, UserPaperRecommendation)
+        .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+        .filter(UserPaperRecommendation.user_id == current_user.id)
+        .order_by(UserPaperRecommendation.rank.asc())
+        .limit(10)
+        .all()
+    )
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No papers in current feed. Run /feed/generate first.",
+        )
+
+    papers_input = [
+        {
+            "arxiv_id": paper.arxiv_id,
+            "title": paper.title,
+            "relevance_score": rec.relevance_score or 0.0,
+            "citation_count": paper.citation_count,
+            "url": paper.arxiv_url,
+            "summary": rec.personalized_summary,
+            "rank": rec.rank,
+        }
+        for paper, rec in rows
+    ]
+
+    from src.agents.iterative_refinement_agent import IterativeRefinementAgent
+    agent = IterativeRefinementAgent()
+    result = agent.refine(
+        papers=papers_input,
+        user_mode=user_mode,
+        user_interests=user_interests,
+        user_id=current_user.id,
+        db_session=db,
+    )
+
+    return {
+        "papers": result["papers"],
+        "score": result["score"],
+        "rounds": result["rounds"],
+        "passed": result["passed"],
+        "message": (
+            f"Feed refined in {result['rounds']} round(s). "
+            f"Quality score: {result['score']:.2f} "
+            f"({'PASS' if result['passed'] else 'best effort'})."
+        ),
+    }
 
 
 @router.get("/saved", response_model=dict)

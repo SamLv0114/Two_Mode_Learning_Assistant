@@ -10,8 +10,7 @@ from src.agents.memory import ConversationMemory, UserFactMemory
 from src.agents.critic_agent import CriticAgent, CriticResult
 from src.agents.context_builder import ContextBuilder
 from src.agents.tool_aware_agent import ToolAwareAgent, ToolTraceEntry
-from src.agents.core import ToolRegistry, Message
-from src.agents.web_article_agent import WebArticleAgent
+from src.agents.core import ToolRegistry
 
 __all__ = [
     # Routing
@@ -33,7 +32,5 @@ __all__ = [
     "ToolTraceEntry",
     # Framework
     "ToolRegistry",
-    "Message",
     # Feed
-    "WebArticleAgent",
 ]

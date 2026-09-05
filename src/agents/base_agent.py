@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 import openai
 
 from src.utils.config import settings
-from src.agents.tools import execute_tool
+from src.agents.tools import build_default_registry
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,8 @@ class BaseAgent:
             raise ValueError("OPENAI_API_KEY is not configured")
         self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
         self.tool_call_listener: Optional[Callable] = None
+        # V4: shared typed dispatch registry (stateless, built once per process)
+        self.registry = build_default_registry()
 
     def _build_system(self, context: Dict[str, Any]) -> str:
         """Prepend UserFactMemory personalisation context if available."""
@@ -89,6 +91,54 @@ class BaseAgent:
                 self.tool_call_listener(name, args, result, duration_ms)
             except Exception as e:
                 logger.debug(f"tool_call_listener raised: {e}")
+
+    # Tools whose results carry sources worth surfacing to the user.
+    _CITING_TOOLS = ("search_knowledge_base", "search_user_documents")
+
+    def _dispatch_tool_call(
+        self,
+        tc,
+        context: Dict[str, Any],
+        tools_called: List[str],
+        citations: List[Dict],
+        messages: List[Dict],
+    ) -> Dict:
+        """
+        Execute one tool call and record its effects.
+
+        Shared by run() and stream() so the two paths cannot drift apart:
+        appends the tool name, fires the observability listener, harvests
+        citations, and appends the tool-result message. Returns the raw result
+        so the caller can emit whatever progress events it needs.
+        """
+        fn_name = tc.function.name
+        try:
+            fn_args = json.loads(tc.function.arguments)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"[{self.name}] malformed tool arguments for {fn_name}: {e}")
+            fn_args = {}
+
+        tools_called.append(fn_name)
+
+        t0 = time.time()
+        result = self.registry.execute(fn_name, fn_args, context)
+        self._fire_listener(fn_name, fn_args, result, int((time.time() - t0) * 1000), context)
+
+        if fn_name in self._CITING_TOOLS:
+            for item in result.get("results", []):
+                if item.get("title") or item.get("url"):
+                    citations.append({
+                        "title": item.get("title", ""),
+                        "url": item.get("url", ""),
+                        "type": item.get("type", "unknown"),
+                    })
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": json.dumps(result),
+        })
+        return result
 
     def run(
         self,
@@ -127,30 +177,8 @@ class BaseAgent:
             messages.append(choice.message)
 
             for tc in choice.message.tool_calls:
-                fn_name = tc.function.name
-                fn_args = json.loads(tc.function.arguments)
-
-                logger.info(f"[{self.name}] tool call: {fn_name}({fn_args})")
-                tools_called.append(fn_name)
-
-                t0 = time.time()
-                result = execute_tool(fn_name, fn_args, context)
-                self._fire_listener(fn_name, fn_args, result, int((time.time() - t0) * 1000), context)
-
-                if fn_name in ("search_knowledge_base", "search_user_documents"):
-                    for item in result.get("results", []):
-                        if item.get("title") or item.get("url"):
-                            citations.append({
-                                "title": item.get("title", ""),
-                                "url": item.get("url", ""),
-                                "type": item.get("type", "unknown"),
-                            })
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(result),
-                })
+                logger.info(f"[{self.name}] tool call: {tc.function.name}")
+                self._dispatch_tool_call(tc, context, tools_called, citations, messages)
 
             call_kwargs["messages"] = messages
 
@@ -207,32 +235,11 @@ class BaseAgent:
             messages.append(choice.message)
             for tc in choice.message.tool_calls:
                 fn_name = tc.function.name
-                fn_args = json.loads(tc.function.arguments)
-
                 yield {"type": "tool_call", "tool": fn_name}
-                tools_called.append(fn_name)
 
-                t0 = time.time()
-                result = execute_tool(fn_name, fn_args, context)
-                self._fire_listener(fn_name, fn_args, result, int((time.time() - t0) * 1000), context)
+                result = self._dispatch_tool_call(tc, context, tools_called, citations, messages)
 
-                if fn_name in ("search_knowledge_base", "search_user_documents"):
-                    for item in result.get("results", []):
-                        if item.get("title") or item.get("url"):
-                            citations.append({
-                                "title": item.get("title", ""),
-                                "url": item.get("url", ""),
-                                "type": item.get("type", "unknown"),
-                            })
-
-                count = result.get("count", 0)
-                yield {"type": "tool_result", "tool": fn_name, "count": count}
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(result),
-                })
+                yield {"type": "tool_result", "tool": fn_name, "count": result.get("count", 0)}
 
             call_kwargs["messages"] = messages
 

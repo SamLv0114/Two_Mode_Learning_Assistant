@@ -1,13 +1,16 @@
 """
 User interaction endpoints
 """
+import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from src.database.models import User, UserInteraction, UserModelState, Paper, Article
 from src.api.deps import get_db_session, get_current_user
+
+logger = logging.getLogger(__name__)
 from src.schemas.interaction import (
     InteractionCreate,
     InteractionResponse,
@@ -21,9 +24,61 @@ from src.utils.config import settings
 router = APIRouter(prefix="/interactions", tags=["Interactions"])
 
 
+# ── V4: Dismiss Reflexion ─────────────────────────────────────────────────────
+
+def _extract_dismiss_reason_and_store(user_id: int, paper_title: str, paper_abstract: str) -> None:
+    """
+    Background task: use gpt-4o-mini to infer why a user dismissed a paper,
+    then store the result as a negative fact in UserFactMemory.
+
+    This implements the 'Dismiss Reflexion' pattern — the system learns not just
+    that the user dismissed something, but *why*, and uses that signal to avoid
+    similar content in future feeds.
+    """
+    from openai import OpenAI
+    from src.agents.memory import UserFactMemory
+    from src.utils.config import settings
+
+    if not settings.OPENAI_API_KEY:
+        return
+
+    try:
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        prompt = (
+            f"A researcher dismissed this paper from their feed. "
+            f"In 5-10 words, why might they have dismissed it?\n\n"
+            f"Title: {paper_title}\n"
+            f"Abstract: {(paper_abstract or '')[:300]}\n\n"
+            f"Return only the reason phrase, e.g. 'too theoretical, no practical applications'"
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=40,
+            temperature=0.3,
+        )
+        reason = resp.choices[0].message.content.strip().strip('"').strip("'")
+        if reason:
+            # Get Redis client
+            redis_client = None
+            try:
+                import redis
+                if settings.REDIS_URL:
+                    redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+                    redis_client.ping()
+            except Exception:
+                redis_client = None
+
+            UserFactMemory().add_negative_fact(user_id, reason, redis_client)
+            logger.info(f"Dismiss reflexion stored for user {user_id}: {reason[:60]}")
+    except Exception as e:
+        logger.debug(f"Dismiss reflexion failed: {e}")
+
+
 @router.post("", response_model=InteractionResponse, status_code=status.HTTP_201_CREATED)
 async def create_interaction(
     interaction: InteractionCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
 ):
@@ -56,14 +111,12 @@ async def create_interaction(
     ).first()
 
     if existing:
-        # Update existing interaction
         existing.interaction_type = interaction.interaction_type
         existing.timestamp = datetime.now(timezone.utc)
         db.commit()
         db.refresh(existing)
-        return InteractionResponse.model_validate(existing)
+        result = InteractionResponse.model_validate(existing)
     else:
-        # Create new interaction
         new_interaction = UserInteraction(
             user_id=current_user.id,
             item_type=interaction.item_type,
@@ -73,7 +126,18 @@ async def create_interaction(
         db.add(new_interaction)
         db.commit()
         db.refresh(new_interaction)
-        return InteractionResponse.model_validate(new_interaction)
+        result = InteractionResponse.model_validate(new_interaction)
+
+    # V4: Dismiss Reflexion — infer why user dismissed a paper and store as negative fact
+    if interaction.interaction_type == "dismissed" and interaction.item_type == "paper":
+        background_tasks.add_task(
+            _extract_dismiss_reason_and_store,
+            user_id=current_user.id,
+            paper_title=item.title,
+            paper_abstract=getattr(item, "abstract", "") or "",
+        )
+
+    return result
 
 
 @router.get("", response_model=InteractionList)

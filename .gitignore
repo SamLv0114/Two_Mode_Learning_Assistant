@@ -72,5 +72,13 @@ Thumbs.db
 .scratch
 
 tsconfig.tsbuildinfo
-.github/
 
+# NOTE: .github/ must NOT be ignored — the deploy workflow lives there and has
+# to reach GitHub for Actions to run it. It was ignored until 2026-09-05, which
+# is why auto-deploy never fired.
+
+
+# Scratch notes
+plan.txt
+chroma_db/
+*.chroma

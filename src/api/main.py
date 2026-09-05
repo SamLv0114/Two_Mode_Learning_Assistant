@@ -12,7 +12,8 @@ import logging
 
 from src.utils.config import settings
 from src.database.models import init_db
-from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router
+from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router, whats_hot_router
+from src.api.middleware import RateLimitMiddleware
 from src.jobs.nightly_indexer import run_nightly_index
 
 # Configure logging
@@ -110,6 +111,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Enforce settings.RATE_LIMIT_PER_MINUTE. Added after CORS so that CORS headers
+# are still applied to 429 responses — a browser must be able to read the error.
+app.add_middleware(RateLimitMiddleware)
+
 
 # Exception handlers
 @app.exception_handler(RequestValidationError)
@@ -148,6 +153,7 @@ app.include_router(feed_router, prefix=settings.API_V1_PREFIX)
 app.include_router(interactions_router, prefix=settings.API_V1_PREFIX)
 app.include_router(qa_router, prefix=settings.API_V1_PREFIX)
 app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
+app.include_router(whats_hot_router, prefix=settings.API_V1_PREFIX)
 
 
 # Prometheus metrics endpoint (scraped by Prometheus every 15s)

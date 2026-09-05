@@ -114,11 +114,15 @@ class Paper(Base):
     pdf_url = Column(String(500))
     citation_count = Column(Integer, default=0)
     heuristic_impact_score = Column(Float, nullable=True)
-    relevance_score = Column(Float, default=0.0)
     personalized_summary = Column(Text, nullable=True)
     collected_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    recommended = Column(Boolean, default=False)
-    recommended_date = Column(DateTime, nullable=True)
+
+    # Removed: relevance_score, recommended, recommended_date.
+    # Single-user-era columns. Once recommendations became per-user they moved to
+    # UserPaperRecommendation, and nothing wrote these again — relevance_score sat
+    # at its 0.0 default while a reader still ranked by it. Per-user recommendation
+    # state belongs on UserPaperRecommendation; keep it there.
+    # (create_all() never drops columns, so existing databases keep them unused.)
 
     def __repr__(self):
         return f"<Paper(arxiv_id='{self.arxiv_id}', title='{self.title[:50]}...')>"
@@ -140,6 +144,7 @@ class Article(Base):
     engagement_score = Column(Float, default=0.0)
     relevance_score = Column(Float, default=0.0)
     personalized_summary = Column(Text, nullable=True)
+    digest_summary = Column(Text, nullable=True)  # LLM-synthesized community digest
     collected_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     recommended = Column(Boolean, default=False)
     recommended_date = Column(DateTime, nullable=True)

@@ -48,6 +48,7 @@ class ArticleResponse(BaseModel):
     upvotes: int = 0
     relevance_score: float = 0.0
     summary: Optional[str] = None
+    digest_summary: Optional[str] = None
 
     class Config:
         from_attributes = True

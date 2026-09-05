@@ -4,12 +4,13 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
 import {
-  feedApi, interactionsApi, qaApi, authApi, chatApi,
+  feedApi, interactionsApi, qaApi, authApi, chatApi, whatsHotApi,
   Paper, Article, FeedResponse, InteractionStats, FeedJobStatus, AgentEvent,
+  HFPaper, GithubRepo, WhatsHotData,
   API_BASE_URL,
 } from '@/lib/api';
 import toast from 'react-hot-toast';
-import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send } from 'lucide-react';
+import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send, Sparkles } from 'lucide-react';
 
 const AVAILABLE_AREAS = ['ML', 'NLP', 'CV', 'AI', 'DL'];
 const EXAMPLE_INTERESTS = [
@@ -27,6 +28,11 @@ export default function DashboardPage() {
   const [feed, setFeed] = useState<FeedResponse | null>(null);
   const [stats, setStats] = useState<InteractionStats | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [whatsHot, setWhatsHot] = useState<WhatsHotData | null>(null);
+  const [isLoadingHot, setIsLoadingHot] = useState(false);
+  const [isRefreshingHot, setIsRefreshingHot] = useState(false);
+  const [isRefining, setIsRefining] = useState(false);
+  const [refineResult, setRefineResult] = useState<{ score: number; rounds: number; passed: boolean } | null>(null);
   const [feedProgress, setFeedProgress] = useState('');
   const [timeWindow, setTimeWindow] = useState(7);
   const [feedMode, setFeedMode] = useState<'recommended' | 'latest'>('recommended');
@@ -52,6 +58,7 @@ export default function DashboardPage() {
   useEffect(() => {
     if (isAuthenticated) {
       loadStats();
+      loadWhatsHot();
     }
   }, [isAuthenticated]);
 
@@ -70,11 +77,37 @@ export default function DashboardPage() {
     }
   };
 
+  const loadWhatsHot = async () => {
+    setIsLoadingHot(true);
+    try {
+      const data = await whatsHotApi.get();
+      setWhatsHot(data);
+    } catch (error) {
+      console.error('Failed to load What\'s Hot:', error);
+    } finally {
+      setIsLoadingHot(false);
+    }
+  };
+
+  const refreshWhatsHot = async () => {
+    setIsRefreshingHot(true);
+    try {
+      const data = await whatsHotApi.refresh();
+      setWhatsHot(data);
+      toast.success('What\'s Hot refreshed!');
+    } catch (error) {
+      toast.error('Failed to refresh');
+    } finally {
+      setIsRefreshingHot(false);
+    }
+  };
+
   const generateFeed = async () => {
     if (feedPollRef.current) clearInterval(feedPollRef.current);
     setIsGenerating(true);
     setFeedProgress('Starting feed generation...');
     setFeed(null);
+    setRefineResult(null);
     try {
       const { job_id } = await feedApi.generate({
         time_window_days: timeWindow,
@@ -100,19 +133,17 @@ export default function DashboardPage() {
           if (status.status === 'done') {
             clearInterval(feedPollRef.current!);
             feedPollRef.current = null;
-            const [papers, articles] = await Promise.all([
-              feedApi.getPapers(20),
-              feedApi.getArticles(20),
-            ]);
+            // Articles retired in V4 — trending content now comes from What's Hot.
+            const papers = await feedApi.getPapers(20);
             setFeed({
               papers,
-              articles,
+              articles: [],
               generated_at: new Date().toISOString(),
               time_window_days: timeWindow,
               focus_areas: user?.focus_areas || [],
               used_ml_ranking: status.used_ml_ranking ?? false,
               total_papers_considered: status.papers_count ?? papers.length,
-              total_articles_considered: status.articles_count ?? articles.length,
+              total_articles_considered: 0,
             });
             toast.success('Feed ready!');
             loadStats();
@@ -130,6 +161,22 @@ export default function DashboardPage() {
     } catch (error: any) {
       toast.error(error.response?.data?.detail || 'Failed to start feed generation');
       setIsGenerating(false);
+    }
+  };
+
+  // V4: Evaluator-Optimizer pass — re-scores the current feed and swaps out
+  // weak papers without re-running the whole pipeline.
+  const handleRefine = async () => {
+    setIsRefining(true);
+    try {
+      const result = await feedApi.refine();
+      setFeed((prev) => (prev ? { ...prev, papers: result.papers } : prev));
+      setRefineResult({ score: result.score, rounds: result.rounds, passed: result.passed });
+      toast.success(result.message || 'Feed refined!');
+    } catch (error: any) {
+      toast.error(error.response?.data?.detail || 'Refinement failed');
+    } finally {
+      setIsRefining(false);
     }
   };
 
@@ -264,20 +311,51 @@ export default function DashboardPage() {
               onProfileUpdate={fetchProfile}
             />
 
+            {/* What's Hot — always visible */}
+            <WhatsHotSection
+              data={whatsHot}
+              isLoading={isLoadingHot}
+              isRefreshing={isRefreshingHot}
+              onRefresh={refreshWhatsHot}
+            />
+
             {/* Feed Results */}
             {feed && (
-              <div className="space-y-6">
+              <div className="space-y-6 mt-6">
                 {/* Papers */}
                 {feed.papers.length > 0 && (
                   <div>
-                    <div className="flex items-center gap-2.5 mb-4">
-                      <div className="w-8 h-8 rounded-xl bg-sky-100 flex items-center justify-center">
-                        <BookOpen className="w-4 h-4 text-sky-600" />
+                    <div className="flex items-center justify-between gap-3 mb-4">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-xl bg-sky-100 flex items-center justify-center">
+                          <BookOpen className="w-4 h-4 text-sky-600" />
+                        </div>
+                        <h2 className="text-base font-bold text-gray-900">
+                          Research Papers
+                          <span className="ml-2 text-sm font-normal text-gray-400">({feed.papers.length})</span>
+                        </h2>
+                        {refineResult && (
+                          <span
+                            className={`text-xs font-medium px-2 py-0.5 rounded-full ${
+                              refineResult.passed
+                                ? 'bg-emerald-50 text-emerald-700'
+                                : 'bg-amber-50 text-amber-700'
+                            }`}
+                          >
+                            quality {refineResult.score.toFixed(2)} · {refineResult.rounds} round
+                            {refineResult.rounds > 1 ? 's' : ''}
+                          </span>
+                        )}
                       </div>
-                      <h2 className="text-base font-bold text-gray-900">
-                        Research Papers
-                        <span className="ml-2 text-sm font-normal text-gray-400">({feed.papers.length})</span>
-                      </h2>
+                      <button
+                        onClick={handleRefine}
+                        disabled={isRefining}
+                        title="Re-score this feed and swap out weak matches"
+                        className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-primary-600 hover:border-primary-200 hover:bg-primary-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Sparkles className={`w-3.5 h-3.5 ${isRefining ? 'animate-pulse' : ''}`} />
+                        {isRefining ? 'Refining…' : 'Refine'}
+                      </button>
                     </div>
                     <div className="space-y-4">
                       {feed.papers.map((paper) => (
@@ -292,48 +370,24 @@ export default function DashboardPage() {
                   </div>
                 )}
 
-                {/* Articles */}
-                {feed.articles.length > 0 && (
-                  <div>
-                    <div className="flex items-center gap-2.5 mb-4">
-                      <div className="w-8 h-8 rounded-xl bg-violet-100 flex items-center justify-center">
-                        <FileText className="w-4 h-4 text-violet-600" />
-                      </div>
-                      <h2 className="text-base font-bold text-gray-900">
-                        Tech Articles
-                        <span className="ml-2 text-sm font-normal text-gray-400">({feed.articles.length})</span>
-                      </h2>
-                    </div>
-                    <div className="space-y-4">
-                      {feed.articles.map((article) => (
-                        <ArticleCard
-                          key={article.id}
-                          article={article}
-                          onInteraction={handleInteraction}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
-
                 {/* Meta info */}
                 <div className="flex items-center justify-center gap-2 pt-2">
                   <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full ${feed.used_ml_ranking ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
                     {feed.used_ml_ranking ? '🧠 Personalized ML ranking' : '📊 Heuristic ranking — interact more to unlock ML'}
                   </span>
                   <span className="text-xs text-gray-400">
-                    {feed.total_papers_considered} papers · {feed.total_articles_considered} articles considered
+                    {feed.total_papers_considered} papers considered
                   </span>
                 </div>
               </div>
             )}
 
             {!feed && !isGenerating && (
-              <div className="text-center py-16 animate-in">
+              <div className="text-center py-10 animate-in">
                 <div className="text-5xl mb-4">🔬</div>
-                <h3 className="text-lg font-semibold text-gray-700 mb-2">Your feed is empty</h3>
+                <h3 className="text-lg font-semibold text-gray-700 mb-2">Generate your personalized feed</h3>
                 <p className="text-sm text-gray-400 max-w-sm mx-auto">
-                  Click <strong>Generate Feed</strong> to discover personalized research papers and articles based on your interests.
+                  Click <strong>Generate Feed</strong> to discover research papers tailored to your interests.
                 </p>
               </div>
             )}
@@ -761,8 +815,8 @@ function PaperCard({
   );
 }
 
-/* ── Article Card ── */
-function ArticleCard({
+/* ── Digest Card ("What's Hot in CS") ── */
+function DigestCard({
   article,
   onInteraction,
 }: {
@@ -772,27 +826,44 @@ function ArticleCard({
   return (
     <div
       className="card-lift animate-in"
-      style={{ borderLeft: '3px solid #8b5cf6' }}
+      style={{ borderLeft: '3px solid #f97316' }}
     >
       <div className="flex-1">
-        <div className="flex items-start justify-between gap-3 mb-2">
+        {/* Title + source */}
+        <div className="flex items-start justify-between gap-3 mb-1">
           <h3 className="font-semibold text-gray-900 leading-snug">
             <span className="text-gray-400 mr-1.5">#{article.rank}</span>
             {article.title}
           </h3>
-          {article.upvotes > 100 && (
-            <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-rose-50 text-rose-600 border border-rose-100">
-              🔥 {article.upvotes} pts
-            </span>
-          )}
         </div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-400 mb-3">
-          <span className="capitalize">{article.source}</span>
-          <span>{article.upvotes} upvotes</span>
-          <span className="text-violet-600 font-medium">Score: {article.relevance_score.toFixed(3)}</span>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-gray-400 mb-3">
+          <span className="font-medium text-orange-500">{article.source}</span>
         </div>
-        {article.summary && <FormattedSummary text={article.summary} />}
+
+        {/* Digest summary — the main content */}
+        {article.digest_summary ? (
+          <p className="text-sm text-gray-700 leading-relaxed mb-3">
+            {article.digest_summary}
+          </p>
+        ) : article.summary ? (
+          <FormattedSummary text={article.summary} />
+        ) : null}
+
+        {/* Source citation link */}
+        <div className="flex items-center gap-1 text-xs text-gray-400">
+          <span>Source:</span>
+          <a
+            href={article.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => onInteraction('article', article.id, 'viewed')}
+            className="text-orange-500 hover:text-orange-600 hover:underline truncate max-w-[300px]"
+          >
+            {article.url.replace(/^https?:\/\/(www\.)?/, '').split('/')[0]}
+          </a>
+        </div>
       </div>
+
       <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
         <a
           href={article.url}
@@ -802,7 +873,7 @@ function ArticleCard({
           className="btn-secondary text-sm py-1.5"
         >
           <ExternalLink className="w-3.5 h-3.5" />
-          Read article
+          Read full article
         </a>
         <button
           onClick={() => onInteraction('article', article.id, 'saved')}
@@ -1617,6 +1688,167 @@ function SavedItems() {
             ))}
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+/* ── What's Hot Section ── */
+function WhatsHotSection({
+  data,
+  isLoading,
+  isRefreshing,
+  onRefresh,
+}: {
+  data: WhatsHotData | null;
+  isLoading: boolean;
+  isRefreshing: boolean;
+  onRefresh: () => void;
+}) {
+  return (
+    <div>
+      {/* Section header */}
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-orange-100 flex items-center justify-center text-lg">
+            🔥
+          </div>
+          <h2 className="text-base font-bold text-gray-900">What&apos;s Hot</h2>
+          {data && (
+            <span className="text-xs text-gray-400 ml-1">
+              · {data.github_window === 'daily' ? 'daily' : 'weekly'} window
+            </span>
+          )}
+        </div>
+        <button
+          onClick={onRefresh}
+          disabled={isRefreshing}
+          title="Refresh What's Hot"
+          className="p-1.5 rounded-lg text-gray-400 hover:text-orange-500 hover:bg-orange-50 transition-colors disabled:opacity-40"
+        >
+          <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+        </button>
+      </div>
+
+      {/* Loading skeleton */}
+      {isLoading && !data && (
+        <div className="space-y-3">
+          {[...Array(3)].map((_, i) => (
+            <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 animate-pulse">
+              <div className="h-4 bg-gray-100 rounded w-3/4 mb-2" />
+              <div className="h-3 bg-gray-100 rounded w-full mb-1" />
+              <div className="h-3 bg-gray-100 rounded w-5/6" />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {data && (
+        <div className="space-y-6">
+          {/* HuggingFace Trending Papers */}
+          {data.hf_papers.length > 0 && (
+            <div>
+              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
+                <span>🤗</span> Trending Papers
+              </h3>
+              <div className="space-y-3">
+                {data.hf_papers.map((paper) => (
+                  <HFPaperCard key={paper.id} paper={paper} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* GitHub Trending Repos */}
+          {data.github_repos.length > 0 && (
+            <div>
+              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
+                <span>🛠️</span> Trending Tools
+              </h3>
+              <div className="space-y-3">
+                {data.github_repos.map((repo) => (
+                  <GithubRepoCard key={repo.full_name} repo={repo} />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HFPaperCard({ paper }: { paper: HFPaper }) {
+  return (
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 hover:border-orange-200 transition-colors">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <h4 className="text-sm font-semibold text-gray-900 leading-snug flex-1">{paper.title}</h4>
+        {paper.upvotes > 0 && (
+          <span className="flex-shrink-0 flex items-center gap-1 text-xs font-medium text-orange-600 bg-orange-50 px-2 py-0.5 rounded-full">
+            ▲ {paper.upvotes}
+          </span>
+        )}
+      </div>
+      {paper.digest && (
+        <p className="text-sm text-gray-500 leading-relaxed mb-3">{paper.digest}</p>
+      )}
+      <div className="flex items-center gap-3 text-xs text-gray-400">
+        <span className="font-medium text-gray-500">HuggingFace</span>
+        <a
+          href={paper.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-0.5 hover:text-orange-500 transition-colors"
+        >
+          HF <ExternalLink className="w-3 h-3" />
+        </a>
+        {paper.arxiv_url && (
+          <a
+            href={paper.arxiv_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-0.5 hover:text-orange-500 transition-colors"
+          >
+            arXiv <ExternalLink className="w-3 h-3" />
+          </a>
+        )}
+        {paper.authors.length > 0 && (
+          <span className="truncate max-w-[200px]">{paper.authors.slice(0, 2).join(', ')}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GithubRepoCard({ repo }: { repo: GithubRepo }) {
+  return (
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 hover:border-orange-200 transition-colors">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div className="flex-1 min-w-0">
+          <a
+            href={repo.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm font-semibold text-gray-900 hover:text-orange-600 transition-colors flex items-center gap-1"
+          >
+            {repo.name}
+            <ExternalLink className="w-3 h-3 flex-shrink-0" />
+          </a>
+          <span className="text-xs text-gray-400">{repo.full_name.split('/')[0]}</span>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {repo.language && (
+            <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-sky-50 text-sky-600">
+              {repo.language}
+            </span>
+          )}
+          <span className="flex items-center gap-1 text-xs text-yellow-600 font-medium">
+            ★ {repo.stars >= 1000 ? `${(repo.stars / 1000).toFixed(1)}k` : repo.stars}
+          </span>
+        </div>
+      </div>
+      {repo.description && (
+        <p className="text-sm text-gray-500 leading-relaxed">{repo.description}</p>
       )}
     </div>
   );

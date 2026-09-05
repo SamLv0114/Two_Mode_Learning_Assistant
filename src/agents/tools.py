@@ -11,9 +11,11 @@ Replacement 3 — Multi-query retrieval:
   _exec_search_knowledge_base now generates 2 query variants with gpt-4o-mini,
   runs 3 parallel searches, and deduplicates by document ID for higher recall.
 
-Replacement 2 — UserFactMemory-aware feed:
-  _exec_get_personalized_feed reads user_facts_context from context and
-  boosts items whose title/abstract overlap with the user's long-term interests.
+Feed access:
+  _exec_get_personalized_feed reads back the ranked list DailyFeedPipeline
+  produced (UserPaperRecommendation, ordered by rank). It deliberately does NOT
+  re-rank — the pipeline is the single authority on what a user should read, so
+  the chat answer and the Daily Feed tab always show the same thing.
 """
 import json
 import logging
@@ -52,28 +54,6 @@ def _expand_query(query: str) -> List[str]:
     except Exception as e:
         logger.debug(f"_expand_query failed: {e}")
     return [query]
-
-
-# ── UserFactMemory keyword extractor ─────────────────────────────────────────
-
-def _fact_keywords(facts_context: str) -> List[str]:
-    """
-    Extract simple topic keywords from a UserFactMemory context block.
-    e.g. "- user is studying LoRA fine-tuning\n- user likes transformers"
-    → ["LoRA", "fine-tuning", "transformers"]
-    """
-    keywords = []
-    for line in facts_context.splitlines():
-        line = line.strip("- •\t ")
-        if line.lower().startswith("user"):
-            # strip "user is/was/has/likes..." prefix and take the rest
-            for prefix in ("user is studying ", "user is interested in ", "user likes ",
-                           "user's goal:", "user has been", "user wants to", "user "):
-                if line.lower().startswith(prefix):
-                    rest = line[len(prefix):].strip()
-                    keywords.extend(rest.split()[:6])
-                    break
-    return [k.strip(".,;:()") for k in keywords if len(k) > 3]
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -115,8 +95,11 @@ GET_PERSONALIZED_FEED = {
     "function": {
         "name": "get_personalized_feed",
         "description": (
-            "Fetch recent personalized paper and article recommendations "
-            "for this user from the database."
+            "Read this user's current personalized paper feed — the ranked list "
+            "already produced by the recommendation pipeline. Returns papers in the "
+            "pipeline's own ranking order. If the user has never generated a feed, "
+            "the result is empty and carries a 'note' field explaining that; relay "
+            "that to the user instead of inventing recommendations."
         ),
         "parameters": {
             "type": "object",
@@ -298,88 +281,62 @@ def _exec_search_knowledge_base(args: Dict[str, Any], context: Dict) -> Dict:
 
 def _exec_get_personalized_feed(args: Dict[str, Any], context: Dict) -> Dict:
     """
-    Replacement 2: UserFactMemory-aware feed.
-    Fetches a candidate pool, then re-ranks by:
-      1. LTR relevance_score (existing signal)
-      2. UserFactMemory keyword overlap bonus (+0.1 per matched keyword)
-    Items matching the user's current interests rise above generic high-scorers.
-    Static settings.USER_INTERESTS replaced by per-user dynamic facts.
+    Read this user's current feed — the ranked list DailyFeedPipeline produced.
+
+    The pipeline is the single authority on "what should this user read": it runs
+    ChromaDB retrieval, mode-aware multi-signal ranking, familiar-paper penalty and
+    (past 50 interactions) LightGBM. This tool does not re-rank; it reads that
+    result back in the pipeline's own order so the chat answer and the Daily Feed
+    tab always agree.
+
+    Returns an explicit empty result when the user has never generated a feed,
+    so the agent can say so rather than inventing recommendations.
     """
     try:
-        from src.database.models import Paper, Article
+        from src.database.models import Paper, UserPaperRecommendation
+
         db = context["db"]
+        user = context["user"]
         count = args.get("count", 5)
-        topic = args.get("topic_filter", "").lower()
+        topic = (args.get("topic_filter") or "").lower()
 
-        # Extract user interest keywords from UserFactMemory context
-        facts_context = context.get("user_facts_context", "")
-        interest_keywords = [k.lower() for k in _fact_keywords(facts_context)] if facts_context else []
-        logger.debug(f"get_personalized_feed: {len(interest_keywords)} interest keywords from UserFactMemory")
-
-        # Fetch a larger candidate pool for re-ranking
-        pool_size = count * 5
-        papers = (
-            db.query(Paper)
-            .order_by(Paper.collected_date.desc())
-            .limit(pool_size)
-            .all()
-        )
-        articles = (
-            db.query(Article)
-            .order_by(Article.collected_date.desc())
-            .limit(pool_size // 2)
-            .all()
+        q = (
+            db.query(Paper, UserPaperRecommendation)
+            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+            .filter(UserPaperRecommendation.user_id == user.id)
+            .order_by(UserPaperRecommendation.rank.asc())
         )
 
-        def _interest_bonus(text: str) -> float:
-            """Bonus for matching user interest keywords — replaces static filter."""
-            if not interest_keywords or not text:
-                return 0.0
-            lower = text.lower()
-            matches = sum(1 for kw in interest_keywords if kw in lower)
-            return min(matches * 0.1, 0.5)  # cap at +0.5
-
-        def _matches_topic(text: str) -> bool:
-            return not topic or topic in text.lower()
-
-        candidates = []
-        for p in papers:
-            title = p.title or ""
-            abstract = p.abstract or ""
-            if not _matches_topic(title + abstract):
-                continue
-            score = (p.relevance_score or 0.0) + _interest_bonus(title + " " + abstract)
-            candidates.append(("paper", p, score))
-
-        for a in articles:
-            title = a.title or ""
-            if not _matches_topic(title):
-                continue
-            score = (a.relevance_score or 0.0) + _interest_bonus(title)
-            candidates.append(("article", a, score))
-
-        # Re-rank by combined score
-        candidates.sort(key=lambda x: x[2], reverse=True)
+        # A topic filter narrows the existing feed — it never reorders it.
+        rows = q.all() if topic else q.limit(count).all()
 
         results = []
-        for ctype, item, score in candidates[:count]:
-            if ctype == "paper":
-                results.append({
-                    "type": "paper",
-                    "title": item.title,
-                    "summary": item.personalized_summary or (item.abstract[:250] if item.abstract else ""),
-                    "url": item.arxiv_url or (f"https://arxiv.org/abs/{item.arxiv_id}" if item.arxiv_id else ""),
-                    "relevance_score": round(score, 3),
-                })
-            else:
-                results.append({
-                    "type": "article",
-                    "title": item.title,
-                    "summary": item.personalized_summary or "",
-                    "url": item.url or "",
-                    "source": item.source,
-                    "relevance_score": round(score, 3),
-                })
+        for paper, rec in rows:
+            if topic and topic not in f"{paper.title or ''} {paper.abstract or ''}".lower():
+                continue
+            results.append({
+                "type": "paper",
+                "rank": rec.rank,
+                "title": paper.title,
+                "summary": rec.personalized_summary or (paper.abstract[:250] if paper.abstract else ""),
+                "url": paper.arxiv_url or (f"https://arxiv.org/abs/{paper.arxiv_id}" if paper.arxiv_id else ""),
+                "relevance_score": round(rec.relevance_score or 0.0, 3),
+                "citation_count": paper.citation_count,
+            })
+            if len(results) >= count:
+                break
+
+        if not results:
+            return {
+                "recommendations": [],
+                "count": 0,
+                "note": (
+                    "No feed has been generated for this user yet. "
+                    "Ask them to click Generate Feed on the Daily Feed tab first."
+                    if not topic else
+                    f"The current feed has no papers matching '{topic}'."
+                ),
+            }
 
         return {"recommendations": results, "count": len(results)}
     except Exception as e:
@@ -486,20 +443,39 @@ def _exec_get_note(args: Dict[str, Any], context: Dict) -> Dict:
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
-_EXECUTORS = {
-    "search_knowledge_base": _exec_search_knowledge_base,
-    "get_personalized_feed": _exec_get_personalized_feed,
-    "list_user_documents": _exec_list_user_documents,
-    "search_user_documents": _exec_search_user_documents,
-    "search_web": _exec_search_web,
-    "save_note": _exec_save_note,
-    "get_note": _exec_get_note,
-}
-
 
 def execute_tool(name: str, args: Dict[str, Any], context: Dict) -> Dict:
-    executor = _EXECUTORS.get(name)
-    if not executor:
-        logger.warning(f"Unknown tool requested: {name}")
-        return {"error": f"Unknown tool: {name}"}
-    return executor(args, context)
+    """
+    Dispatch a tool call by name.
+
+    Thin wrapper over the shared ToolRegistry — kept so callers that dispatch a
+    single known tool (DeepResearchAgent, PlanAndSolveAgent) don't each need a
+    registry handle. There is exactly one dispatch path underneath.
+    """
+    return build_default_registry().execute(name, args, context)
+
+
+_DEFAULT_REGISTRY = None
+
+
+def build_default_registry():
+    """
+    V4: Return the shared ToolRegistry pre-loaded with all standard agent tools.
+
+    The registry holds only (schema, executor) pairs — it is stateless and
+    read-only at call time, so a single module-level instance is shared by every
+    agent rather than rebuilt per instantiation.
+    """
+    global _DEFAULT_REGISTRY
+    if _DEFAULT_REGISTRY is None:
+        from src.agents.core.tool_registry import ToolRegistry
+        reg = ToolRegistry()
+        reg.register(SEARCH_KNOWLEDGE_BASE, _exec_search_knowledge_base)
+        reg.register(GET_PERSONALIZED_FEED, _exec_get_personalized_feed)
+        reg.register(LIST_USER_DOCUMENTS, _exec_list_user_documents)
+        reg.register(SEARCH_USER_DOCUMENTS, _exec_search_user_documents)
+        reg.register(SEARCH_WEB, _exec_search_web)
+        reg.register(SAVE_NOTE, _exec_save_note)
+        reg.register(GET_NOTE, _exec_get_note)
+        _DEFAULT_REGISTRY = reg
+    return _DEFAULT_REGISTRY

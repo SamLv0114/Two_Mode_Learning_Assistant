@@ -13,6 +13,7 @@ research_qa routing matrix:
 All three fall back gracefully to ResearchAgent if unavailable.
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.agents.intent_recognizer import IntentRecognizer, Intent
@@ -41,21 +42,44 @@ _COMPLEX_KEYWORDS = {
     "multiple", "several", "various", "relationship between",
 }
 
-_COMPLEX_LENGTH = 90
+_COMPLEX_LENGTH = 90        # long enough to *consider* the deep path
+_VERY_LONG_LENGTH = 220     # long enough that multi-part intent is near-certain
+
+
+def _contains_phrase(message: str, phrases) -> bool:
+    """
+    Whole-word phrase match.
+
+    A bare substring test misfires badly on short keywords: "vs" matches
+    "VSA", "vsync" and "revision", routing trivial lookups to the expensive
+    analytical agent. \\b anchors the match to word boundaries.
+    """
+    lower = message.lower()
+    return any(re.search(rf"\b{re.escape(p)}\b", lower) for p in phrases)
 
 
 def _is_analytical_query(message: str) -> bool:
     """True for comparison, trade-off, and when-to-use questions."""
-    lower = message.lower()
-    return any(kw in lower for kw in _ANALYTICAL_KEYWORDS)
+    return _contains_phrase(message, _ANALYTICAL_KEYWORDS)
 
 
 def _is_complex_query(message: str) -> bool:
-    """True for long or multi-faceted research questions."""
-    if len(message) >= _COMPLEX_LENGTH:
+    """
+    True for multi-faceted research questions.
+
+    Length alone is not evidence of complexity — a long "summarise this and
+    keep it short" request would otherwise trigger DeepResearchAgent, which
+    costs a planner + up to 5 summarisers + a writer. Length is therefore only
+    a supporting signal: it must be paired with an actual complexity keyword,
+    or be long enough that a multi-part question is genuinely likely.
+    """
+    if _contains_phrase(message, _COMPLEX_KEYWORDS):
         return True
-    lower = message.lower()
-    return any(kw in lower for kw in _COMPLEX_KEYWORDS)
+    # Long *and* multi-clause: several sentences or an explicit conjunction of asks.
+    if len(message) >= _COMPLEX_LENGTH:
+        clause_markers = message.count("?") + message.count(";") + message.count(" and ")
+        return clause_markers >= 2 or len(message) >= _VERY_LONG_LENGTH
+    return False
 
 
 # ── GeneralAgent ───────────────────────────────────────────────────────────────

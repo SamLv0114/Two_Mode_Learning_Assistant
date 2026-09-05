@@ -82,6 +82,7 @@ export interface Article {
   upvotes: number;
   relevance_score: number;
   summary?: string;
+  digest_summary?: string;
 }
 
 export interface FeedResponse {
@@ -93,6 +94,14 @@ export interface FeedResponse {
   used_ml_ranking: boolean;
   total_papers_considered: number;
   total_articles_considered: number;
+}
+
+export interface RefineResponse {
+  papers: Paper[];
+  score: number;
+  rounds: number;
+  passed: boolean;
+  message: string;
 }
 
 export interface InteractionStats {
@@ -194,6 +203,7 @@ export const feedApi = {
     return response.data;
   },
 
+  /** @deprecated V4 retired feed articles — use whatsHotApi for trending content. */
   getArticles: async (limit = 10, offset = 0) => {
     const response = await api.get<Article[]>('/feed/articles', {
       params: { limit, offset },
@@ -205,6 +215,54 @@ export const feedApi = {
     const response = await api.get<{ papers: Paper[]; articles: Article[]; total_saved: number }>(
       '/feed/saved'
     );
+    return response.data;
+  },
+
+  // V4: Evaluator-Optimizer refinement pass over the current feed.
+  // Reads feed_ctx from Redis (2h TTL) — requires a prior /feed/generate.
+  refine: async (): Promise<RefineResponse> => {
+    const response = await api.post<RefineResponse>('/feed/refine');
+    return response.data;
+  },
+};
+
+// What's Hot API
+export interface HFPaper {
+  id: string;
+  title: string;
+  abstract: string;
+  authors: string[];
+  upvotes: number;
+  url: string;
+  arxiv_url: string;
+  source: string;
+  digest: string;
+}
+
+export interface GithubRepo {
+  name: string;
+  full_name: string;
+  description: string;
+  stars: number;
+  language: string;
+  url: string;
+  source: string;
+}
+
+export interface WhatsHotData {
+  hf_papers: HFPaper[];
+  github_repos: GithubRepo[];
+  github_window: string;
+  cached_at: string;
+}
+
+export const whatsHotApi = {
+  get: async (): Promise<WhatsHotData> => {
+    const response = await api.get<WhatsHotData>('/whats_hot');
+    return response.data;
+  },
+  refresh: async (): Promise<WhatsHotData> => {
+    const response = await api.post<WhatsHotData>('/whats_hot/refresh');
     return response.data;
   },
 };

@@ -3,7 +3,8 @@ MODE 1: Daily Recommendation Feed Pipeline
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional
+import json
 import logging
 import numpy as np
 import random
@@ -12,7 +13,7 @@ from sqlalchemy import exc as sa_exc
 
 from sqlalchemy.orm import Session
 
-from src.collectors import ArxivCollector, PaperData
+from src.collectors import PaperData
 from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
@@ -23,6 +24,13 @@ from src.utils.config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# V4: research-mode-aware ranking weights (inspired by LLM4RS)
+MODE_WEIGHTS = {
+    "learning":  {"semantic": 0.5, "citation": 0.4, "recency": 0.1},
+    "frontier":  {"semantic": 0.4, "citation": 0.1, "recency": 0.5},
+    "balanced":  {"semantic": 0.6, "citation": 0.4, "recency": 0.0},
+}
 
 FOCUS_AREA_TERMS = {
     "ML": "machine learning",
@@ -64,9 +72,11 @@ class DailyFeedPipeline:
         else:
             top_papers = self._fetch_papers_recommended(selected_interests)
 
-        # Step 2: Articles — Tavily agent-based discovery (replaces static scrapers)
-        logger.info("Step 2: Discovering articles via WebArticleAgent (Tavily)...")
-        top_articles = self._discover_articles(self._user_interests)
+        # Step 2: Articles — retired in V4.
+        # Trending discovery moved to the What's Hot section (HuggingFace + GitHub,
+        # free public APIs, Redis-cached and shared across users). Running Tavily
+        # discovery here would burn API + LLM calls on content the UI no longer shows.
+        top_articles = []
 
         # Step 3: Summarize papers (parallel LLM calls)
         logger.info("Step 3: Generating personalized summaries...")
@@ -76,6 +86,9 @@ class DailyFeedPipeline:
         logger.info("Step 4: Storing results...")
         self._store_results(top_papers, top_articles)
         output = self._format_output(top_papers, top_articles)
+
+        # V4: persist feed context in Redis for IterativeRefinementAgent
+        self._store_feed_ctx(output, mode)
 
         # Step 5: Retrain if enough interactions
         interaction_count = self.trainer.get_interaction_count()
@@ -90,25 +103,51 @@ class DailyFeedPipeline:
 
     def _fetch_papers_recommended(self, selected_interests: List[str]) -> List[PaperData]:
         """
-        Recommended mode — two-stage retrieval:
+        Recommended mode — two-stage retrieval with V4 enhancements:
 
-        Stage 1 (ChromaDB ANN, ~10ms):
-            Semantic search across ALL indexed papers using HNSW.
-            Returns top-N candidates with cosine similarity scores.
+        Stage 1 (ChromaDB ANN, fan-out parallel):
+            V4: _fanout_search() expands the query into 3 variants, runs parallel
+            ChromaDB searches, and merges by doc_id. Richer recall than a single query.
+            Falls back to single search if expansion fails.
 
-        Stage 2 (PostgreSQL join + re-rank):
-            Fetch full metadata + citation counts for those candidates.
-            Score = 0.6 * semantic_similarity + 0.4 * normalized_citations.
+        Stage 2 (PostgreSQL join + mode-aware re-rank):
+            V4: Uses _infer_research_mode() + MODE_WEIGHTS to weight semantic/citation/recency.
+            V4: Applies _familiar_penalty() to penalise already-seen content.
 
         Fallback: impact-score DB query if ChromaDB returns too few results.
         """
         interests_text = " ".join(_expand_focus_areas(selected_interests))
         candidate_limit = settings.TOP_PAPERS_COUNT * 20  # e.g. 100
 
-        # ── Stage 1: ChromaDB ANN search ──────────────────────────────────────
-        vector_results = self.embedding_manager.search(
-            interests_text, n_results=candidate_limit, filter_type="paper"
-        )
+        # V4: infer research mode for downstream re-ranking
+        research_mode = self._infer_research_mode()
+        self._research_mode = research_mode  # surfaced in feed_ctx for /feed/refine
+        weights = MODE_WEIGHTS.get(research_mode, MODE_WEIGHTS["balanced"])
+        logger.info(f"Research mode inferred: {research_mode} (weights={weights})")
+
+        # V4: HuggingFace trending for frontier mode
+        if research_mode == "frontier":
+            hf_papers = self._fetch_hf_trending_papers(candidate_limit)
+            if len(hf_papers) >= settings.TOP_PAPERS_COUNT:
+                logger.info("Frontier mode: using HuggingFace trending papers")
+                # Persist first — _store_results only writes recommendations for
+                # papers that already exist in PostgreSQL, so unsaved HF papers
+                # would be dropped and the feed would come back empty.
+                self._save_papers_to_db(hf_papers)
+                return self._rerank_papers_mode_aware(hf_papers, interests_text, weights)
+
+        # V4: LLM-generated user profile as richer ChromaDB query
+        profile_query = self._build_user_profile_query(redis_client=self._get_redis()) or interests_text
+        logger.info(f"ChromaDB query: {'profile' if profile_query != interests_text else 'keywords'}")
+
+        # ── Stage 1: fan-out parallel ChromaDB search (V4) ───────────────────
+        try:
+            vector_results = self._fanout_search(profile_query, candidate_limit)
+        except Exception as e:
+            logger.warning(f"Fan-out search failed ({e}), falling back to single query")
+            vector_results = self.embedding_manager.search(
+                interests_text, n_results=candidate_limit, filter_type="paper"
+            )
 
         MIN_CHROMA_RESULTS = settings.TOP_PAPERS_COUNT * 2
         if len(vector_results) < MIN_CHROMA_RESULTS:
@@ -158,27 +197,10 @@ class DailyFeedPipeline:
                 papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
             )
 
-        # Heuristic: 0.6 * semantic + 0.4 * normalized citations
-        citations = [p.citation_count or 0 for p in db_papers]
-        max_cit = max(citations) if max(citations) > 0 else 1
-
-        scored = []
-        for p in db_papers:
-            sem = semantic_scores.get(p.arxiv_id, 0.0)
-            cit = (p.citation_count or 0) / max_cit
-            score = 0.6 * sem + 0.4 * cit
-            scored.append((p, score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = scored[:settings.TOP_PAPERS_COUNT]
-
-        papers = []
-        for p, score in top:
-            pd = self._db_paper_to_paperdata(p)
-            pd.relevance_score = round(score, 4)
-            papers.append(pd)
-
-        return papers
+        # ── Re-rank: mode-aware weights + familiar penalty (V4) ──────────────
+        paperdata_list = [self._db_paper_to_paperdata(p) for p in db_papers]
+        return self._rerank_papers_mode_aware(paperdata_list, interests_text, weights,
+                                               semantic_scores_override={p.arxiv_id: semantic_scores.get(p.arxiv_id, 0.0) for p in db_papers})
 
     def _fetch_papers_recommended_fallback(self, selected_interests: List[str]) -> List[PaperData]:
         """
@@ -281,6 +303,231 @@ class DailyFeedPipeline:
         )
         return {r[0] for r in rows}
 
+    # ── V4: shared Redis handle ───────────────────────────────────────────────
+
+    def _get_redis(self):
+        """Return a Redis client, or None when Redis is unconfigured/unreachable."""
+        try:
+            import redis
+            if not settings.REDIS_URL:
+                return None
+            rc = redis.from_url(settings.REDIS_URL, decode_responses=True)
+            rc.ping()
+            return rc
+        except Exception:
+            return None
+
+    # ── V4: research mode inference ───────────────────────────────────────────
+
+    def _infer_research_mode(self) -> str:
+        """
+        Infer user's current research mode from interaction history.
+        - recent_ratio (fraction of saved/viewed papers < 30 days old) > 0.7 → frontier
+        - avg citations of saved papers > 100 → learning
+        - else → balanced
+        """
+        try:
+            cutoff_30d = datetime.now(timezone.utc) - timedelta(days=30)
+            rows = (
+                self.db.query(UserInteraction, Paper)
+                .join(Paper, UserInteraction.item_id == Paper.id)
+                .filter(
+                    UserInteraction.user_id == self.user_id,
+                    UserInteraction.item_type == "paper",
+                    UserInteraction.interaction_type.in_(["saved", "viewed"]),
+                )
+                .order_by(UserInteraction.timestamp.desc())
+                .limit(30)
+                .all()
+            )
+            if not rows:
+                return "balanced"
+
+            recent_count = sum(
+                1 for _, p in rows
+                if p.published_date and p.published_date.replace(tzinfo=timezone.utc) >= cutoff_30d
+            )
+            recent_ratio = recent_count / len(rows)
+
+            citations = [p.citation_count or 0 for _, p in rows]
+            avg_citations = sum(citations) / len(citations)
+
+            if recent_ratio > 0.7:
+                return "frontier"
+            elif avg_citations > 100:
+                return "learning"
+            else:
+                return "balanced"
+        except Exception:
+            return "balanced"
+
+    # ── V4: LLM user-profile query (Mem0-inspired) ────────────────────────────
+
+    def _build_user_profile_query(self, redis_client=None) -> Optional[str]:
+        """
+        Generate a 2-3 sentence research profile from the user's saved papers.
+        Used as a richer ChromaDB query than a bare keyword list.
+        Cached in Redis for 6 hours to avoid redundant LLM calls.
+        """
+        cache_key = f"user_profile_query:{self.user_id}"
+        if redis_client:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    return cached
+            except Exception:
+                pass
+
+        saved_ids = self._get_user_saved_arxiv_ids(max_ids=10)
+        if not saved_ids:
+            return None
+
+        saved_papers = (
+            self.db.query(Paper)
+            .filter(Paper.arxiv_id.in_(saved_ids))
+            .all()
+        )
+        if not saved_papers:
+            return None
+
+        paper_snippets = "\n".join(
+            f"- {p.title}: {(p.abstract or '')[:150]}" for p in saved_papers[:8]
+        )
+
+        try:
+            from openai import OpenAI
+            from src.utils.config import settings
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Given these papers a researcher has saved, write a 2-3 sentence "
+                        "research profile describing their interests (for use as a search query):\n\n"
+                        f"{paper_snippets}\n\nProfile (plain text, no bullets):"
+                    )
+                }],
+                max_tokens=120,
+                temperature=0.3,
+            )
+            profile = resp.choices[0].message.content.strip()
+            if redis_client and profile:
+                try:
+                    redis_client.setex(cache_key, 6 * 3600, profile)
+                except Exception:
+                    pass
+            return profile
+        except Exception as e:
+            logger.debug(f"_build_user_profile_query failed: {e}")
+            return None
+
+    # ── V4: fan-out parallel ChromaDB search (GPT-Researcher-inspired) ────────
+
+    def _fanout_search(self, base_query: str, candidate_limit: int) -> List[Dict]:
+        """
+        Expand the base query into 2 variants, run 3 parallel ChromaDB searches,
+        and merge results deduped by arxiv_id (doc_id).
+        """
+        from src.agents.tools import _expand_query
+        variants = _expand_query(base_query)  # returns up to 2 expanded strings
+        queries = [base_query] + variants
+
+        def _search(q: str) -> List[Dict]:
+            try:
+                return self.embedding_manager.search(q, n_results=candidate_limit, filter_type="paper")
+            except Exception:
+                return []
+
+        seen: Dict[str, Dict] = {}
+        with ThreadPoolExecutor(max_workers=len(queries)) as ex:
+            futures = {ex.submit(_search, q): q for q in queries}
+            for future in as_completed(futures):
+                for r in future.result():
+                    arxiv_id = r.get("metadata", {}).get("paper_id")
+                    if arxiv_id and arxiv_id not in seen:
+                        seen[arxiv_id] = r
+                    elif arxiv_id and arxiv_id in seen:
+                        # Keep the hit with the smallest distance (closest match)
+                        if r.get("distance", 1.0) < seen[arxiv_id].get("distance", 1.0):
+                            seen[arxiv_id] = r
+
+        return list(seen.values())
+
+    # ── V4: familiar-paper penalty (diversity signal) ─────────────────────────
+
+    def _get_saved_paper_embeddings(self) -> Optional[np.ndarray]:
+        """Return stacked embeddings of the user's 10 most-recently saved papers."""
+        saved_ids = self._get_user_saved_arxiv_ids(max_ids=10)
+        if not saved_ids:
+            return None
+        saved_papers = self.db.query(Paper).filter(Paper.arxiv_id.in_(saved_ids)).all()
+        if not saved_papers:
+            return None
+        texts = [f"{p.title} {(p.abstract or '')[:300]}" for p in saved_papers]
+        embs = np.array(self.embedding_manager.generate_embeddings(texts))
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return embs / norms
+
+    def _familiar_penalty(self, paper_emb: np.ndarray, saved_embs: Optional[np.ndarray]) -> float:
+        """
+        Similarity of a candidate paper to the user's saved papers.
+        High penalty → paper is too similar to what the user already has.
+        Returns a value in [0, 1].
+        """
+        if saved_embs is None or len(saved_embs) == 0:
+            return 0.0
+        sims = saved_embs @ paper_emb
+        return float(np.max(sims))
+
+    # ── V4: HuggingFace trending papers for frontier mode ─────────────────────
+
+    def _fetch_hf_trending_papers(self, limit: int = 20) -> List[PaperData]:
+        """
+        Fetch trending ML papers from the HuggingFace papers API.
+
+        publishedAt is parsed into published_date — frontier mode weights recency
+        at 0.5, so dropping the date would silently zero out half the ranking signal.
+        """
+        import urllib.request
+        try:
+            url = f"https://huggingface.co/api/papers?sort=trending&limit={limit}"
+            req = urllib.request.Request(url, headers={"User-Agent": "LearningAssistant/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+
+            papers = []
+            for item in data:
+                arxiv_id = item.get("id", "")
+                if not arxiv_id:
+                    continue
+
+                published = None
+                raw_date = item.get("publishedAt")
+                if raw_date:
+                    try:
+                        published = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    except Exception:
+                        published = None
+
+                papers.append(PaperData(
+                    arxiv_id=arxiv_id,
+                    title=item.get("title", ""),
+                    abstract=item.get("summary", ""),
+                    authors=[a.get("name", "") for a in item.get("authors", [])],
+                    categories=[],
+                    published_date=published,
+                    arxiv_url=f"https://arxiv.org/abs/{arxiv_id}",
+                    pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+                    citation_count=item.get("upvotes", 0),
+                ))
+            logger.info(f"HuggingFace trending: fetched {len(papers)} papers")
+            return papers
+        except Exception as e:
+            logger.warning(f"HuggingFace trending fetch failed: {e}")
+            return []
+
     def _db_paper_to_paperdata(self, p: Paper) -> PaperData:
         return PaperData(
             arxiv_id=p.arxiv_id,
@@ -294,41 +541,120 @@ class DailyFeedPipeline:
             citation_count=p.citation_count,
         )
 
+    def _rerank_papers_mode_aware(
+        self,
+        papers: List[PaperData],
+        interests_text: str,
+        weights: Dict,
+        semantic_scores_override: Optional[Dict[str, float]] = None,
+        top_k: Optional[int] = None,
+    ) -> List[PaperData]:
+        """
+        V4: Score candidates using mode-specific weights for semantic, citation, and recency signals.
+        Applies familiar_penalty to reduce score for papers too similar to already-saved content.
+
+        This is the single ranking implementation — every non-ML path routes through
+        it so mode inference and the familiar penalty apply consistently.
+        """
+        if not papers:
+            return []
+
+        now = datetime.now(timezone.utc)
+
+        # Compute semantic scores (batch, unless provided by caller)
+        if semantic_scores_override:
+            sem_scores = semantic_scores_override
+        else:
+            paper_texts = [f"{p.title} {(p.abstract or '')[:400]}" for p in papers]
+            all_texts = [interests_text] + paper_texts
+            all_embs = np.array(self.embedding_manager.generate_embeddings(all_texts))
+            interest_emb = all_embs[0]
+            paper_embs = all_embs[1:]
+            i_norm = interest_emb / (np.linalg.norm(interest_emb) + 1e-8)
+            norms = np.linalg.norm(paper_embs, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            sims = (paper_embs / norms) @ i_norm
+            sem_scores = {p.arxiv_id: float(s) for p, s in zip(papers, sims)}
+
+        # Citation normalization
+        cit_vals = [p.citation_count or 0 for p in papers]
+        max_cit = max(cit_vals) if max(cit_vals) > 0 else 1
+
+        # Recency normalization (0=oldest known, 1=today)
+        def _recency(p: PaperData) -> float:
+            if not p.published_date:
+                return 0.0
+            pub = p.published_date
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            age = max(0, (now - pub).days)
+            return max(0.0, 1.0 - age / 365)
+
+        # V4: familiar penalty embeddings
+        saved_embs = None
+        try:
+            saved_embs = self._get_saved_paper_embeddings()
+        except Exception:
+            pass
+
+        w_sem = weights.get("semantic", 0.6)
+        w_cit = weights.get("citation", 0.4)
+        w_rec = weights.get("recency", 0.0)
+
+        # Pre-compute paper embeddings if familiar penalty is needed
+        paper_embs_norm_map: Dict[str, np.ndarray] = {}
+        if saved_embs is not None:
+            texts = [f"{p.title} {(p.abstract or '')[:300]}" for p in papers]
+            raw_embs = np.array(self.embedding_manager.generate_embeddings(texts))
+            norms = np.linalg.norm(raw_embs, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            normed = raw_embs / norms
+            for p, emb in zip(papers, normed):
+                paper_embs_norm_map[p.arxiv_id] = emb
+
+        scored = []
+        for p in papers:
+            sem = sem_scores.get(p.arxiv_id, 0.0)
+            cit = (p.citation_count or 0) / max_cit
+            rec = _recency(p)
+            base_score = w_sem * sem + w_cit * cit + w_rec * rec
+
+            # Penalise overly familiar papers (similarity to already-saved work)
+            if saved_embs is not None and p.arxiv_id in paper_embs_norm_map:
+                penalty = self._familiar_penalty(paper_embs_norm_map[p.arxiv_id], saved_embs)
+                base_score = base_score * (1.0 - 0.3 * penalty)
+
+            scored.append((p, base_score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        limit = top_k if top_k is not None else settings.TOP_PAPERS_COUNT
+        result = []
+        for p, score in scored[:limit]:
+            p.relevance_score = round(score, 4)
+            result.append(p)
+        return result
+
     def _rank_with_interests(self, papers: List[PaperData], selected_interests: List[str], top_k: int) -> List[PaperData]:
         """
-        Rank papers by combining embedding cosine similarity to user interests + normalized citations.
-        Uses batch embedding for efficiency (one model.encode call per batch).
-        Combined score = 0.6 * similarity + 0.4 * normalized_citation_count
+        Rank papers for the Latest-mode and fallback paths.
+
+        Previously this hard-coded `0.6 * similarity + 0.4 * citations` — byte-for-byte
+        MODE_WEIGHTS["balanced"]. Duplicating the formula meant these two paths silently
+        missed every V4 ranking improvement: research-mode inference, the recency signal,
+        and the familiar-paper penalty. It now delegates to the single ranking
+        implementation so all non-ML paths behave consistently.
         """
         if not papers:
             return []
 
         interests_text = " ".join(_expand_focus_areas(selected_interests))
-        paper_texts = [f"{p.title} {(p.abstract or '')[:400]}" for p in papers]
+        research_mode = self._infer_research_mode()
+        weights = MODE_WEIGHTS.get(research_mode, MODE_WEIGHTS["balanced"])
+        logger.info(f"Ranking with inferred mode: {research_mode} (weights={weights})")
 
-        all_texts = [interests_text] + paper_texts
-        all_embeddings = np.array(self.embedding_manager.generate_embeddings(all_texts))
-
-        interest_emb = all_embeddings[0]
-        paper_embs = all_embeddings[1:]
-
-        interest_norm = interest_emb / (np.linalg.norm(interest_emb) + 1e-8)
-        norms = np.linalg.norm(paper_embs, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        paper_embs_norm = paper_embs / norms
-        similarities = paper_embs_norm @ interest_norm
-
-        citations = np.array([p.citation_count or 0 for p in papers], dtype=float)
-        max_cit = citations.max() if citations.max() > 0 else 1.0
-        cit_scores = citations / max_cit
-
-        combined = 0.6 * similarities + 0.4 * cit_scores
-
-        for paper, score in zip(papers, combined.tolist()):
-            paper.relevance_score = round(float(score), 4)
-
-        ranked_indices = np.argsort(combined)[::-1][:top_k]
-        return [papers[i] for i in ranked_indices]
+        return self._rerank_papers_mode_aware(
+            papers, interests_text, weights, top_k=top_k
+        )
 
     def _save_papers_to_db(self, papers: List[PaperData]) -> None:
         """Upsert papers from Semantic Scholar into PostgreSQL."""
@@ -351,28 +677,6 @@ class DailyFeedPipeline:
                 ))
         self.db.commit()
 
-    def _rank_papers_by_signals(self, papers: List[PaperData]) -> List[PaperData]:
-        """
-        Rank papers without embedding.
-        Score = 0.6 * normalized_citations + 0.4 * recency
-        """
-        now = datetime.now(timezone.utc)
-        citations = [p.citation_count or 0 for p in papers]
-        max_cit = max(citations) if citations else 1
-
-        def score(p: PaperData) -> float:
-            cit_score = (p.citation_count or 0) / max(max_cit, 1)
-            if p.published_date:
-                age_days = (now - p.published_date.replace(tzinfo=timezone.utc) if p.published_date.tzinfo is None else now - p.published_date).days
-                recency = max(0.0, 1.0 - age_days / 365)
-            else:
-                recency = 0.0
-            return 0.6 * cit_score + 0.4 * recency
-
-        ranked = sorted(papers, key=score, reverse=True)
-        for p in ranked:
-            p.relevance_score = score(p)
-        return ranked
     
     def record_interaction(self, item_type: str, item_id: int, interaction_type: str):
         """
@@ -387,108 +691,10 @@ class DailyFeedPipeline:
         self.trainer.record_interaction(item_type, item_id, interaction_type)
         logger.info(f"Recorded {interaction_type} for {item_type} {item_id}")
     
-    def get_interaction_stats(self) -> dict:
-        """Get statistics about collected interactions"""
-        count = self.trainer.get_interaction_count()
-        return {
-            "total_interactions": count,
-            "ready_for_retrain": count >= 50,
-            "interactions_needed": max(0, 50 - count)
-        }
-    
-    def _collect_papers(self, time_window_days: int, selected_interests: List[str], max_results: int, use_time_slices: bool = True) -> List[PaperData]:
-        """Collect new papers from ArXiv"""
-        collector = ArxivCollector()
-        # Map focus areas to arXiv categories
-        focus_to_categories = {
-            "NLP": ["cs.CL"],
-            "ML": ["cs.LG"],
-            "AI": ["cs.AI"],
-            "DL": ["cs.LG", "cs.CV", "cs.AI", "cs.NE"],
-            "CV": ["cs.CV"],
-        }
-        categories = []
-        for area in selected_interests:
-            categories.extend(focus_to_categories.get(area, []))
-        # Deduplicate categories
-        # if none matched, use defaults
-        category_override = list(dict.fromkeys(categories)) if categories else None
-
-        # Use time-slice bucketing to ensure balanced sampling across time window
-        if use_time_slices:
-            # Calculate number of slices and candidates per slice
-            if time_window_days >= 365:
-                num_slices = 12  # Monthly slices for 1 year
-            elif time_window_days >= 30:
-                num_slices = 4  # Weekly slices for 1 month
-            elif time_window_days >= 7:
-                num_slices = 7  # Daily slices for 1 week
-            else:
-                num_slices = time_window_days  # Daily slices for < 7 days
-            
-            candidates_per_slice = min(20, max(5, max_results // num_slices * 2))
-            logger.info(f"Using time-slice bucketing: {num_slices} slices, ~{candidates_per_slice} candidates/slice")
-            papers = collector.fetch_by_time_slices(
-                days=time_window_days,
-                num_slices=num_slices,
-                candidates_per_slice=candidates_per_slice,
-                categories=category_override,
-            )
-        else:
-            papers = collector.fetch_recent_papers(
-                days=time_window_days,
-                categories=category_override,
-                max_results=max_results,
-            )
-
-        # Deduplicate by arxiv_id
-        dedup = {}
-        for p in papers:
-            dedup[p.arxiv_id] = p
-        papers = list(dedup.values())
-        
-        for paper_data in papers:
-            existing = self.db.query(Paper).filter(Paper.arxiv_id == paper_data.arxiv_id).first()
-            if not existing:
-                paper = Paper(
-                    arxiv_id=paper_data.arxiv_id,
-                    title=paper_data.title,
-                    authors=", ".join(paper_data.authors),
-                    abstract=paper_data.abstract,
-                    categories=", ".join(paper_data.categories),
-                    published_date=paper_data.published_date,
-                    arxiv_url=paper_data.arxiv_url,
-                    pdf_url=paper_data.pdf_url,
-                    citation_count=paper_data.citation_count
-                )
-                self.db.add(paper)
-        
-        self.db.commit()
-        return papers
     
     
     
-    def _filter_candidates(
-        self, 
-        items: List, 
-        item_type: str, 
-        selected_interests: List[str], 
-        min_threshold: float = None,
-        min_papers_per_slice: int = 10,  # Minimum papers we want per time slice
-    ) -> List:
-        """
-        Filter candidates with quality hard filter for papers:
-        (relevance >= r_min) AND ((impact_score >= i_min) OR has_doi/journal_ref)
-        
-        For articles, uses simple relevance threshold.
-        Auto-relaxes thresholds if not enough papers pass.
-        """
-        if item_type == "paper":
-            return self._filter_papers_with_quality(
-                items, selected_interests, min_threshold, min_papers_per_slice
-            )
-        else:
-            return self._filter_articles(items, selected_interests, min_threshold)
+    
     
     def _filter_papers_with_quality(
         self,
@@ -765,62 +971,9 @@ class DailyFeedPipeline:
             candidates.extend(sampled)
         return candidates
     
-    def _discover_articles(self, interests: List[str]) -> List:
-        """
-        Discover CS/AI articles using WebArticleAgent (Tavily web search).
-        Upserts results into the Article table and returns DB Article objects
-        scored by relevance to user interests, ready for summary generation
-        and storage in UserArticleRecommendation.
-        """
-        from src.agents.web_article_agent import WebArticleAgent
-        from sqlalchemy import exc as sa_exc
-
-        agent = WebArticleAgent()
-        raw = agent.discover(interests, max_articles=settings.TOP_ARTICLES_COUNT * 4)
-
-        if not raw:
-            return []
-
-        article_objs = []
-        for art in raw:
-            try:
-                existing = self.db.query(Article).filter(Article.url == art["url"]).first()
-                if existing:
-                    db_art = existing
-                else:
-                    db_art = Article(
-                        source=art["source"],
-                        source_id=art["source_id"],
-                        title=art["title"],
-                        url=art["url"],
-                        content=art["content"],
-                        author=art["author"],
-                        published_date=datetime.now(timezone.utc),
-                        upvotes=0,
-                    )
-                    self.db.add(db_art)
-                    self.db.flush()
-
-                article_objs.append(db_art)
-            except sa_exc.IntegrityError:
-                self.db.rollback()
-                logger.debug(f"Duplicate article skipped: {art.get('url')}")
-            except Exception as e:
-                self.db.rollback()
-                logger.warning(f"Article upsert failed ({art.get('url')}): {e}")
-
-        if not article_objs:
-            return []
-
-        self.db.commit()
-
-        # Score by semantic similarity to interests
-        scored = self._filter_articles(article_objs, interests, min_threshold=0.05)
-        if not scored:
-            scored = article_objs  # keep all if none pass low threshold
-
-        top = sorted(scored, key=lambda a: getattr(a, "relevance_score", 0), reverse=True)
-        return top[: settings.TOP_ARTICLES_COUNT]
+    # _discover_articles() was removed in V4 — trending discovery now lives in
+    # the What's Hot section (HotNewsCollector: HuggingFace + GitHub, free APIs,
+    # Redis-cached). The agents' search_web tool calls Tavily directly.
 
     def _generate_summaries(self, items: List, item_type: str) -> List:
         """Generate personalized summaries for items (parallel API calls)."""
@@ -924,6 +1077,31 @@ class DailyFeedPipeline:
 
         self.db.commit()
     
+    def _store_feed_ctx(self, output: Dict, mode: str) -> None:
+        """
+        V4: Persist feed context in Redis (TTL 2h) for the IterativeRefinementAgent.
+        Stores shown paper IDs, research mode, and query info so /feed/refine can
+        re-score and adjust the feed without running the full pipeline again.
+
+        research_mode (learning/frontier/balanced) is what the Evaluator prompt
+        expects — the feed mode (recommended/latest) is kept separately.
+        """
+        try:
+            rc = self._get_redis()
+            if not rc:
+                return
+            ctx = {
+                "user_id": self.user_id,
+                "feed_mode": mode,
+                "research_mode": getattr(self, "_research_mode", "balanced"),
+                "shown_arxiv_ids": [p.get("arxiv_id") for p in output.get("papers", [])],
+                "candidate_ids": [p.get("db_id") for p in output.get("papers", [])],
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            rc.setex(f"feed_ctx:{self.user_id}", 7200, json.dumps(ctx))
+        except Exception as e:
+            logger.debug(f"feed_ctx storage skipped: {e}")
+
     def _format_output(self, papers: List[PaperData], articles: List) -> Dict:
         """Format output for display"""
         output = {
