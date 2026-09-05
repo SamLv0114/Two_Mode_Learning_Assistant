@@ -13,6 +13,9 @@ class FeedRequest(BaseModel):
     custom_interests: Optional[List[str]] = None
     use_ml: bool = True  # Whether to use ML ranking if available
     mode: str = Field(default="recommended", pattern="^(recommended|latest)$")
+    # Generation is idempotent per day. Set this to explicitly request a
+    # different batch, which consumes the novelty window.
+    force_refresh: bool = False
 
 
 class PaperResponse(BaseModel):

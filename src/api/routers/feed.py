@@ -19,6 +19,7 @@ from src.schemas.feed import (
 )
 from src.utils.config import settings
 from src.models.embeddings import EmbeddingManager
+from src.pipelines.daily_feed import DailyFeedPipeline, _describe_novelty
 
 router = APIRouter(prefix="/feed", tags=["Daily Feed"])
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def _run_pipeline_background(
     focus_areas: List[str],
     user_interests: List[str],
     mode: str = "recommended",
+    force_refresh: bool = False,
 ) -> None:
     """Runs the full feed pipeline in a background thread with its own DB session."""
     from src.database.models import SessionLocal, User as UserModel
@@ -83,7 +85,6 @@ def _run_pipeline_background(
         db = SessionLocal()
         try:
             embedding_manager = get_embedding_manager()
-            from src.pipelines.daily_feed import DailyFeedPipeline
 
             _set_status(job_id, {"status": "ranking", "message": "Ranking and summarizing content..."})
 
@@ -97,11 +98,13 @@ def _run_pipeline_background(
                 focus_areas=focus_areas,
                 user_interests=user_interests,
                 mode=mode,
+                force_refresh=force_refresh,
             )
 
             _set_status(job_id, {
                 "status": "done",
-                "message": "Feed ready",
+                "message": "Showing today's feed" if result.get("reused") else "Feed ready",
+                "reused": bool(result.get("reused")),
                 "papers_count": len(result.get("papers", [])),
                 "articles_count": len(result.get("articles", [])),
                 "used_ml_ranking": result.get("used_ml_ranking", False),
@@ -129,9 +132,14 @@ async def generate_feed(
     Returns a job_id immediately. Poll GET /feed/status/{job_id} to track
     progress, then fetch results from GET /feed/papers and GET /feed/articles.
 
+    Generation is idempotent per day: calling this again returns the feed already
+    built today instead of replacing it. Pass force_refresh to deliberately draw a
+    different batch, which consumes the novelty window.
+
     - **time_window_days**: How far back to look for content (1-365)
     - **focus_areas**: Optional list of focus areas to prioritize
     - **custom_interests**: Optional additional interest keywords
+    - **force_refresh**: Draw a new batch instead of reusing today's
     """
     user_interests = current_user.get_interests_list()
     if request.custom_interests:
@@ -149,6 +157,7 @@ async def generate_feed(
         focus_areas=focus_areas or user_interests,
         user_interests=user_interests,
         mode=request.mode,
+        force_refresh=request.force_refresh,
     )
 
     return {"job_id": job_id, "status": "generating", "message": "Feed generation started"}
@@ -173,9 +182,49 @@ async def feed_status(
     return _get_status(job_id)
 
 
+@router.get("/coldstart")
+async def get_coldstart_seeds(
+    count: int = 12,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+    embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
+):
+    """
+    Diverse, high-impact papers for a new user to react to during onboarding.
+
+    Rating a few of these through POST /interactions bootstraps the profile far
+    faster than waiting for organic interactions: the same table feeds the LLM
+    profile query, the novelty dial, both ranking penalties, and eventually
+    LightGBM. `interactions_recorded` lets the client decide whether onboarding
+    is still warranted.
+    """
+    recorded = (
+        db.query(UserInteraction)
+        .filter(
+            UserInteraction.user_id == current_user.id,
+            UserInteraction.item_type == "paper",
+        )
+        .count()
+    )
+
+    pipeline = DailyFeedPipeline(
+        user_id=current_user.id,
+        db_session=db,
+        embedding_manager=embedding_manager,
+    )
+    seeds = pipeline.get_coldstart_seeds(n=max(1, min(count, 30)))
+
+    return {
+        "seeds": seeds,
+        "count": len(seeds),
+        "interactions_recorded": recorded,
+        "onboarding_recommended": recorded < 5 and len(seeds) > 0,
+    }
+
+
 @router.get("/papers", response_model=List[PaperResponse])
 async def get_recommended_papers(
-    limit: int = 10,
+    limit: int = settings.TOP_PAPERS_COUNT,
     offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
@@ -214,7 +263,7 @@ async def get_recommended_papers(
 
 @router.get("/articles", response_model=List[ArticleResponse])
 async def get_recommended_articles(
-    limit: int = 10,
+    limit: int = settings.TOP_ARTICLES_COUNT,
     offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
@@ -252,52 +301,72 @@ async def get_recommended_articles(
 async def refine_feed(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session),
+    embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
 ):
     """
-    V4: Evaluator-Optimizer refinement pass on the current feed.
+    Evaluator-Optimizer refinement pass on the current feed.
 
-    Reads feed_ctx:{user_id} from Redis (stored by the last /generate run),
-    runs IterativeRefinementAgent (up to 3 rounds, threshold=0.70),
-    and returns the improved paper list along with the evaluation score.
+    An LLM scores the feed and names the weak entries; those get replaced with
+    fresh candidates retrieved from the corpus, and the revised list is re-scored.
+    Up to 3 rounds, stopping early once the score clears 0.70 or there is nothing
+    left to swap in.
 
-    Returns 404 if no feed context is found (call /generate first).
+    Reads feed_ctx:{user_id} from Redis (written by the last /generate run) for the
+    reader profile, and returns the best-scoring version along with its score.
+
+    Returns 404 only when there is no feed to refine.
     """
-    rc = _get_redis()
-    ctx_raw = None
-    if rc:
-        try:
-            ctx_raw = rc.get(f"feed_ctx:{current_user.id}")
-        except Exception:
-            pass
-
-    if not ctx_raw:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No feed context found. Run /feed/generate first.",
-        )
-
-    ctx = json.loads(ctx_raw)
-    # The Evaluator reasons about research intent (learning/frontier/balanced),
-    # not the feed mode (recommended/latest).
-    user_mode = ctx.get("research_mode", "balanced")
-    user_interests = current_user.get_interests_list()
-
-    # Load current papers from DB
     from src.database.models import Paper, UserPaperRecommendation
+
+    # The feed itself is the hard requirement — without papers there is nothing to
+    # score. Load it first so a missing context never masks a present feed.
     rows = (
         db.query(Paper, UserPaperRecommendation)
         .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
         .filter(UserPaperRecommendation.user_id == current_user.id)
         .order_by(UserPaperRecommendation.rank.asc())
-        .limit(10)
+        # Refine operates on the whole feed, so this tracks the feed size rather
+        # than a literal that happens to exceed it today.
+        .limit(settings.TOP_PAPERS_COUNT)
         .all()
     )
 
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No papers in current feed. Run /feed/generate first.",
+            detail="No feed to refine. Generate a feed first.",
         )
+
+    # The reading profile is a nicety: it becomes one line of the evaluator prompt.
+    # feed_ctx holds it but expires after 2h, so a feed generated this morning
+    # would otherwise stop being refinable by the afternoon even though it is still
+    # on screen. Recompute it when the cache has gone rather than refusing to run.
+    DEFAULT_PROFILE = "balances established literature and recent work"
+    user_mode = None
+
+    rc = _get_redis()
+    if rc:
+        try:
+            ctx_raw = rc.get(f"feed_ctx:{current_user.id}")
+            if ctx_raw:
+                user_mode = json.loads(ctx_raw).get("reading_profile")
+        except Exception:
+            pass
+
+    if not user_mode:
+        try:
+            probe = DailyFeedPipeline(
+                user_id=current_user.id,
+                db_session=db,
+                embedding_manager=embedding_manager,
+            )
+            user_mode = _describe_novelty(probe._infer_novelty_preference())
+            logger.info(f"feed_ctx missing — recomputed reading profile: {user_mode}")
+        except Exception as e:
+            logger.debug(f"Could not recompute reading profile ({e}) — using default")
+            user_mode = DEFAULT_PROFILE
+
+    user_interests = current_user.get_interests_list()
 
     papers_input = [
         {
@@ -312,6 +381,23 @@ async def refine_feed(
         for paper, rec in rows
     ]
 
+    # Replacements are retrieved from the corpus, not from the user's own
+    # recommendation rows — those rows are the feed being refined, so searching
+    # them for alternatives always came back empty.
+    pipeline = DailyFeedPipeline(
+        user_id=current_user.id,
+        db_session=db,
+        embedding_manager=embedding_manager,
+    )
+    focus_areas = current_user.get_focus_areas_list() or user_interests
+
+    def _provide_candidates(exclude_ids: set, limit: int):
+        return pipeline.get_alternate_candidates(
+            exclude_arxiv_ids=exclude_ids,
+            selected_interests=focus_areas,
+            limit=limit,
+        )
+
     from src.agents.iterative_refinement_agent import IterativeRefinementAgent
     agent = IterativeRefinementAgent()
     result = agent.refine(
@@ -320,6 +406,7 @@ async def refine_feed(
         user_interests=user_interests,
         user_id=current_user.id,
         db_session=db,
+        candidate_provider=_provide_candidates,
     )
 
     return {

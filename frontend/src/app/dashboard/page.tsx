@@ -7,10 +7,11 @@ import {
   feedApi, interactionsApi, qaApi, authApi, chatApi, whatsHotApi,
   Paper, Article, FeedResponse, InteractionStats, FeedJobStatus, AgentEvent,
   HFPaper, GithubRepo, WhatsHotData,
+  ColdStartSeed, ColdStartResponse,
   API_BASE_URL,
 } from '@/lib/api';
 import toast from 'react-hot-toast';
-import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send, Sparkles } from 'lucide-react';
+import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send, Sparkles, Flame } from 'lucide-react';
 
 const AVAILABLE_AREAS = ['ML', 'NLP', 'CV', 'AI', 'DL'];
 const EXAMPLE_INTERESTS = [
@@ -33,10 +34,12 @@ export default function DashboardPage() {
   const [isRefreshingHot, setIsRefreshingHot] = useState(false);
   const [isRefining, setIsRefining] = useState(false);
   const [refineResult, setRefineResult] = useState<{ score: number; rounds: number; passed: boolean } | null>(null);
+  const [coldStart, setColdStart] = useState<ColdStartResponse | null>(null);
+  const [ratedSeeds, setRatedSeeds] = useState<Record<number, 'saved' | 'dismissed'>>({});
   const [feedProgress, setFeedProgress] = useState('');
   const [timeWindow, setTimeWindow] = useState(7);
   const [feedMode, setFeedMode] = useState<'recommended' | 'latest'>('recommended');
-  const [activeTab, setActiveTab] = useState<'feed' | 'saved' | 'chat' | 'settings'>('feed');
+  const [activeTab, setActiveTab] = useState<'feed' | 'hot' | 'saved' | 'chat' | 'settings'>('feed');
   const [activePaperContext, setActivePaperContext] = useState<{
     title: string;
     abstract: string | null;
@@ -58,9 +61,17 @@ export default function DashboardPage() {
   useEffect(() => {
     if (isAuthenticated) {
       loadStats();
-      loadWhatsHot();
+      loadColdStart();
     }
   }, [isAuthenticated]);
+
+  // What's Hot has its own tab now, so fetch it when that tab is first opened
+  // rather than on every dashboard load. Kept in state after the first visit.
+  useEffect(() => {
+    if (isAuthenticated && activeTab === 'hot' && !whatsHot && !isLoadingHot) {
+      loadWhatsHot();
+    }
+  }, [isAuthenticated, activeTab]);
 
   useEffect(() => {
     return () => {
@@ -89,6 +100,36 @@ export default function DashboardPage() {
     }
   };
 
+  const loadColdStart = async () => {
+    try {
+      const data = await feedApi.getColdStartSeeds(12);
+      // Only surface onboarding when the backend says the profile is still thin.
+      setColdStart(data.onboarding_recommended ? data : null);
+    } catch (error) {
+      console.error('Failed to load onboarding seeds:', error);
+    }
+  };
+
+  const rateSeed = async (seed: ColdStartSeed, verdict: 'saved' | 'dismissed') => {
+    setRatedSeeds((prev) => ({ ...prev, [seed.db_id]: verdict }));
+    try {
+      await interactionsApi.create({
+        item_type: 'paper',
+        item_id: seed.db_id,
+        interaction_type: verdict,
+      });
+      loadStats();
+    } catch (error) {
+      // Roll the choice back so the card does not look recorded when it is not.
+      setRatedSeeds((prev) => {
+        const next = { ...prev };
+        delete next[seed.db_id];
+        return next;
+      });
+      toast.error('Could not save that rating');
+    }
+  };
+
   const refreshWhatsHot = async () => {
     setIsRefreshingHot(true);
     try {
@@ -102,10 +143,10 @@ export default function DashboardPage() {
     }
   };
 
-  const generateFeed = async () => {
+  const generateFeed = async (forceRefresh = false) => {
     if (feedPollRef.current) clearInterval(feedPollRef.current);
     setIsGenerating(true);
-    setFeedProgress('Starting feed generation...');
+    setFeedProgress(forceRefresh ? 'Drawing a new batch...' : 'Loading your feed...');
     setFeed(null);
     setRefineResult(null);
     try {
@@ -114,6 +155,7 @@ export default function DashboardPage() {
         focus_areas: user?.focus_areas,
         use_ml: true,
         mode: feedMode,
+        force_refresh: forceRefresh,
       });
 
       feedPollRef.current = setInterval(async () => {
@@ -121,8 +163,8 @@ export default function DashboardPage() {
           const status: FeedJobStatus = await feedApi.getJobStatus(job_id);
 
           const msgMap: Record<string, string> = {
-            generating: 'Starting feed generation...',
-            collecting: 'Collecting papers and articles...',
+            generating: 'Loading your feed...',
+            collecting: 'Collecting papers...',
             ranking: 'Ranking and summarizing content (this takes 1-2 min)...',
             done: 'Feed ready!',
             error: status.message || 'Pipeline error',
@@ -134,7 +176,9 @@ export default function DashboardPage() {
             clearInterval(feedPollRef.current!);
             feedPollRef.current = null;
             // Articles retired in V4 — trending content now comes from What's Hot.
-            const papers = await feedApi.getPapers(20);
+            // No count — the server decides how large a feed is, so this does
+            // not need updating if that size changes.
+            const papers = await feedApi.getPapers();
             setFeed({
               papers,
               articles: [],
@@ -145,7 +189,7 @@ export default function DashboardPage() {
               total_papers_considered: status.papers_count ?? papers.length,
               total_articles_considered: 0,
             });
-            toast.success('Feed ready!');
+            toast.success(status.reused ? "Showing today's feed" : 'Feed ready!');
             loadStats();
             setIsGenerating(false);
           } else if (status.status === 'error' || status.status === 'not_found') {
@@ -273,6 +317,7 @@ export default function DashboardPage() {
           {(
             [
               { id: 'feed', label: 'Daily Feed' },
+              { id: 'hot', label: "What's Hot", Icon: Flame },
               { id: 'saved', label: 'Saved Items' },
               { id: 'chat', label: 'Agent Chat', Icon: Bot },
               { id: 'settings', label: 'Settings' },
@@ -307,17 +352,20 @@ export default function DashboardPage() {
               setFeedMode={setFeedMode}
               isGenerating={isGenerating}
               feedProgress={feedProgress}
-              onGenerate={generateFeed}
+              onGenerate={() => generateFeed(false)}
               onProfileUpdate={fetchProfile}
             />
 
-            {/* What's Hot — always visible */}
-            <WhatsHotSection
-              data={whatsHot}
-              isLoading={isLoadingHot}
-              isRefreshing={isRefreshingHot}
-              onRefresh={refreshWhatsHot}
-            />
+            {/* Onboarding — only while the profile is still thin */}
+            {coldStart && coldStart.seeds.length > 0 && (
+              <ColdStartSection
+                data={coldStart}
+                rated={ratedSeeds}
+                onRate={rateSeed}
+                onDismiss={() => setColdStart(null)}
+              />
+            )}
+
 
             {/* Feed Results */}
             {feed && (
@@ -347,15 +395,29 @@ export default function DashboardPage() {
                           </span>
                         )}
                       </div>
-                      <button
-                        onClick={handleRefine}
-                        disabled={isRefining}
-                        title="Re-score this feed and swap out weak matches"
-                        className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-primary-600 hover:border-primary-200 hover:bg-primary-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        <Sparkles className={`w-3.5 h-3.5 ${isRefining ? 'animate-pulse' : ''}`} />
-                        {isRefining ? 'Refining…' : 'Refine'}
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={handleRefine}
+                          disabled={isRefining || isGenerating}
+                          title="Re-score this feed and swap out weak matches"
+                          className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-primary-600 hover:border-primary-200 hover:bg-primary-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <Sparkles className={`w-3.5 h-3.5 ${isRefining ? 'animate-pulse' : ''}`} />
+                          {isRefining ? 'Refining…' : 'Refine'}
+                        </button>
+                        {/* Separate from Generate: this is the one action that
+                            deliberately replaces today's feed with lower-ranked
+                            papers, so it should be chosen, not stumbled into. */}
+                        <button
+                          onClick={() => generateFeed(true)}
+                          disabled={isGenerating || isRefining}
+                          title="Replace today's feed with the next set of papers"
+                          className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-gray-900 hover:border-gray-300 hover:bg-gray-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${isGenerating ? 'animate-spin' : ''}`} />
+                          New batch
+                        </button>
+                      </div>
                     </div>
                     <div className="space-y-4">
                       {feed.papers.map((paper) => (
@@ -389,9 +451,24 @@ export default function DashboardPage() {
                 <p className="text-sm text-gray-400 max-w-sm mx-auto">
                   Click <strong>Generate Feed</strong> to discover research papers tailored to your interests.
                 </p>
+                <button
+                  onClick={() => setActiveTab('hot')}
+                  className="mt-4 text-sm text-orange-600 hover:text-orange-700 font-medium transition-colors"
+                >
+                  Or see what the community is reading &rarr;
+                </button>
               </div>
             )}
           </>
+        )}
+
+        {activeTab === 'hot' && (
+          <WhatsHotSection
+            data={whatsHot}
+            isLoading={isLoadingHot}
+            isRefreshing={isRefreshingHot}
+            onRefresh={refreshWhatsHot}
+          />
         )}
 
         {activeTab === 'saved' && <SavedItems />}
@@ -1693,6 +1770,117 @@ function SavedItems() {
   );
 }
 
+/* ── Cold-start onboarding ── */
+function ColdStartSection({
+  data,
+  rated,
+  onRate,
+  onDismiss,
+}: {
+  data: ColdStartResponse;
+  rated: Record<number, 'saved' | 'dismissed'>;
+  onRate: (seed: ColdStartSeed, verdict: 'saved' | 'dismissed') => void;
+  onDismiss: () => void;
+}) {
+  // Progress counts ratings already on the server plus the ones made in this
+  // session. Counting only this session would restart the bar at zero for a user
+  // who already has interactions, showing a target they have partly met.
+  const target = 5;
+  const ratedCount = Math.min(
+    target,
+    data.interactions_recorded + Object.keys(rated).length
+  );
+  const remaining = Math.max(0, target - ratedCount);
+  const pct = Math.min(100, (ratedCount / target) * 100);
+
+  // Rated cards drop out so what remains is always what still needs a decision.
+  const pending = data.seeds.filter((s) => !(s.db_id in rated));
+
+  return (
+    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 mb-6">
+      <div className="flex items-start justify-between gap-3 mb-1">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-violet-100 flex items-center justify-center text-lg">
+            🎯
+          </div>
+          <h2 className="text-base font-bold text-gray-900">Teach your feed</h2>
+        </div>
+        <button
+          onClick={onDismiss}
+          className="text-xs text-gray-400 hover:text-gray-600 px-2 py-1 rounded-lg hover:bg-gray-100 transition-colors"
+        >
+          Skip
+        </button>
+      </div>
+
+      <p className="text-sm text-gray-500 mb-4 max-w-2xl leading-relaxed">
+        {remaining > 0 ? (
+          <>
+            Rate <strong>{remaining} more</strong> {remaining === 1 ? 'paper' : 'papers'} to
+            bootstrap your profile. Saves and dismissals both help &mdash; a dismissal tells
+            the ranker what to avoid just as clearly as a save tells it what to find.
+          </>
+        ) : (
+          <>Enough signal to personalize. Generate a feed to see it applied.</>
+        )}
+      </p>
+
+      <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden mb-4">
+        <div
+          className="h-full bg-violet-500 rounded-full transition-all duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+
+      {pending.length > 0 ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {pending.slice(0, 6).map((seed) => (
+            <div
+              key={seed.db_id}
+              className="border border-gray-100 rounded-xl p-3.5 hover:border-violet-200 transition-colors flex flex-col"
+            >
+              <a
+                href={seed.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm font-semibold text-gray-900 hover:text-violet-600 leading-snug mb-1.5 transition-colors"
+              >
+                {seed.title}
+              </a>
+              <p className="text-xs text-gray-500 leading-relaxed mb-3 line-clamp-3 flex-1">
+                {seed.abstract}
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => onRate(seed, 'saved')}
+                  className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 transition-colors"
+                >
+                  <Save className="w-3.5 h-3.5" /> Interested
+                </button>
+                <button
+                  onClick={() => onRate(seed, 'dismissed')}
+                  className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
+                >
+                  <X className="w-3.5 h-3.5" /> Not for me
+                </button>
+                {seed.citation_count ? (
+                  <span className="ml-auto text-xs text-gray-400">
+                    ⭐ {seed.citation_count}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-sm text-gray-400 py-2">
+          All set — that&apos;s everything from this batch.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ── What's Hot Section ── */
 function WhatsHotSection({
   data,
@@ -1706,25 +1894,33 @@ function WhatsHotSection({
   onRefresh: () => void;
 }) {
   return (
-    <div>
-      {/* Section header */}
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-xl bg-orange-100 flex items-center justify-center text-lg">
+    <div className="animate-in">
+      {/* Page header — states plainly that this surface is not personalized,
+          which is the whole reason it lives apart from Daily Feed. */}
+      <div className="flex items-start justify-between gap-4 mb-5">
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-xl bg-orange-100 flex items-center justify-center text-xl flex-shrink-0">
             🔥
           </div>
-          <h2 className="text-base font-bold text-gray-900">What&apos;s Hot</h2>
-          {data && (
-            <span className="text-xs text-gray-400 ml-1">
-              · {data.github_window === 'daily' ? 'daily' : 'weekly'} window
-            </span>
-          )}
+          <div>
+            <h2 className="text-lg font-bold text-gray-900 leading-tight">What&apos;s Hot</h2>
+            <p className="text-sm text-gray-500 mt-0.5">
+              What the ML community is reading and building right now — the same for
+              everyone, not tailored to you.
+              {data && (
+                <span className="text-gray-400">
+                  {' '}Tools from the last{' '}
+                  {data.github_window === 'daily' ? 'day' : 'week'}.
+                </span>
+              )}
+            </p>
+          </div>
         </div>
         <button
           onClick={onRefresh}
           disabled={isRefreshing}
           title="Refresh What's Hot"
-          className="p-1.5 rounded-lg text-gray-400 hover:text-orange-500 hover:bg-orange-50 transition-colors disabled:opacity-40"
+          className="p-2 rounded-lg text-gray-400 hover:text-orange-500 hover:bg-orange-50 transition-colors disabled:opacity-40 flex-shrink-0"
         >
           <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
         </button>

@@ -55,6 +55,6 @@ PyMuPDF>=1.23.0
 # streamlit>=1.28.0
 
 # Development (not needed for production)
-# pytest>=7.4.0
-# pytest-asyncio>=0.21.0
-# httpx>=0.25.0
+# Smoke tests run without pytest (python tests/smoke.py), but TestClient
+# needs httpx.
+httpx>=0.25.0

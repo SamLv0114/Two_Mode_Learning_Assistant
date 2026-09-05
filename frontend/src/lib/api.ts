@@ -96,6 +96,23 @@ export interface FeedResponse {
   total_articles_considered: number;
 }
 
+export interface ColdStartSeed {
+  db_id: number;
+  arxiv_id: string;
+  title: string;
+  abstract: string;
+  categories?: string;
+  citation_count?: number;
+  url: string;
+}
+
+export interface ColdStartResponse {
+  seeds: ColdStartSeed[];
+  count: number;
+  interactions_recorded: number;
+  onboarding_recommended: boolean;
+}
+
 export interface RefineResponse {
   papers: Paper[];
   score: number;
@@ -116,6 +133,8 @@ export interface InteractionStats {
 export interface FeedJobStatus {
   status: 'generating' | 'collecting' | 'ranking' | 'done' | 'error' | 'not_found';
   message?: string;
+  /** True when the job returned today's existing feed rather than building one. */
+  reused?: boolean;
   papers_count?: number;
   articles_count?: number;
   used_ml_ranking?: boolean;
@@ -183,6 +202,8 @@ export const feedApi = {
     custom_interests?: string[];
     use_ml?: boolean;
     mode?: 'recommended' | 'latest';
+    /** Draw a new batch instead of reusing today's feed. */
+    force_refresh?: boolean;
   }) => {
     const response = await api.post<{ job_id: string; status: string; message: string }>(
       '/feed/generate',
@@ -196,9 +217,10 @@ export const feedApi = {
     return response.data;
   },
 
-  getPapers: async (limit = 20, offset = 0) => {
+  /** Omit `limit` to let the server return its configured feed size. */
+  getPapers: async (limit?: number, offset = 0) => {
     const response = await api.get<Paper[]>('/feed/papers', {
-      params: { limit, offset },
+      params: { ...(limit !== undefined && { limit }), offset },
     });
     return response.data;
   },
@@ -222,6 +244,15 @@ export const feedApi = {
   // Reads feed_ctx from Redis (2h TTL) — requires a prior /feed/generate.
   refine: async (): Promise<RefineResponse> => {
     const response = await api.post<RefineResponse>('/feed/refine');
+    return response.data;
+  },
+
+  // Onboarding seeds: diverse high-impact papers for a new user to rate,
+  // which bootstraps the profile without waiting for organic interactions.
+  getColdStartSeeds: async (count = 12): Promise<ColdStartResponse> => {
+    const response = await api.get<ColdStartResponse>('/feed/coldstart', {
+      params: { count },
+    });
     return response.data;
   },
 };

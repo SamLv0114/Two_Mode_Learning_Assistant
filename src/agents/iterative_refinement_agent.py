@@ -1,27 +1,22 @@
 """
 IterativeRefinementAgent — Evaluator-Optimizer loop for feed quality.
 
-Inspired by the Evaluator-Optimizer pattern (LangGraph / GPT-Researcher):
+Backs POST /feed/refine: improve an existing feed without re-running the pipeline.
 
-  Round 1:  Score current feed (Evaluator) → if score < threshold, refine (Optimizer)
-  Round 2+: Re-score refined feed → repeat until score >= EVAL_THRESHOLD or MAX_ROUNDS
+  Round 1:  an LLM scores the feed; below threshold, weak entries are replaced
+  Round 2+: re-score the revised feed, up to MAX_ROUNDS
 
-Used by POST /feed/refine to let the user trigger a quality improvement pass
-without re-running the full pipeline. Reads feed context from Redis (feed_ctx:{user_id})
-and re-ranks or replaces low-scoring papers.
-
-Scoring dimensions (each 0–1):
-  - diversity:   title embedding pairwise dissimilarity
-  - relevance:   average relevance_score from DB
-  - novelty:     fraction of papers not in shown_arxiv_ids history
-  - mode_fit:    alignment between paper recency/citations and user_mode
-
-Overall score = 0.3*diversity + 0.4*relevance + 0.2*novelty + 0.1*mode_fit
-PASS threshold: 0.70
+Scoring is a single gpt-4o-mini judgement over the whole list, not a computed
+formula — the model is asked to weigh diversity, relevance, novelty and fit with
+the reader's profile, and returns one score plus the positions it considers weak.
+Replacements come from a candidate_provider supplied by the caller, which goes
+back to the corpus; an earlier version searched the user's own recommendation
+rows, which are exactly the feed being refined, so it never found anything and
+the optimizer half silently did nothing.
 """
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from openai import OpenAI
 
@@ -36,7 +31,7 @@ _EVALUATOR_PROMPT = """\
 You are an expert ML paper feed curator. Evaluate this list of recommended papers \
 for a researcher and return a quality score from 0.0 to 1.0.
 
-User research mode: {mode}
+Reading profile: {mode}
 User interests: {interests}
 
 Papers:
@@ -44,9 +39,9 @@ Papers:
 
 Score on:
 - Diversity (varied topics/methods, not all the same theme)
-- Relevance (match to user interests and mode)
-- Novelty (not all well-known papers the user likely already knows)
-- Mode fit (frontier mode → recent; learning mode → cited foundational)
+- Relevance (match to the stated interests)
+- Novelty (not all well-known papers the reader likely already knows)
+- Profile fit (does the mix of established and recent work match the reading profile above)
 
 Return JSON only: {{"score": <float 0-1>, "reason": "<one sentence>", "weak_indices": [<0-indexed positions to replace>]}}
 """
@@ -70,55 +65,68 @@ class IterativeRefinementAgent:
         user_interests: List[str],
         user_id: int,
         db_session=None,
+        candidate_provider: Optional[Callable[[set, int], List[Dict]]] = None,
     ) -> Dict:
         """
-        Run up to MAX_ROUNDS of evaluate → refine.
+        Run up to MAX_ROUNDS of evaluate -> replace weak entries -> re-evaluate.
 
-        Returns:
-          {
-            "papers": List[Dict],   # best version of the feed
-            "score":  float,        # final evaluator score
-            "rounds": int,          # number of rounds taken
-            "passed": bool,         # True if score >= EVAL_THRESHOLD
-          }
+        candidate_provider(exclude_arxiv_ids, limit) supplies replacements. Without
+        one the loop can still score, but has nothing to swap in, so it returns
+        after the first evaluation rather than burning two more LLM calls to
+        re-score an unchanged list.
+
+        Returns the highest-scoring version seen, with the score that version
+        actually earned. Tracking those separately is the point: an earlier version
+        updated the paper list on every round but only raised the score when it
+        improved, so a refinement that made things worse was returned alongside the
+        better round's score.
         """
-        best_papers = papers
-        best_score = 0.0
         interests_str = ", ".join(user_interests[:8]) if user_interests else "ML research"
 
+        current = list(papers)
+        best_papers, best_score = list(papers), -1.0
+        rounds_run = 0
+
         for round_num in range(1, MAX_ROUNDS + 1):
+            rounds_run = round_num
             logger.info(f"[IterativeRefinement] round {round_num}/{MAX_ROUNDS}")
 
-            score, reason, weak_indices = self._evaluate(best_papers, user_mode, interests_str)
+            score, reason, weak_indices = self._evaluate(current, user_mode, interests_str)
             logger.info(f"  score={score:.2f} reason={reason}")
 
+            # Keep the list and the score it earned together.
             if score > best_score:
-                best_score = score
+                best_score, best_papers = score, list(current)
 
             if score >= EVAL_THRESHOLD:
                 logger.info(f"  PASS (score={score:.2f} >= {EVAL_THRESHOLD})")
-                return {
-                    "papers": best_papers,
-                    "score": best_score,
-                    "rounds": round_num,
-                    "passed": True,
-                }
+                break
 
-            # Try to improve: replace weak-scoring papers
-            if weak_indices and db_session:
-                try:
-                    refined = self._replace_weak_papers(
-                        best_papers, weak_indices, user_mode, interests_str, db_session, user_id
-                    )
-                    if refined:
-                        best_papers = refined
-                except Exception as e:
-                    logger.warning(f"  refinement failed: {e}")
+            if not weak_indices:
+                logger.info("  evaluator flagged nothing to replace — stopping")
+                break
+
+            if candidate_provider is None:
+                logger.info("  no candidate provider — cannot replace, stopping")
+                break
+
+            try:
+                revised = self._replace_weak_papers(
+                    current, weak_indices, candidate_provider
+                )
+            except Exception as e:
+                logger.warning(f"  refinement failed: {e}")
+                break
+
+            if not revised:
+                logger.info("  no replacement candidates available — stopping")
+                break
+            current = revised
 
         return {
             "papers": best_papers,
-            "score": best_score,
-            "rounds": MAX_ROUNDS,
+            "score": max(best_score, 0.0),
+            "rounds": rounds_run,
             "passed": best_score >= EVAL_THRESHOLD,
         }
 
@@ -160,52 +168,31 @@ class IterativeRefinementAgent:
         self,
         papers: List[Dict],
         weak_indices: List[int],
-        mode: str,
-        interests: str,
-        db_session,
-        user_id: int,
+        candidate_provider: Callable[[set, int], List[Dict]],
     ) -> Optional[List[Dict]]:
         """
-        Replace papers at weak_indices with higher-scoring alternatives from DB.
-        Simple strategy: query DB for papers NOT in current feed, ranked by relevance_score.
+        Swap the flagged positions for fresh candidates from the corpus.
+
+        Excludes everything currently shown so a replacement is never a paper the
+        reader is already looking at. Returns None when nothing could be replaced,
+        which the caller treats as a signal to stop rather than loop pointlessly.
         """
-        from src.database.models import Paper, UserPaperRecommendation
+        valid = sorted({i for i in weak_indices if 0 <= i < len(papers)})
+        if not valid:
+            return None
 
-        current_arxiv_ids = {p.get("arxiv_id") for p in papers}
-
-        # Pull higher-relevance papers not currently in the feed
-        alternates = (
-            db_session.query(Paper, UserPaperRecommendation)
-            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
-            .filter(
-                UserPaperRecommendation.user_id == user_id,
-                ~Paper.arxiv_id.in_(current_arxiv_ids),
-            )
-            .order_by(UserPaperRecommendation.relevance_score.desc())
-            .limit(len(weak_indices) * 3)
-            .all()
-        )
-
-        if not alternates:
+        current_ids = {p.get("arxiv_id") for p in papers if p.get("arxiv_id")}
+        candidates = candidate_provider(current_ids, len(valid) * 2) or []
+        # The provider excludes by id, but guard here too — it is a callback and
+        # this class cannot assume it honoured the contract.
+        candidates = [c for c in candidates if c.get("arxiv_id") not in current_ids]
+        if not candidates:
             return None
 
         result = list(papers)
-        alt_iter = iter(alternates)
-        for idx in sorted(weak_indices, reverse=True):
-            if idx >= len(result):
-                continue
-            try:
-                paper, rec = next(alt_iter)
-                result[idx] = {
-                    "arxiv_id": paper.arxiv_id,
-                    "title": paper.title,
-                    "relevance_score": rec.relevance_score or 0.0,
-                    "citation_count": paper.citation_count,
-                    "url": paper.arxiv_url,
-                    "summary": rec.personalized_summary,
-                    "rank": idx + 1,
-                }
-            except StopIteration:
-                break
+        for idx, cand in zip(valid, candidates):
+            result[idx] = {**cand, "rank": idx + 1}
 
+        replaced = min(len(valid), len(candidates))
+        logger.info(f"  replaced {replaced} of {len(valid)} weak papers")
         return result
