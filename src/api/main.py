@@ -15,6 +15,7 @@ from src.database.models import init_db
 from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router, whats_hot_router
 from src.api.middleware import RateLimitMiddleware
 from src.jobs.nightly_indexer import run_nightly_index
+from src.jobs.citation_refresh import run_citation_refresh
 
 # Configure logging
 logging.basicConfig(
@@ -56,8 +57,14 @@ async def lifespan(app: FastAPI):
     # Start nightly indexer — runs at 06:00 UTC daily (ArXiv RSS updates ~05:00 UTC)
     try:
         _scheduler.add_job(run_nightly_index, "cron", hour=6, minute=0, id="nightly_index")
+        # citation_refresh existed only as a standalone CLI script and was never
+        # wired to anything — new papers reached citation_count=0 and stayed
+        # there permanently, with nothing to fill in the real count once Semantic
+        # Scholar had indexed them. Runs after the indexer so same-day papers
+        # aren't queried before they exist.
+        _scheduler.add_job(run_citation_refresh, "cron", hour=7, minute=0, id="citation_refresh")
         _scheduler.start()
-        logger.info("Nightly indexer scheduled at 06:00 UTC daily")
+        logger.info("Nightly indexer scheduled at 06:00 UTC; citation refresh at 07:00 UTC")
     except Exception as e:
         logger.warning(f"Could not start scheduler: {e}")
 
@@ -169,6 +176,18 @@ async def trigger_index():
     import asyncio
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, run_nightly_index)
+    return result
+
+
+@app.post("/api/v1/admin/refresh-citations-now", tags=["Admin"])
+async def trigger_citation_refresh():
+    """
+    Run citation_refresh immediately, for backfilling the papers that
+    accumulated at citation_count=0 while this job had no schedule at all.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, run_citation_refresh)
     return result
 
 
