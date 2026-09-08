@@ -247,24 +247,42 @@ def init_db():
     """Initialize database tables"""
     Base.metadata.create_all(bind=engine)
 
-    # Handle SQLite-specific migrations for legacy tables
+    # create_all() only creates tables that don't exist yet — it never adds a
+    # column to a table that's already there. Every additive column added to
+    # a model after its table first shipped needs a matching statement here.
+    #
+    # This used to be gated behind `if db_url.startswith("sqlite")` and used
+    # PRAGMA table_info(), which is SQLite-only syntax — meaning on Postgres
+    # (production) this block never ran at all, for any column, ever. A column
+    # added to a model would work against a fresh local SQLite db (create_all
+    # builds the whole table, migration included) and silently never reach an
+    # existing production table — exactly what happened when feed_mode /
+    # feed_time_window_days shipped: the first query referencing them raised
+    # UndefinedColumn, and since nothing rolled the session back, every later
+    # query in that request inherited the aborted transaction.
     db_url = settings.DATABASE_URL
     if db_url.startswith("sqlite"):
         with engine.connect() as conn:
-            # Check and add missing columns to papers table
             result = conn.execute(text("PRAGMA table_info(papers)")).fetchall()
             existing = {row[1] for row in result}
             if "heuristic_impact_score" not in existing:
                 conn.execute(text("ALTER TABLE papers ADD COLUMN heuristic_impact_score FLOAT"))
                 conn.commit()
 
-            # Check if user_interactions has user_id column
             result = conn.execute(text("PRAGMA table_info(user_interactions)")).fetchall()
             existing = {row[1] for row in result}
             if "user_id" not in existing:
-                # Add user_id column with default NULL
                 conn.execute(text("ALTER TABLE user_interactions ADD COLUMN user_id INTEGER"))
                 conn.commit()
+    else:
+        # Postgres supports IF NOT EXISTS directly, so no need to introspect
+        # first — each statement is a no-op if the column is already there.
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE papers ADD COLUMN IF NOT EXISTS heuristic_impact_score FLOAT"))
+            conn.execute(text("ALTER TABLE user_interactions ADD COLUMN IF NOT EXISTS user_id INTEGER"))
+            conn.execute(text("ALTER TABLE user_paper_recommendations ADD COLUMN IF NOT EXISTS feed_mode VARCHAR"))
+            conn.execute(text("ALTER TABLE user_paper_recommendations ADD COLUMN IF NOT EXISTS feed_time_window_days INTEGER"))
+            conn.commit()
 
 
 def get_db():
