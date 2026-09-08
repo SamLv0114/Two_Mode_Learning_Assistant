@@ -103,6 +103,38 @@ FAMILIAR_PENALTY_STRENGTH = 0.30   # similar to something already saved
 # to check this against, it stays a nudge rather than a strong signal.
 DISLIKE_PENALTY_STRENGTH = 0.20
 
+# Calibrated selection (Steck, "Calibrated Recommendations", RecSys 2018): the
+# final top-K should reflect the user's own category mix, not just whichever
+# category the profile-driven semantic score currently favors. Declared
+# interests act as a prior — expressed as CALIBRATION_PRIOR_STRENGTH "virtual"
+# saved papers split across whichever declared areas map to a known category —
+# so a category can't be silently zeroed out just because the user hasn't
+# happened to save anything in it yet. Saved/viewed papers' real arXiv
+# categories are the evidence that shifts the target as it accumulates.
+CALIBRATION_PRIOR_STRENGTH = 5.0    # prior weight, in "papers", split across declared interests
+CALIBRATION_EVIDENCE_MAX_IDS = 200  # recent saved/viewed papers considered as evidence
+
+# Candidates requested from ranking before calibrating down to TOP_PAPERS_COUNT.
+# Deliberately large: _reserve_exploration_slots (the heuristic path's own
+# final cut) does no intermediate widening — whatever top_k it's given becomes
+# the literal cut from the full ~100-candidate pool. A factor too small here
+# means an under-represented category never reaches _calibrate_top_k at all
+# because it was already sliced away one step earlier, silently defeating the
+# whole point of calibrating. 8x (40 of ~100) was chosen after confirming 3x
+# (15) reproducibly lost an entire category in a plausibly-skewed pool; it is
+# still a heuristic window, not a guarantee — see the zero-representation log
+# in _calibrate_top_k for when even this isn't enough.
+CALIBRATION_OVERSAMPLE_FACTOR = 8
+
+# A category's quota is only filled from candidates whose normalized relevance
+# (0 = worst, 1 = best, in the oversampled pool) clears this floor. Without it,
+# an empty or near-empty category would get filled by whatever's left in it —
+# including a near-zero-relevance paper — ahead of a genuinely strong paper
+# from an over-represented category. Tested empirically: below this floor,
+# calibration starts trading a great paper for a barely-relevant one just to
+# hit the target ratio, which is a worse result than the imbalance it fixes.
+CALIBRATION_MIN_QUALITY = 0.15
+
 
 def _blend_weights(novelty: float) -> Dict[str, float]:
     """
@@ -141,6 +173,18 @@ FOCUS_AREA_TERMS = {
     "CV": "computer vision",
     "AI": "artificial intelligence",
     "DL": "deep learning",
+}
+
+# Same keys as FOCUS_AREA_TERMS, mapped to the arXiv category codes actually
+# indexed by run_nightly_index (settings.ARXIV_CATEGORIES) — used to give
+# declared interests a prior in _compute_target_category_distribution. DL has
+# no distinct arXiv code of its own, so it shares cs.LG with ML.
+FOCUS_AREA_CATEGORY_MAP = {
+    "ML": "cs.LG",
+    "NLP": "cs.CL",
+    "CV": "cs.CV",
+    "AI": "cs.AI",
+    "DL": "cs.LG",
 }
 
 
@@ -182,28 +226,46 @@ class DailyFeedPipeline:
         """
         Build today's feed.
 
-        Idempotent within a day: a second call returns the feed already generated
-        rather than producing a new one. Generating unconditionally made the button
-        destructive — it deleted the list the user was reading, spent LLM calls
-        re-summarising, and, because papers shown in the last NOVELTY_LOOKBACK_DAYS
-        are excluded from candidates, handed back strictly lower-ranked papers each
-        time. Clicking twice should not be a downgrade.
+        Idempotent within a day: a second call with the same mode/time_window
+        returns the feed already generated rather than producing a new one.
+        Generating unconditionally made the button destructive — it deleted the
+        list the user was reading, spent LLM calls re-summarising, and, because
+        papers shown in the last NOVELTY_LOOKBACK_DAYS are excluded from
+        candidates, handed back strictly lower-ranked papers each time. Clicking
+        twice should not be a downgrade.
 
         force_refresh=True is the explicit "show me a different batch" path, where
-        consuming the novelty window is what the user actually asked for.
+        consuming the novelty window is what the user actually asked for. A mode
+        or time_window_days that differs from what today's stored feed was
+        generated with is treated the same way — the UI toggle is an explicit
+        signal, and silently ignoring it (returning a Recommended-mode feed after
+        the user switched to Latest, say) is worse than spending the regeneration.
         """
         if not force_refresh:
             existing = self._todays_feed()
             if existing:
-                logger.info(
-                    f"Feed already generated today ({len(existing['papers'])} papers) "
-                    f"— returning it unchanged. Use force_refresh for a new batch."
+                existing_mode = existing.get("mode") or "recommended"
+                mode_matches = existing_mode == mode
+                window_matches = (
+                    mode != "latest"
+                    or existing.get("time_window_days") == time_window_days
                 )
-                # Still check training. Interactions accrue between clicks — a user
-                # who finishes onboarding after generating would otherwise wait
-                # until tomorrow for the model to see any of it.
-                self._maybe_retrain()
-                return existing
+                if mode_matches and window_matches:
+                    logger.info(
+                        f"Feed already generated today ({len(existing['papers'])} papers) "
+                        f"— returning it unchanged. Use force_refresh for a new batch."
+                    )
+                    # Still check training. Interactions accrue between clicks — a user
+                    # who finishes onboarding after generating would otherwise wait
+                    # until tomorrow for the model to see any of it.
+                    self._maybe_retrain()
+                    return existing
+                logger.info(
+                    f"Today's feed was generated as mode={existing_mode!r}/"
+                    f"window={existing.get('time_window_days')}, but this request "
+                    f"asked for mode={mode!r}/window={time_window_days} — "
+                    f"regenerating instead of returning the mismatched feed."
+                )
 
         logger.info(f"Starting daily feed pipeline (mode={mode}, force_refresh={force_refresh})...")
 
@@ -232,7 +294,7 @@ class DailyFeedPipeline:
 
         # Step 4: Store and return
         logger.info("Step 4: Storing results...")
-        self._store_results(top_papers, top_articles)
+        self._store_results(top_papers, top_articles, mode=mode, time_window_days=time_window_days)
         output = self._format_output(top_papers, top_articles)
 
         # Persist feed context in Redis for IterativeRefinementAgent
@@ -294,8 +356,11 @@ class DailyFeedPipeline:
             if not rows:
                 return None
 
+            _first_rec = rows[0][1]
             return {
                 "date": datetime.now().strftime("%Y-%m-%d"),
+                "mode": _first_rec.feed_mode,
+                "time_window_days": _first_rec.feed_time_window_days,
                 "papers": [
                     {
                         "rank": rec.rank or i,
@@ -347,7 +412,7 @@ class DailyFeedPipeline:
 
         try:
             profile_query = self._build_user_profile_query(
-                redis_client=self._get_redis()
+                interests_text, redis_client=self._get_redis()
             ) or interests_text
             vector_results = self._fanout_search(profile_query, candidate_limit)
         except Exception as e:
@@ -415,6 +480,12 @@ class DailyFeedPipeline:
             _familiar_penalty() and _dislike_penalty() demote content the user has
             already seen or explicitly rejected.
 
+        Stage 3 (calibrated selection):
+            The ranked list is over-fetched and trimmed to TOP_PAPERS_COUNT by
+            _calibrate_top_k(), so a profile that leans heavily toward one
+            declared interest can't silently push the others out of the final
+            list — see _compute_target_category_distribution().
+
         Fallback: impact-score DB query if ChromaDB returns too few results.
 
         There is exactly one candidate source here — the indexed corpus. An earlier
@@ -431,7 +502,7 @@ class DailyFeedPipeline:
         logger.info(f"Novelty preference: {novelty:.2f} (weights={weights})")
 
         # LLM-generated user profile as richer ChromaDB query
-        profile_query = self._build_user_profile_query(redis_client=self._get_redis()) or interests_text
+        profile_query = self._build_user_profile_query(interests_text, redis_client=self._get_redis()) or interests_text
         logger.info(f"ChromaDB query: {'profile' if profile_query != interests_text else 'keywords'}")
 
         # ── Stage 1: fan-out parallel ChromaDB search ────────────────────────
@@ -481,20 +552,197 @@ class DailyFeedPipeline:
             f"(ChromaDB ANN → PostgreSQL join)"
         )
 
+        # ── Stage 3 setup: how many to rank, and what mix to calibrate toward ──
+        target_dist = self._compute_target_category_distribution(selected_interests)
+        select_count = (
+            settings.TOP_PAPERS_COUNT * CALIBRATION_OVERSAMPLE_FACTOR
+            if target_dist else settings.TOP_PAPERS_COUNT
+        )
+
         # ── Re-rank: semantic similarity + citation influence ──────────────────
         interaction_count = self.trainer.get_interaction_count()
         if interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
             # LightGBM knows citation counts via feature extractor — just pass candidates
             logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
             papers = [self._db_paper_to_paperdata(p) for p in db_papers]
-            return self._rank_and_select(
-                papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
+            ranked = self._rank_and_select(
+                papers, select_count, "paper", selected_interests, use_ml=True
+            )
+        else:
+            # ── Re-rank: weighted signals + familiarity/dislike penalties ────
+            paperdata_list = [self._db_paper_to_paperdata(p) for p in db_papers]
+            ranked = self._score_and_rank(
+                paperdata_list, interests_text, weights,
+                semantic_scores_override={p.arxiv_id: semantic_scores.get(p.arxiv_id, 0.0) for p in db_papers},
+                top_k=select_count,
             )
 
-        # ── Re-rank: weighted signals + familiarity/dislike penalties ────────
-        paperdata_list = [self._db_paper_to_paperdata(p) for p in db_papers]
-        return self._score_and_rank(paperdata_list, interests_text, weights,
-                                               semantic_scores_override={p.arxiv_id: semantic_scores.get(p.arxiv_id, 0.0) for p in db_papers})
+        if target_dist:
+            return self._calibrate_top_k(ranked, settings.TOP_PAPERS_COUNT, target_dist)
+        return ranked
+
+    def _compute_target_category_distribution(
+        self, selected_interests: List[str]
+    ) -> Optional[Dict[str, float]]:
+        """
+        Blend declared interests with saved/viewed papers' arXiv categories into
+        a target mix for _calibrate_top_k(), Dirichlet-style: declared interests
+        are a prior (CALIBRATION_PRIOR_STRENGTH "virtual" saved papers, split
+        across whichever declared areas map to a known category), and real
+        saved/viewed papers are the evidence. With nothing saved yet, the result
+        is just the declared-interest split; as saves accumulate, evidence
+        dominates the prior on its own — there is no hand-picked blend ratio to
+        justify or re-tune later.
+
+        Returns None when there's nothing to calibrate against (no declared
+        interest maps to a known category and nothing has been saved yet), so
+        the caller can skip calibration entirely rather than calibrate toward
+        an empty target.
+        """
+        counts: Dict[str, float] = {}
+
+        mapped_categories = [
+            FOCUS_AREA_CATEGORY_MAP[a.upper()]
+            for a in selected_interests
+            if a.upper() in FOCUS_AREA_CATEGORY_MAP
+        ]
+        if mapped_categories:
+            share = CALIBRATION_PRIOR_STRENGTH / len(mapped_categories)
+            for cat in mapped_categories:
+                counts[cat] = counts.get(cat, 0.0) + share
+
+        saved_ids = self._get_user_saved_arxiv_ids(max_ids=CALIBRATION_EVIDENCE_MAX_IDS)
+        if saved_ids:
+            rows = (
+                self.db.query(Paper.categories)
+                .filter(Paper.arxiv_id.in_(saved_ids))
+                .all()
+            )
+            for (categories_str,) in rows:
+                if not categories_str:
+                    continue
+                # First-listed category only, matching _calibrate_top_k's
+                # _primary_category — crediting every category on a multi-labeled
+                # paper would count it once per label there but only ever bucket
+                # candidates by their first label, silently mismatched.
+                primary = categories_str.split(", ")[0].strip()
+                if primary:
+                    counts[primary] = counts.get(primary, 0.0) + 1.0
+
+        total = sum(counts.values())
+        if total <= 0:
+            return None
+        return {cat: n / total for cat, n in counts.items()}
+
+    def _calibrate_top_k(
+        self, ranked: List[PaperData], limit: int, target_dist: Dict[str, float]
+    ) -> List[PaperData]:
+        """
+        Trim an already-ranked (oversampled) list down to `limit` so its
+        category mix reflects target_dist — Steck, "Calibrated Recommendations"
+        (RecSys 2018) — instead of whatever plain top-K truncation happens to
+        produce, which lets one category with systematically higher scores
+        (e.g. whatever the profile currently leans toward) crowd out every
+        other declared interest.
+
+        Two passes:
+          1. Convert target_dist into an integer quota per category (largest-
+             remainder rounding, so quotas sum to exactly `limit`), then fill
+             each category's quota from its own best-scoring candidates —
+             skipping any below CALIBRATION_MIN_QUALITY so an under-populated
+             category can't be padded with near-irrelevant papers.
+          2. Anything left unfilled (a category didn't have enough qualifying
+             candidates to meet its quota) is topped up with the next-best
+             remaining candidates overall, regardless of category — a
+             shortfall in one category becomes extra room for whichever
+             category actually has the depth, rather than forcing in a weak
+             paper just to hit an exact ratio.
+
+        A linear "relevance vs. divergence" tradeoff was tried first and
+        rejected: at TOP_PAPERS_COUNT's list sizes there's no single weight
+        that both reaches the target ratio and refuses to trade a strong paper
+        for a near-zero-relevance one — the two goals pulled in opposite
+        directions at any weight tested. Explicit quotas plus a quality floor
+        get both without a fragile constant standing in for either.
+        """
+        if len(ranked) <= limit:
+            return ranked[:limit]
+
+        scores = [p.relevance_score or 0.0 for p in ranked]
+        lo, hi = min(scores), max(scores)
+        spread = hi - lo
+
+        def _norm(score: float) -> float:
+            return (score - lo) / spread if spread > 0 else 1.0
+
+        def _primary_category(paper: PaperData) -> str:
+            cats = getattr(paper, "categories", None) or []
+            return cats[0] if cats else "unknown"
+
+        # ── Quotas: largest-remainder rounding so they sum to exactly `limit` ──
+        raw_targets = {cat: p * limit for cat, p in target_dist.items()}
+        quotas = {cat: int(v) for cat, v in raw_targets.items()}
+        leftover_slots = limit - sum(quotas.values())
+        by_remainder = sorted(
+            raw_targets.items(), key=lambda kv: kv[1] - int(kv[1]), reverse=True
+        )
+        for cat, _ in by_remainder[:leftover_slots]:
+            quotas[cat] += 1
+
+        by_category: Dict[str, List[PaperData]] = {}
+        for p in ranked:  # already sorted best-first, so each bucket stays sorted
+            by_category.setdefault(_primary_category(p), []).append(p)
+
+        selected: List[PaperData] = []
+        selected_ids = set()
+
+        # ── Pass 1: each category's own best candidates, up to its quota ──────
+        for cat, quota in quotas.items():
+            qualifying = [
+                p for p in by_category.get(cat, [])
+                if _norm(p.relevance_score or 0.0) >= CALIBRATION_MIN_QUALITY
+            ]
+            for p in qualifying[:quota]:
+                selected.append(p)
+                selected_ids.add(id(p))
+
+        # ── Pass 2: top up any shortfall with the next-best candidates overall ─
+        if len(selected) < limit:
+            for p in ranked:
+                if len(selected) >= limit:
+                    break
+                if id(p) not in selected_ids:
+                    selected.append(p)
+                    selected_ids.add(id(p))
+
+        # Composition is now calibrated; display order still goes by relevance.
+        selected.sort(key=lambda p: p.relevance_score or 0.0, reverse=True)
+        selected = selected[:limit]
+
+        picked_counts: Dict[str, int] = {}
+        for p in selected:
+            cat = _primary_category(p)
+            picked_counts[cat] = picked_counts.get(cat, 0) + 1
+        logger.info(
+            f"Calibrated selection: target={ {k: round(v, 2) for k, v in target_dist.items()} }, "
+            f"quotas={quotas}, picked={picked_counts}"
+        )
+
+        # A category with a real target share but zero final representation means
+        # CALIBRATION_OVERSAMPLE_FACTOR wasn't wide enough for this request — the
+        # category's candidates never reached this function at all (they were cut
+        # by the ranking step's own top-K before calibration ran), as distinct
+        # from correctly finding no qualifying candidates within a wide-enough
+        # window. This is a heuristic window, not a guarantee; logging it is how
+        # that gap gets noticed instead of silently reverting to plain top-K.
+        starved = [cat for cat, share in target_dist.items() if share > 0 and picked_counts.get(cat, 0) == 0]
+        if starved:
+            logger.warning(
+                f"Calibration target category(ies) {starved} got zero representation — "
+                f"likely cut by ranking's own top-K before reaching calibration, not a "
+                f"lack of qualifying candidates. Consider raising CALIBRATION_OVERSAMPLE_FACTOR."
+            )
+        return selected
 
     def _fetch_papers_recommended_fallback(self, selected_interests: List[str]) -> List[PaperData]:
         """
@@ -707,11 +955,21 @@ class DailyFeedPipeline:
 
     # ── LLM user-profile query ────────────────────────────────────────────────
 
-    def _build_user_profile_query(self, redis_client=None) -> Optional[str]:
+    def _build_user_profile_query(self, interests_text: str = "", redis_client=None) -> Optional[str]:
         """
         Generate a 2-3 sentence research profile from the user's saved papers.
         Used as a richer ChromaDB query than a bare keyword list.
         Cached in Redis for 6 hours to avoid redundant LLM calls.
+
+        interests_text (the user's declared focus areas) is passed as context so
+        the profile doesn't describe only whatever narrow slice the saved papers
+        happen to cover. Without it, an LLM asked to summarize e.g. 8 NLP saves
+        has no way to know the user also declared interest in CV, and will
+        confidently write a profile that omits it entirely —
+        _compute_target_category_distribution() still catches this at final
+        selection either way, but a profile that isn't blind to declared scope
+        in the first place means fewer candidates get excluded before that
+        stage ever sees them.
         """
         cache_key = f"user_profile_query:{self.user_id}"
         if redis_client:
@@ -738,6 +996,13 @@ class DailyFeedPipeline:
             f"- {p.title}: {(p.abstract or '')[:150]}" for p in saved_papers[:8]
         )
 
+        interest_context = (
+            f"They have also stated interest in: {interests_text}. If the saved "
+            "papers below don't fully reflect that stated scope, still mention it "
+            "briefly rather than describing only the narrower pattern in the papers.\n\n"
+            if interests_text else ""
+        )
+
         try:
             from openai import OpenAI
             from src.utils.config import settings
@@ -747,6 +1012,7 @@ class DailyFeedPipeline:
                 messages=[{
                     "role": "user",
                     "content": (
+                        f"{interest_context}"
                         "Given these papers a researcher has saved, write a 2-3 sentence "
                         "research profile describing their interests (for use as a search query):\n\n"
                         f"{paper_snippets}\n\nProfile (plain text, no bullets):"
@@ -1560,7 +1826,7 @@ class DailyFeedPipeline:
 
         return items
     
-    def _store_results(self, papers: List[PaperData], articles: List):
+    def _store_results(self, papers: List[PaperData], articles: List, mode: str = "recommended", time_window_days: int = 7):
         """Store recommended items in database and vector DB"""
         now = datetime.now(timezone.utc)
 
@@ -1589,6 +1855,8 @@ class DailyFeedPipeline:
                     personalized_summary=paper_data.personalized_summary,
                     relevance_score=paper_data.relevance_score,
                     rank=rank,
+                    feed_mode=mode,
+                    feed_time_window_days=time_window_days,
                 ))
 
                 try:

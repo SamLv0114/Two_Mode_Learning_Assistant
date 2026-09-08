@@ -187,6 +187,8 @@ class UserPaperRecommendation(Base):
     personalized_summary = Column(Text, nullable=True)
     relevance_score = Column(Float, nullable=True)
     rank = Column(Integer, nullable=True)
+    feed_mode = Column(String, nullable=True)
+    feed_time_window_days = Column(Integer, nullable=True)
 
     __table_args__ = (
         Index('ix_user_paper_rec', 'user_id', 'paper_id', unique=True),
