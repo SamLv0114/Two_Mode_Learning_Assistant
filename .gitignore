@@ -82,3 +82,7 @@ tsconfig.tsbuildinfo
 plan.txt
 chroma_db/
 *.chroma
+
+# Local project context for Claude Code — stays out of the public repo,
+# still loads fine every session since it's kept at the project root.
+CLAUDE.md

@@ -47,6 +47,21 @@ class Settings(BaseSettings):
     MMR_LAMBDA: float = 0.7
     MMR_CANDIDATE_MULTIPLIER: int = 5
 
+    # RAG hybrid retrieval — BM25 + vector fusion (RRF) is always on, no flag
+    # needed since it degrades to vector-only on its own if rank_bm25 isn't
+    # installed. Cross-Encoder reranking crashed with a SIGBUS during local
+    # dev testing (macOS ARM64, torch 2.11.0) — root-caused via the macOS
+    # crash report to a conflict between Apple's Accelerate BLAS
+    # (libBLAS.dylib, what PyTorch calls into for nn.Linear on macOS) and
+    # NumPy/SciPy's bundled OpenBLAS both loaded in-process, under memory
+    # pressure (kernel log showed repeated "pmap_enter retried due to
+    # resource shortage" right before the crash) — a macOS-Accelerate-
+    # specific failure mode with no Linux equivalent (no Accelerate.framework
+    # there at all). Confirmed safe by running the exact CrossEncoder.predict
+    # call directly on the production container (Linux, python:3.11-slim):
+    # returned a real score, no crash. Enabled by default on that evidence.
+    RAG_RERANK_ENABLED: bool = True
+
     # Exploration settings
     EXPLORATION_RATE: float = 0.2
 
