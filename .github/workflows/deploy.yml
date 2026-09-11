@@ -100,3 +100,121 @@ jobs:
             echo "API failed health check after 45s — recent logs:"
             docker compose logs --tail=50 api
             exit 1
+samlv@MacBook-Air-von-Sam Learning_Assistant % cat ~/Dropbox/Learning_Assistant/.scratch/researchmate-key.pem | pbcopy
+
+samlv@MacBook-Air-von-Sam Learning_Assistant % cat /Users/samlv/Dropbox/Learning_Assistant/.github/workflows/deploy.yml
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Smoke test
+        # Gate the deploy. Both failures this catches — a stale import and an
+        # undeclared dependency — reached production before and stayed there,
+        # because the app still started and only failed at request time.
+        run: |
+          pip install -q -r requirements.txt
+          python tests/smoke.py -v
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Default is 10m — too short for a dependency-change rebuild of an
+          # ML-heavy image (torch, transformers, sentence-transformers). Hit
+          # this exactly once: build was mid-Step-9/13 when the action killed
+          # it at 10m6s.
+          command_timeout: 30m
+          script: |
+            set -e
+            cd ~/learning-assistant
+
+            # Record where we were so we can diff the whole push, not just the
+            # last commit. HEAD~1 misses changes when a push carries several
+            # commits — that silently skipped image rebuilds.
+            BEFORE=$(git rev-parse HEAD)
+            git pull origin master
+            AFTER=$(git rev-parse HEAD)
+
+            if [ "$BEFORE" = "$AFTER" ]; then
+              echo "Already up to date — nothing to deploy"
+              exit 0
+            fi
+
+            CHANGED=$(git diff --name-only "$BEFORE" "$AFTER")
+            echo "Changed files:"
+            echo "$CHANGED"
+
+            # ── API ────────────────────────────────────────────────────────
+            # No --no-cache: Dockerfile.api already COPYs requirements.txt
+            # before src/ specifically so Docker's own layer cache only
+            # reruns pip install when dependencies actually changed — torch's
+            # own RUN layer is untouched by a src/ or small requirements.txt
+            # change. --no-cache threw all of that away and reinstalled
+            # everything (including torch) on every dependency change, which
+            # is what blew through the SSH action's timeout in the first
+            # place.
+            if echo "$CHANGED" | grep -q "^requirements.txt\|^Dockerfile.api"; then
+              echo "Dependencies changed — rebuilding API image"
+              docker compose build api
+              docker compose up -d --force-recreate api
+            elif echo "$CHANGED" | grep -q "^src/"; then
+              echo "API code changed — restarting container"
+              docker compose restart api
+            else
+              echo "No API changes"
+            fi
+
+            # ── Frontend ───────────────────────────────────────────────────
+            # Next.js compiles at build time, so any frontend change needs a
+            # rebuild — restarting the container would serve the old bundle.
+            if echo "$CHANGED" | grep -q "^frontend/"; then
+              echo "Frontend changed — rebuilding image"
+              docker compose build frontend
+              docker compose up -d --force-recreate frontend
+            else
+              echo "No frontend changes"
+            fi
+
+            # ── Infrastructure ─────────────────────────────────────────────
+            if echo "$CHANGED" | grep -q "^docker-compose.yml\|^nginx/"; then
+              echo "Infrastructure changed — reconciling full stack"
+              docker compose up -d
+            fi
+
+            # ── Health gate ────────────────────────────────────────────────
+            # Fail the job on a bad deploy so it surfaces in Actions rather
+            # than sitting broken until someone opens the site.
+            # The api service publishes no host port (nginx proxies it), so the
+            # check runs inside the container.
+            echo "Waiting for API health..."
+            for i in $(seq 1 45); do
+              if docker exec learning_assistant_api \
+                   python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)" \
+                   > /dev/null 2>&1; then
+                echo "API healthy after ${i}s"
+                docker image prune -f
+                echo "Deploy complete"
+                exit 0
+              fi
+              sleep 1
+            done
+
+            echo "API failed health check after 45s — recent logs:"
+            docker compose logs --tail=50 api
+            exit 1
