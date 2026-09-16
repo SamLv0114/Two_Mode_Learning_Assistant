@@ -111,12 +111,13 @@ export default function Home() {
           </div>
 
           <h1 className="text-5xl sm:text-6xl font-extrabold text-white mb-6 leading-tight tracking-tight">
-            Your ML research feed,<br />
+            Your AI research feed,<br />
             <span className="text-primary-100">ranked by your own AI</span>
           </h1>
 
           <p className="text-lg sm:text-xl text-white/80 mb-10 max-w-2xl mx-auto leading-relaxed">
-            Personalized paper recommendations from ArXiv, a knowledge base you can ask questions to,
+            Personalized paper recommendations from ArXiv, spanning deep learning, LLMs, agents,
+            and the broader ML/data stack, plus a knowledge base you can ask questions to,
             and a learning-to-rank model that trains on your behavior.
           </p>
 
@@ -137,7 +138,7 @@ export default function Home() {
 
           {/* Social proof chips */}
           <div className="flex flex-wrap justify-center gap-3 mt-10">
-            {['20k+ papers indexed', 'ChromaDB HNSW retrieval', 'Personal LightGBM model', 'RAG Q&A'].map((t) => (
+            {['30k+ papers indexed', 'ChromaDB HNSW retrieval', 'Personal LightGBM model', 'RAG Q&A'].map((t) => (
               <span key={t} className="bg-white/15 border border-white/25 text-white/90 text-xs font-medium px-3.5 py-1.5 rounded-full backdrop-blur-sm">
                 {t}
               </span>
@@ -150,7 +151,7 @@ export default function Home() {
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-20">
         <div className="text-center mb-14">
           <p className="text-sm font-semibold text-primary-600 uppercase tracking-widest mb-3">What you get</p>
-          <h2 className="text-3xl sm:text-4xl font-bold text-gray-900">Built for ML researchers</h2>
+          <h2 className="text-3xl sm:text-4xl font-bold text-gray-900">Built for AI/ML researchers and engineers</h2>
         </div>
 
         <div className="grid md:grid-cols-3 gap-6">

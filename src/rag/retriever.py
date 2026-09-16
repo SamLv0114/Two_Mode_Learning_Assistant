@@ -45,16 +45,20 @@ class Retriever:
     _calibrate_top_k docstring). RRF sidesteps that by only using rank
     position, not raw score, so nothing needs tuning.
 
-    Cross-Encoder reranking (settings.RAG_RERANK_ENABLED, off by default) is
-    a further precision pass over the fused shortlist using real
-    query-document attention instead of precomputed embeddings. It is gated
-    off rather than always-on: in local dev testing it crashed the process
-    with a native SIGBUS on the simplest possible input (device="cpu"
-    explicitly set) — a failure mode try/except cannot catch, since no
-    Python exception is ever raised. Whether that's specific to this dev
-    machine (macOS ARM64, torch 2.11.0) or would also hit the Linux
-    production container (python:3.11-slim) was never confirmed — verify it
-    doesn't crash the actual deployment target before enabling it there.
+    Cross-Encoder reranking (settings.RAG_RERANK_ENABLED, on by default) is a
+    further precision pass over the fused shortlist using real
+    query-document attention instead of precomputed embeddings. It is behind
+    a flag rather than unconditional because in local dev testing it once
+    crashed the process with a native SIGBUS on the simplest possible input
+    (device="cpu" explicitly set) — a failure mode try/except cannot catch,
+    since no Python exception is ever raised. Root-caused to a macOS-only
+    Accelerate-BLAS-vs-bundled-OpenBLAS conflict under memory pressure (see
+    settings.RAG_RERANK_ENABLED's comment for the full diagnostic chain) —
+    confirmed safe by running the exact CrossEncoder.predict call directly on
+    the Linux production container (python:3.11-slim): returned a real
+    score, no crash. Enabled by default on that evidence; the flag stays so
+    it can be switched off again without a code change if a similar failure
+    ever surfaces on a different deployment target.
 
     The BM25 index and the reranker both degrade to vector-only automatically
     if their dependency is missing or fails to *load* (see
@@ -133,7 +137,10 @@ class Retriever:
             self._bm25_built_at = time.time()
             logger.info(f"BM25 index built: {len(ids)} documents")
 
-    def _bm25_search(self, query: str, n_results: int, filter_type: Optional[str]) -> List[Dict]:
+    def _bm25_search(
+        self, query: str, n_results: int, filter_type: Optional[str],
+        user_id: Optional[int] = None,
+    ) -> List[Dict]:
         self._ensure_bm25_index()
         if not self._bm25:
             return []
@@ -147,6 +154,11 @@ class Retriever:
                 break  # BM25Okapi scores sort descending; 0 means no term overlap at all
             meta = self._bm25_metas[i] or {}
             if filter_type and meta.get("type") != filter_type:
+                continue
+            # "user_doc" chunks are private per-user — never let one user's
+            # uploads surface in another user's BM25 results (mirrors the
+            # scoping EmbeddingManager.search applies on the vector side).
+            if meta.get("type") == "user_doc" and meta.get("user_id") != user_id:
                 continue
             results.append({
                 "id": self._bm25_doc_ids[i],
@@ -238,7 +250,7 @@ class Retriever:
 
     def retrieve(
         self, query: str, n_results: int = 5, filter_type: Optional[str] = None,
-        use_hybrid: bool = True,
+        use_hybrid: bool = True, user_id: Optional[int] = None,
     ) -> List[Dict]:
         """
         Retrieve relevant documents for a query.
@@ -248,9 +260,15 @@ class Retriever:
         original vector-only path. Cross-Encoder reranking on top of the
         fused list additionally requires settings.RAG_RERANK_ENABLED — see
         that setting's comment for why it isn't on by default.
+
+        user_id: requesting user's id, used to scope "user_doc" (private
+        upload) results to their owner — see EmbeddingManager.search. Pass it
+        on every user-facing call; only a trusted system/background path
+        should omit it.
         """
         vector_pool = self.embedding_manager.search(
-            query=query, n_results=RERANK_CANDIDATE_POOL, filter_type=filter_type
+            query=query, n_results=RERANK_CANDIDATE_POOL, filter_type=filter_type,
+            user_id=user_id,
         )
 
         if not use_hybrid:
@@ -258,7 +276,7 @@ class Retriever:
             logger.info(f"Retrieved {len(results)} documents (vector-only) for query: {query[:50]}...")
             return results
 
-        bm25_pool = self._bm25_search(query, RERANK_CANDIDATE_POOL, filter_type)
+        bm25_pool = self._bm25_search(query, RERANK_CANDIDATE_POOL, filter_type, user_id=user_id)
         fused = self._reciprocal_rank_fusion([vector_pool, bm25_pool])
 
         if settings.RAG_RERANK_ENABLED:
@@ -273,29 +291,3 @@ class Retriever:
             f"{len(bm25_pool)} bm25 -> {len(fused)} fused -> {stage}) for query: {query[:50]}..."
         )
         return results
-
-    def retrieve_with_scores(self, query: str, n_results: int = 5,
-                            min_score: float = 0.0) -> List[Dict]:
-        """
-        Retrieve documents with similarity scores.
-
-        Stays vector-only (use_hybrid=False): min_score is a cosine-similarity
-        threshold, which only means something against ChromaDB's own
-        distance metric — hybrid search's fused/reranked results don't carry
-        a comparable [0,1] similarity score to threshold against.
-        """
-        results = self.retrieve(query, n_results=n_results, use_hybrid=False)
-
-        # Filter by minimum score (distance is inverse of similarity)
-        filtered = []
-        for result in results:
-            # Convert distance to similarity (1 - distance for cosine)
-            if result.get("distance") is not None:
-                similarity = 1 - result["distance"]
-                if similarity >= min_score:
-                    result["similarity"] = similarity
-                    filtered.append(result)
-            else:
-                filtered.append(result)
-
-        return filtered

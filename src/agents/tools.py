@@ -26,6 +26,40 @@ logger = logging.getLogger(__name__)
 
 # ── Multi-query expansion helper ──────────────────────────────────────────────
 
+# Forced function call, not a prompt instruction — a soft "Return ONLY JSON"
+# ask occasionally comes back with a markdown fence or a leading sentence,
+# which broke json.loads() silently (caught below, degrading to [query] with
+# no visible error). Named required fields also remove the need to guess
+# whether the model returned 2 items, 1, or a dict. This schema is private to
+# this function — not registered in build_default_registry() — because
+# nothing ever chooses whether to call it; it isn't an agent-invokable action,
+# just a formatting constraint on this one call.
+_EXPAND_QUERY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "provide_query_variants",
+        "description": (
+            "Provide 2 short, semantically diverse search query variants, each "
+            "approaching the topic from a different angle (different keywords, "
+            "synonyms, or narrower scope)."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "variant_1": {"type": "string", "description": "First alternate phrasing"},
+                "variant_2": {
+                    "type": "string",
+                    "description": "Second alternate phrasing, from a different angle than variant_1",
+                },
+            },
+            "required": ["variant_1", "variant_2"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 def _expand_query(query: str) -> List[str]:
     """
     Generate 2 semantically diverse variants of a search query using gpt-4o-mini.
@@ -36,21 +70,18 @@ def _expand_query(query: str) -> List[str]:
         from src.utils.config import settings
 
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        prompt = (
-            f"Generate 2 short, semantically diverse search query variants for the following query.\n"
-            f"Each variant should approach the topic from a different angle (e.g. different keywords,\n"
-            f"synonyms, or narrower scope). Return ONLY a JSON array of 2 strings, no explanation.\n\n"
-            f"Query: {query}"
-        )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": f"Query: {query}"}],
             max_tokens=128,
             temperature=0.4,
+            tools=[_EXPAND_QUERY_TOOL],
+            tool_choice={"type": "function", "function": {"name": "provide_query_variants"}},
         )
-        variants = json.loads(resp.choices[0].message.content.strip())
-        if isinstance(variants, list) and len(variants) >= 2:
-            return [query] + [str(v) for v in variants[:2]]
+        call = resp.choices[0].message.tool_calls[0]
+        args = json.loads(call.function.arguments)
+        variants = [args["variant_1"], args["variant_2"]]
+        return [query] + variants
     except Exception as e:
         logger.debug(f"_expand_query failed: {e}")
     return [query]
@@ -181,6 +212,42 @@ SEARCH_WEB = {
     },
 }
 
+FETCH_FULL_PAPER = {
+    "type": "function",
+    "function": {
+        "name": "fetch_full_paper",
+        "description": (
+            "Search the FULL TEXT of one specific arXiv paper, not just its abstract. "
+            "search_knowledge_base only ever has a paper's title+abstract indexed — use "
+            "this instead when the question needs something only the paper's body has: "
+            "exact experimental numbers, ablation results, methodology/implementation "
+            "details, equations, or discussion nuances. Downloads and parses the paper's "
+            "PDF on first use for a given paper (slower, cached after that) then searches "
+            "within it. Requires the paper's arXiv ID — get it from search_knowledge_base "
+            "or get_personalized_feed results first if you don't already have it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "arxiv_id": {
+                    "type": "string",
+                    "description": "The arXiv ID of the paper, e.g. '2401.09876'",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "What to look for within the paper's full text",
+                },
+                "n_results": {
+                    "type": "integer",
+                    "description": "Number of matching passages to return (1-10)",
+                    "default": 5,
+                },
+            },
+            "required": ["arxiv_id", "query"],
+        },
+    },
+}
+
 SAVE_NOTE = {
     "type": "function",
     "function": {
@@ -242,13 +309,14 @@ def _exec_search_knowledge_base(args: Dict[str, Any], context: Dict) -> Dict:
         query = args["query"]
         n = args.get("n_results", 5)
         filter_type = args.get("filter_type")
+        user_id = context["user"].id
 
         queries = _expand_query(query)
         seen_ids: set = set()
         merged: List[Dict] = []
 
         for q in queries:
-            batch = retriever.retrieve(query=q, n_results=n, filter_type=filter_type)
+            batch = retriever.retrieve(query=q, n_results=n, filter_type=filter_type, user_id=user_id)
             for r in batch:
                 # Deduplicate on ChromaDB document id (stored in metadata or use title)
                 doc_id = r.get("id") or r.get("metadata", {}).get("paper_id") or r.get("metadata", {}).get("title", "")
@@ -374,6 +442,7 @@ def _exec_search_user_documents(args: Dict[str, Any], context: Dict) -> Dict:
             query=args["query"],
             n_results=args.get("n_results", 5),
             filter_type="user_doc",
+            user_id=context["user"].id,
         )
         return {
             "results": [
@@ -387,6 +456,74 @@ def _exec_search_user_documents(args: Dict[str, Any], context: Dict) -> Dict:
         }
     except Exception as e:
         logger.error(f"search_user_documents error: {e}")
+        return {"error": str(e), "results": [], "count": 0}
+
+
+# Post-hoc size guard on the downloaded PDF — arXiv papers are almost always
+# a few hundred KB to a few MB; this only exists to stop a pathological
+# response (or the wrong URL entirely) from parsing/embedding something huge.
+MAX_FULLTEXT_PDF_BYTES = 25 * 1024 * 1024
+
+
+def _exec_fetch_full_paper(args: Dict[str, Any], context: Dict) -> Dict:
+    """
+    Fetch (first call per paper) or reuse (cached) one paper's full text,
+    then run a targeted vector search over it.
+
+    Deliberately separate from search_knowledge_base: EmbeddingManager.add_paper
+    only ever stores title+abstract for papers, so there is nothing beyond the
+    abstract for that tool to find no matter how the query is phrased. This
+    tool is the explicit, opt-in escape hatch — it costs a PDF download+parse
+    on first use (bounded by this tool's own longer registry timeout, see
+    build_default_registry), so the agent should only reach for it once
+    search_knowledge_base's abstract-level context has actually run dry.
+    """
+    try:
+        import requests
+        from src.database.models import Paper
+        from src.utils.preprocessing import extract_text_from_pdf
+
+        db = context["db"]
+        embedding_manager = context["embedding_manager"]
+        arxiv_id = args["arxiv_id"].strip()
+        query = args["query"]
+        n_results = min(args.get("n_results", 5), 10)
+
+        paper = db.query(Paper).filter(Paper.arxiv_id == arxiv_id).first()
+        title = paper.title if paper else arxiv_id
+        pdf_url = (paper.pdf_url if paper else None) or f"https://arxiv.org/pdf/{arxiv_id}"
+
+        if not embedding_manager.has_paper_fulltext(arxiv_id):
+            resp = requests.get(pdf_url, timeout=25, headers={"User-Agent": "ResearchMate/1.0"})
+            resp.raise_for_status()
+            if len(resp.content) > MAX_FULLTEXT_PDF_BYTES:
+                return {"error": "PDF too large to process", "results": [], "count": 0}
+
+            full_text = extract_text_from_pdf(resp.content)
+            if not full_text:
+                return {"error": "Could not extract text from this paper's PDF", "results": [], "count": 0}
+
+            n_chunks = embedding_manager.add_paper_fulltext(
+                arxiv_id, title, full_text,
+                metadata={"arxiv_id": arxiv_id, "title": title, "url": pdf_url},
+            )
+            logger.info(f"fetch_full_paper: fetched and cached {n_chunks} chunks for {arxiv_id}")
+
+        hits = embedding_manager.search_paper_fulltext(arxiv_id, query, n_results=n_results)
+        return {
+            "results": [
+                {
+                    "content": h.get("document", "")[:800],
+                    "chunk_index": h.get("metadata", {}).get("chunk_index"),
+                }
+                for h in hits
+            ],
+            "count": len(hits),
+            "title": title,
+            "arxiv_id": arxiv_id,
+        }
+    except Exception as e:
+        logger.error(f"fetch_full_paper error: {e}")
         return {"error": str(e), "results": [], "count": 0}
 
 
@@ -474,6 +611,9 @@ def build_default_registry():
         reg.register(GET_PERSONALIZED_FEED, _exec_get_personalized_feed)
         reg.register(LIST_USER_DOCUMENTS, _exec_list_user_documents)
         reg.register(SEARCH_USER_DOCUMENTS, _exec_search_user_documents)
+        # Longer timeout: first call for a given paper downloads + parses a PDF,
+        # not just a local vector/DB lookup like every other tool here.
+        reg.register(FETCH_FULL_PAPER, _exec_fetch_full_paper, timeout=40)
         reg.register(SEARCH_WEB, _exec_search_web)
         reg.register(SAVE_NOTE, _exec_save_note)
         reg.register(GET_NOTE, _exec_get_note)

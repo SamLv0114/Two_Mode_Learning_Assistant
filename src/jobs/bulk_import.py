@@ -34,7 +34,10 @@ logger = logging.getLogger(__name__)
 _S2_BASE = "https://api.semanticscholar.org"
 _EMBED_BATCH_SIZE = 200
 
-# Broad queries covering all major ML/AI subfields.
+# Broad queries covering all major ML/AI subfields, kept in sync with
+# settings.ARXIV_CATEGORIES: DL/LLM/agents/optimization plus the
+# AI-engineer / data-engineer / data-scientist adjacent subfields (RAG &
+# retrieval, distributed/large-scale training, applied optimization).
 # Overlap between queries is intentional — duplicates are removed after fetching.
 SEARCH_QUERIES = [
     "machine learning",
@@ -57,6 +60,14 @@ SEARCH_QUERIES = [
     "federated learning privacy",
     "neural architecture search",
     "recommendation system collaborative filtering",
+    "large language model agent autonomous",
+    "multi-agent reinforcement learning",
+    "retrieval augmented generation",
+    "prompt engineering in-context learning",
+    "convex optimization gradient descent",
+    "distributed training large scale",
+    "vector database similarity search",
+    "information retrieval ranking",
 ]
 
 

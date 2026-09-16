@@ -52,11 +52,11 @@ class PlanAndSolveAgent(BaseAgent):
     """
 
     name = "PlanAndSolveAgent"
-    system_prompt = "You are a structured analytical assistant for an ML research platform."
+    system_prompt = "You are a structured analytical assistant for a platform focused on deep learning, LLMs, and AI agents."
     tool_schemas = []   # each phase uses its own tools
 
     _PLAN_PROMPT = """\
-You are an analytical planning assistant for a machine learning research platform.
+You are an analytical planning assistant for a research platform focused on deep learning, LLMs, and AI agents.
 
 Break the following analytical question into 3–5 structured analysis steps.
 Each step should be a specific analytical action: define, compare, evaluate, analyse.
@@ -200,7 +200,7 @@ Be precise and directly answer the original question."""
             resp = self.client.chat.completions.create(
                 model=PLANNER_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a senior ML research writer."},
+                    {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents."},
                     {"role": "user", "content": self._SYNTHESIZE_PROMPT.format(
                         question=question,
                         steps_and_results=steps_text[:4000],
@@ -270,7 +270,7 @@ Be precise and directly answer the original question."""
             stream = self.client.chat.completions.create(
                 model=PLANNER_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a senior ML research writer."},
+                    {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents."},
                     {"role": "user", "content": self._SYNTHESIZE_PROMPT.format(
                         question=message,
                         steps_and_results=steps_text[:4000],

@@ -30,9 +30,9 @@ class UserRecommender:
     """
 
     FEATURE_NAMES = [
-        "similarity", "recency", "impact", "category", "source",
+        "similarity", "recency", "impact", "category",
         "title_length", "content_length", "readability", "has_code",
-        "is_survey", "novelty", "venue", "author_reputation",
+        "is_survey", "novelty", "citation_velocity",
     ]
 
     def __init__(self, user_id: int, db: Session):
@@ -249,11 +249,18 @@ class UserRecommender:
             # Fallback to impact score
             return features.get('impact', 0.0)
 
-        # Compute weighted sum
+        # Compute weighted sum. citation_velocity can be NaN (paper too new
+        # for citation data to mean anything — see feature_extractor.py) —
+        # a plain np.dot would let that single NaN poison the whole score,
+        # so missing features are excluded from the sum rather than
+        # treated as 0, which is what LightGBM does natively but this plain
+        # dot product does not get for free.
         feature_vec = np.array([
             features.get(name, 0.0) for name in self.feature_names
         ])
-        score = np.dot(self.heuristic_weights, feature_vec)
+        weights = np.asarray(self.heuristic_weights)
+        valid = ~np.isnan(feature_vec)
+        score = float(np.dot(weights[valid], feature_vec[valid])) if valid.any() else 0.0
 
         # Apply sigmoid to bound to [0, 1]
         score = 1.0 / (1.0 + np.exp(-score))

@@ -5,7 +5,7 @@ import { Toaster } from 'react-hot-toast';
 
 export const metadata: Metadata = {
   title: 'Learning Assistant',
-  description: 'Personalized ML research recommendations and Q&A',
+  description: 'Personalized AI research recommendations and Q&A, spanning deep learning, LLMs, agents, and more',
 };
 
 export default function RootLayout({

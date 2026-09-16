@@ -25,9 +25,9 @@ class UserModelTrainer:
     """
 
     FEATURE_NAMES = [
-        "similarity", "recency", "impact", "category", "source",
+        "similarity", "recency", "impact", "category",
         "title_length", "content_length", "readability", "has_code",
-        "is_survey", "novelty", "venue", "author_reputation",
+        "is_survey", "novelty", "citation_velocity",
     ]
 
     def __init__(self, user_id: int, db: Session, embedding_manager: EmbeddingManager):
@@ -152,17 +152,13 @@ class UserModelTrainer:
         # Get user interests
         user_interests = self._get_user_interests()
 
-        # Get all items recommended to this user
+        # Get all papers recommended to this user. Articles are excluded —
+        # the Article subsystem is retired and nothing writes new
+        # UserArticleRecommendation rows anymore.
         recommended_papers = (
             self.db.query(Paper)
             .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
             .filter(UserPaperRecommendation.user_id == self.user_id)
-            .all()
-        )
-        recommended_articles = (
-            self.db.query(Article)
-            .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
-            .filter(UserArticleRecommendation.user_id == self.user_id)
             .all()
         )
 
@@ -190,34 +186,13 @@ class UserModelTrainer:
         recent_paper_texts = self._get_recent_texts("paper")
         for paper in recommended_papers:
             features = self.feature_extractor.extract_features(
-                paper, "paper", self.embedding_manager, user_interests,
+                paper, self.embedding_manager, user_interests,
                 recent_texts=recent_paper_texts,
             )
 
             X_list.append([features.get(name, 0.0) for name in self.FEATURE_NAMES])
 
             key = ("paper", paper.id)
-            if key in interaction_scores:
-                y_list.append(interaction_scores[key])
-            elif settings.INCLUDE_IMPLICIT_NEGATIVES:
-                if np.random.rand() <= settings.IMPLICIT_NEGATIVE_SAMPLE_RATE:
-                    y_list.append(0.0)
-                else:
-                    X_list.pop()
-            else:
-                X_list.pop()
-
-        # Process articles
-        recent_article_texts = self._get_recent_texts("article")
-        for article in recommended_articles:
-            features = self.feature_extractor.extract_features(
-                article, "article", self.embedding_manager, user_interests,
-                recent_texts=recent_article_texts,
-            )
-
-            X_list.append([features.get(name, 0.0) for name in self.FEATURE_NAMES])
-
-            key = ("article", article.id)
             if key in interaction_scores:
                 y_list.append(interaction_scores[key])
             elif settings.INCLUDE_IMPLICIT_NEGATIVES:
@@ -262,12 +237,6 @@ class UserModelTrainer:
             .filter(UserPaperRecommendation.user_id == self.user_id)
             .all()
         )
-        article_recs = (
-            self.db.query(Article, UserArticleRecommendation.recommended_date)
-            .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
-            .filter(UserArticleRecommendation.user_id == self.user_id)
-            .all()
-        )
 
         interaction_scores = {}
         for interaction in interactions:
@@ -284,7 +253,6 @@ class UserModelTrainer:
                 interaction_scores[key] = score
 
         recent_paper_texts = self._get_recent_texts("paper")
-        recent_article_texts = self._get_recent_texts("article")
 
         # Group by week using per-user recommended_date from junction table
         grouped_items = {}
@@ -292,13 +260,7 @@ class UserModelTrainer:
             if not rec_date:
                 continue
             group_key = (rec_date.isocalendar()[0], rec_date.isocalendar()[1])
-            grouped_items.setdefault(group_key, []).append(("paper", paper))
-
-        for article, rec_date in article_recs:
-            if not rec_date:
-                continue
-            group_key = (rec_date.isocalendar()[0], rec_date.isocalendar()[1])
-            grouped_items.setdefault(group_key, []).append(("article", article))
+            grouped_items.setdefault(group_key, []).append(paper)
 
         if not grouped_items:
             logger.warning(f"User {self.user_id}: No grouped recommendations")
@@ -315,16 +277,15 @@ class UserModelTrainer:
         for group_key in sorted_group_keys:
             items = grouped_items[group_key]
 
-            for item_type, item in items:
-                recent = recent_paper_texts if item_type == "paper" else recent_article_texts
+            for item in items:
                 features = self.feature_extractor.extract_features(
-                    item, item_type, self.embedding_manager, user_interests,
-                    recent_texts=recent,
+                    item, self.embedding_manager, user_interests,
+                    recent_texts=recent_paper_texts,
                 )
 
                 feature_vec = [features.get(name, 0.0) for name in self.FEATURE_NAMES]
 
-                key = (item_type, item.id)
+                key = ("paper", item.id)
                 if key in interaction_scores:
                     current_group_x.append(feature_vec)
                     current_group_y.append(interaction_scores[key])

@@ -87,12 +87,15 @@ def _is_complex_query(message: str) -> bool:
 class GeneralAgent(BaseAgent):
     name = "GeneralAgent"
     system_prompt = """\
-You are a helpful assistant for a machine learning research platform.
+You are a helpful assistant for a platform focused on deep learning, LLMs, and AI agents.
 
-This platform helps researchers:
+This platform helps researchers and engineers working in this space:
 - Discover personalized paper and article recommendations
-- Ask questions about ML concepts (RAG-powered Q&A)
+- Ask questions about DL/LLM/agent concepts (RAG-powered Q&A)
 - Manage an uploaded document knowledge base
+
+It's also useful for AI/data-engineering-adjacent work — MLOps, data pipelines, and
+applied optimization show up in the feed and search results too.
 
 You can search the web for current information when needed.
 Answer general questions concisely. For capability questions, explain what the platform \
@@ -175,15 +178,17 @@ class AgentRouter:
                 logger.warning(f"PlanAndSolveAgent unavailable: {e}")
         return self._plan_agent or self._get_research_agent()
 
-    def _select_research_agent(self, message: str, streaming: bool = False) -> BaseAgent:
+    def _select_research_agent(self, message: str) -> BaseAgent:
         """Pick the right research_qa agent based on query characteristics."""
         if _is_analytical_query(message):
             return self._get_plan_agent()
         if _is_complex_query(message):
             return self._get_deep_agent()
-        # Simple path: streaming uses plain ResearchAgent (lower latency);
-        # non-streaming uses ReflectionAgent (quality improvement).
-        return self._get_research_agent() if streaming else self._get_reflection_agent()
+        # Simple path: always ReflectionAgent now. Its stream() runs the
+        # full generate/critique/refine loop and emits its own progress
+        # events, so streaming no longer needs a separate lower-latency
+        # fallback to plain ResearchAgent (see reflection_agent.py).
+        return self._get_reflection_agent()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -202,7 +207,7 @@ class AgentRouter:
         logger.info(f"Routing → intent='{intent}', method='{method}', conf={confidence:.2f}")
 
         if intent == Intent.RESEARCH_QA:
-            agent = self._select_research_agent(message, streaming=False)
+            agent = self._select_research_agent(message)
         else:
             agent = self._get_agent(intent)
 
@@ -220,7 +225,7 @@ class AgentRouter:
         intent, confidence, method = self.recognizer.recognize(message)
 
         if intent == Intent.RESEARCH_QA:
-            agent = self._select_research_agent(message, streaming=True)
+            agent = self._select_research_agent(message)
         else:
             agent = self._get_agent(intent)
 

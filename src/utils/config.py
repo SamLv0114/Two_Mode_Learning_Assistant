@@ -1,12 +1,30 @@
 """
 Configuration settings for the AI Learning Assistant
 """
+import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
 from typing import List, Optional
 import logging
 import secrets
+
+# Some local dev machines' Python has no default CA bundle configured at all
+# (ssl.get_default_verify_paths().cafile is None), so any HTTPS call made via
+# stdlib urllib — HotNewsCollector's HuggingFace/GitHub fetches, feedparser's
+# ArXiv RSS fetches — fails with CERTIFICATE_VERIFY_FAILED and is swallowed
+# by those callers' own graceful-degradation try/except, silently returning
+# empty results instead of erroring loudly. Setting SSL_CERT_FILE from an
+# .env value doesn't fix this: pydantic-settings reads .env into this Settings
+# object's own fields, it does not mirror unrecognized keys into os.environ,
+# which is what the ssl module actually reads from. setdefault() here so an
+# environment that already has this set (e.g. the Linux production container,
+# which doesn't need it) is left alone.
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:
+    pass
 
 
 class Settings(BaseSettings):
@@ -31,7 +49,31 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     # ArXiv settings
-    ARXIV_CATEGORIES: List[str] = ["cs.LG", "cs.AI", "cs.CV", "cs.CL", "cs.NE"]
+    # Focus: DL / LLM / agents / optimization, plus AI-engineer / data-engineer /
+    # data-scientist adjacent subfields (RAG & search, distributed systems,
+    # databases, applied stats), deliberately broader than "pure ML" so the
+    # feed also surfaces infra, systems, and applied-stats work those roles
+    # care about, not just algorithms research.
+    ARXIV_CATEGORIES: List[str] = [
+        "cs.LG",     # Machine Learning
+        "cs.AI",     # Artificial Intelligence
+        "cs.CV",     # Computer Vision
+        "cs.CL",     # Computation and Language (NLP / LLMs)
+        "cs.NE",     # Neural and Evolutionary Computing
+        "cs.MA",     # Multiagent Systems
+        "cs.IR",     # Information Retrieval (RAG, search, recommendation)
+        "cs.RO",     # Robotics (embodied agents)
+        "cs.SE",     # Software Engineering (agentic coding, LLM4SE)
+        "cs.DC",     # Distributed, Parallel, and Cluster Computing (AI infra / big data)
+        "cs.DB",     # Databases (data engineering)
+        "cs.SI",     # Social and Information Networks
+        "cs.CY",     # Computers and Society (AI policy/safety)
+        "cs.CR",     # Cryptography and Security (AI/ML security)
+        "stat.ML",   # Machine Learning (Statistics)
+        "stat.AP",   # Statistics - Applications
+        "math.OC",   # Optimization and Control
+        "eess.AS",   # Audio and Speech Processing
+    ]
     MAX_PAPERS_PER_DAY: int = 15
 
     # Recommendation settings
@@ -66,7 +108,8 @@ class Settings(BaseSettings):
     EXPLORATION_RATE: float = 0.2
 
     # Novelty settings
-    NOVELTY_LOOKBACK_DAYS: int = 14
+    NOVELTY_LOOKBACK_DAYS: int = 14   # explicit "dismissed" papers stay excluded this long
+    SHOWN_LOOKBACK_DAYS: int = 1      # merely-shown-no-reaction papers get a much shorter cooldown
     NOVELTY_MAX_ITEMS: int = 10
 
     # Implicit feedback handling
@@ -149,10 +192,10 @@ class Settings(BaseSettings):
             return [item.strip() for item in self.USER_INTERESTS_STR.split(",") if item.strip()]
         # Default values
         return [
-            "machine learning",
             "deep learning",
-            "natural language processing",
-            "computer vision",
+            "large language models",
+            "AI agents",
+            "machine learning",
             "reinforcement learning"
         ]
 

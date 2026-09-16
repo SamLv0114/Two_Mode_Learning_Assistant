@@ -52,7 +52,7 @@ export default function LoginPage() {
         {/* Headline + bullets */}
         <div className="relative z-10 space-y-7">
           <h2 className="text-white text-4xl font-bold leading-tight">
-            Your personalized<br />ML research companion
+            Your personalized<br />AI research companion
           </h2>
           <ul className="space-y-3.5">
             {[

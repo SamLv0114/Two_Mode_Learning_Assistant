@@ -6,12 +6,15 @@ import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import toast from 'react-hot-toast';
 
-const FOCUS_OPTIONS = ['ML', 'NLP', 'CV', 'AI', 'DL'];
+const FOCUS_OPTIONS = ['DL', 'LLM', 'Agent', 'ML', 'AI', 'NLP', 'CV'];
+// Kept in sync with the backend fallback in settings.USER_INTERESTS
+// (src/utils/config.py). This is what a new user's profile is seeded
+// with if they don't pick their own interests below.
 const DEFAULT_INTERESTS = [
-  'machine learning',
   'deep learning',
-  'natural language processing',
-  'computer vision',
+  'large language models',
+  'AI agents',
+  'machine learning',
   'reinforcement learning',
 ];
 
@@ -105,7 +108,7 @@ export default function RegisterPage() {
           </h2>
           <ul className="space-y-3.5">
             {[
-              'Get a personalized feed of ML papers every day',
+              'Get a personalized feed of AI/ML papers every day',
               'Your model trains on your saves — gets smarter over time',
               'Chat with an AI agent over your research documents',
             ].map((text) => (

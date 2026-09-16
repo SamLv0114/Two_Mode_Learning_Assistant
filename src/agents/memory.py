@@ -104,7 +104,7 @@ class UserFactMemory:
     _DECAY_BASE = 0.95  # per 30-day period
 
     _EXTRACT_PROMPT = """\
-You are a memory extraction agent for an ML research assistant.
+You are a memory extraction agent for a research assistant.
 
 Given the following conversation exchange, extract any facts about the user that
 would help personalise future responses. Focus on:
@@ -117,10 +117,42 @@ would help personalise future responses. Focus on:
 User message: {user_msg}
 Assistant response: {assistant_msg}
 
-Return a JSON array of concise fact strings (max 3 items).
-Return [] if this exchange reveals nothing new and useful about the user.
-Each fact must start with "user" (e.g. "user is studying LoRA fine-tuning").
-No markdown fences. Only the JSON array."""
+Extract 0 to 3 concise facts. Each fact must start with "user"
+(e.g. "user is studying LoRA fine-tuning"). If this exchange reveals nothing
+new and useful about the user, extract no facts."""
+
+    # Forced function call instead of a "Return JSON only" prompt instruction
+    # + json.loads — the prompt-only version silently degraded to "extracted
+    # nothing" whenever the model added a fence or a lead-in sentence, since
+    # json.loads() raised and the except below swallowed it. Private to this
+    # class, not registered as an agent-invokable tool — nothing ever chooses
+    # whether to call it, it only exists to constrain this call's output shape.
+    _EXTRACT_FACTS_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "extract_user_facts",
+            "description": (
+                "Record 0 to 3 concise facts about the user extracted from this "
+                "conversation exchange, for personalizing future responses."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "facts": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "description": "A concise fact starting with 'user', e.g. 'user is studying LoRA fine-tuning'",
+                        },
+                        "description": "0 to 3 facts; empty if nothing new and useful was revealed",
+                    },
+                },
+                "required": ["facts"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
     def __init__(self):
         self._client: Optional[OpenAI] = None
@@ -161,6 +193,74 @@ No markdown fences. Only the JSON array."""
             except Exception:
                 pass
         self._fallback[user_id] = facts
+
+    # Common function words stripped before computing word overlap for the
+    # "update vs distinct" judgment below. Every extracted fact starts with
+    # "user" and shares template words like "is"/"was" regardless of topic —
+    # without stripping these, two facts about unrelated topics (e.g. "user
+    # is studying rl" vs "user is studying rlhf") can share enough boilerplate
+    # tokens to look like the same topic by raw overlap alone, even though
+    # the actual content words ("rl" vs "rlhf") don't overlap at all.
+    _STOPWORDS = frozenset({
+        "user", "users", "is", "are", "was", "were", "be", "been", "a", "an",
+        "the", "of", "to", "in", "on", "at", "for", "with", "and", "or",
+        "but", "this", "that", "these", "those", "their", "user's", "over",
+    })
+
+    @staticmethod
+    def _tokens(text: str) -> List[str]:
+        return text.lower().split()
+
+    @staticmethod
+    def _contains_sublist(haystack: List[str], needle: List[str]) -> bool:
+        """Whether needle appears as a contiguous run inside haystack."""
+        n, m = len(haystack), len(needle)
+        if m == 0 or m > n:
+            return False
+        return any(haystack[i:i + m] == needle for i in range(n - m + 1))
+
+    @classmethod
+    def _classify_fact_relation(cls, new_fact: str, existing_fact: str) -> str:
+        """
+        Classify how a new fact relates to an existing one, for merge purposes.
+
+        Word-boundary aware — unlike a raw substring check (the previous
+        approach), which false-positives whenever one fact's text happens to
+        be a literal character prefix of another's, e.g. "user is studying rl"
+        is a substring of "user is studying rlhf" even though "rl" and "rlhf"
+        are different topics; token-level comparison doesn't make that
+        mistake since "rl" != "rlhf" as tokens.
+
+        Returns one of:
+          "duplicate"   — identical tokens, nothing to do
+          "supersedes"  — new fact's tokens contain the existing fact's tokens
+                          plus more (new is a more detailed version) -> replace
+          "redundant"   — existing fact's tokens already contain the new
+                          fact's tokens (new adds nothing) -> drop new
+          "update"      — high word overlap without containment either way —
+                          same topic, but not a strict refinement (e.g. a
+                          preference that changed) -> replace old with new
+          "distinct"    — unrelated -> keep both
+        """
+        new_tokens = cls._tokens(new_fact)
+        old_tokens = cls._tokens(existing_fact)
+        if new_tokens == old_tokens:
+            return "duplicate"
+        if cls._contains_sublist(new_tokens, old_tokens):
+            return "supersedes"
+        if cls._contains_sublist(old_tokens, new_tokens):
+            return "redundant"
+
+        # Content-word overlap only (see _STOPWORDS) — otherwise shared
+        # boilerplate ("user", "is") alone can push unrelated facts over the
+        # threshold, as it did for "user is studying rl" vs "...studying rlhf"
+        # during testing before this filter was added.
+        new_content = {t for t in new_tokens if t not in cls._STOPWORDS}
+        old_content = {t for t in old_tokens if t not in cls._STOPWORDS}
+        overlap = len(new_content & old_content)
+        union = len(new_content | old_content)
+        jaccard = overlap / union if union else 0.0
+        return "update" if jaccard >= 0.5 else "distinct"
 
     def _decay_weight(self, fact: Dict) -> float:
         """Compute temporal decay weight: 0.95^(days_since_creation / 30)."""
@@ -203,11 +303,16 @@ No markdown fences. Only the JSON array."""
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=256,
                 temperature=0.0,
+                tools=[self._EXTRACT_FACTS_TOOL],
+                tool_choice={"type": "function", "function": {"name": "extract_user_facts"}},
             )
-            text = response.choices[0].message.content.strip()
-            new_facts: List[str] = json.loads(text)
+            call = response.choices[0].message.tool_calls[0]
+            args = json.loads(call.function.arguments)
+            new_facts = args.get("facts", [])
             if not isinstance(new_facts, list):
                 return []
+            # Schema can't enforce a string-prefix pattern or a max item count
+            # under strict mode — keep these as a defensive filter, same as before.
             new_facts = [f for f in new_facts if isinstance(f, str) and f.startswith("user")][:3]
         except Exception as e:
             logger.debug(f"UserFactMemory extraction failed: {e}")
@@ -224,8 +329,29 @@ No markdown fences. Only the JSON array."""
         merged = list(existing)
         for fd in new_fact_dicts:
             fact_text = fd["fact"]
-            if not any(fact_text.lower() in e["fact"].lower() or e["fact"].lower() in fact_text.lower() for e in merged):
+            action = "add"
+            replace_idx = None
+            for i, e in enumerate(merged):
+                if e.get("negative"):
+                    continue  # dismiss-reason facts aren't merged against topic facts
+                relation = self._classify_fact_relation(fact_text, e["fact"])
+                if relation in ("duplicate", "redundant"):
+                    action = "skip"
+                    break
+                if relation in ("supersedes", "update"):
+                    # "supersedes": new fact is a more detailed version of an
+                    # existing one. "update": same topic, high word overlap,
+                    # but not a strict refinement — most often a preference
+                    # that changed (e.g. "wants theory" -> "wants code
+                    # examples") rather than two things both worth keeping.
+                    action = "replace"
+                    replace_idx = i
+                    break
+            if action == "add":
                 merged.append(fd)
+            elif action == "replace":
+                merged[replace_idx] = fd
+            # action == "skip": new fact adds nothing, drop it
 
         # V4: trim by decay weight (drop lowest-weight / oldest facts first)
         if len(merged) > MAX_FACTS:

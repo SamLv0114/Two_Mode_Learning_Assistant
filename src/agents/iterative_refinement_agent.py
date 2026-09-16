@@ -28,7 +28,7 @@ MAX_ROUNDS = 3
 EVAL_THRESHOLD = 0.70
 
 _EVALUATOR_PROMPT = """\
-You are an expert ML paper feed curator. Evaluate this list of recommended papers \
+You are an expert paper feed curator. Evaluate this list of recommended papers \
 for a researcher and return a quality score from 0.0 to 1.0.
 
 Reading profile: {mode}
@@ -81,7 +81,7 @@ class IterativeRefinementAgent:
         improved, so a refinement that made things worse was returned alongside the
         better round's score.
         """
-        interests_str = ", ".join(user_interests[:8]) if user_interests else "ML research"
+        interests_str = ", ".join(user_interests[:8]) if user_interests else "deep learning, LLMs, and AI agents"
 
         current = list(papers)
         best_papers, best_score = list(papers), -1.0

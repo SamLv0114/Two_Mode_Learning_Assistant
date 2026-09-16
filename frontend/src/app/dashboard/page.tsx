@@ -13,7 +13,7 @@ import {
 import toast from 'react-hot-toast';
 import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send, Sparkles, Flame } from 'lucide-react';
 
-const AVAILABLE_AREAS = ['ML', 'NLP', 'CV', 'AI', 'DL'];
+const AVAILABLE_AREAS = ['DL', 'LLM', 'Agent', 'ML', 'AI', 'NLP', 'CV'];
 const EXAMPLE_INTERESTS = [
   'machine learning and deep learning',
   'natural language processing and transformers',
@@ -1176,7 +1176,11 @@ interface ChatMessage {
   citations?: { title: string; url: string; type: string }[];
   isStreaming?: boolean;
   researchPlan?: ResearchTask[];
+  reflectionStage?: 'critiquing' | 'refining';
+  reflectionScore?: number;
 }
+
+const CHAT_SESSION_STORAGE_KEY = 'chat_session_id';
 
 /* ── Agent Chat ── */
 function AgentChat({
@@ -1189,7 +1193,9 @@ function AgentChat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(() =>
+    typeof window !== 'undefined' ? localStorage.getItem(CHAT_SESSION_STORAGE_KEY) : null
+  );
   const [showKB, setShowKB] = useState(false);
   const [kbDocs, setKbDocs] = useState<any[]>([]);
   const [isUploading, setIsUploading] = useState(false);
@@ -1207,6 +1213,45 @@ function AgentChat({
       abortRef.current?.abort();
     };
   }, []);
+
+  // Restore the previous conversation on mount (page refresh, or switching
+  // back to this tab after AgentChat was unmounted) using whatever
+  // session_id survived in localStorage. The backend keeps history for this
+  // session_id in Redis for 24h regardless of whether the frontend remembers
+  // it — this just gives the frontend a way to ask for it back.
+  useEffect(() => {
+    if (!sessionId) return;
+    chatApi.getHistory(sessionId)
+      .then((data) => {
+        if (!data.messages || data.messages.length === 0) return;
+        setMessages(
+          data.messages.map((m, i) => ({
+            id: `restored-${i}`,
+            role: m.role,
+            content: m.content,
+          }))
+        );
+      })
+      .catch(() => {
+        // Session expired in Redis (past the 24h TTL) or otherwise
+        // unreachable — nothing to restore, start fresh silently.
+        localStorage.removeItem(CHAT_SESSION_STORAGE_KEY);
+        setSessionId(null);
+      });
+    // Intentionally only on mount — this restores once, not on every
+    // sessionId change (a live chat already has its messages in state).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep localStorage in sync whenever the active session changes, so a
+  // page refresh or a return trip to this tab always has the latest id.
+  useEffect(() => {
+    if (sessionId) {
+      localStorage.setItem(CHAT_SESSION_STORAGE_KEY, sessionId);
+    } else {
+      localStorage.removeItem(CHAT_SESSION_STORAGE_KEY);
+    }
+  }, [sessionId]);
 
   useEffect(() => {
     paperContextInjected.current = false;
@@ -1340,6 +1385,12 @@ function AgentChat({
                 );
                 return { ...m, researchPlan: updated };
               }
+              case 'critiquing':
+                return { ...m, reflectionStage: 'critiquing' };
+              case 'critique_result':
+                return { ...m, reflectionScore: event.aggregate };
+              case 'refining':
+                return { ...m, reflectionStage: 'refining' };
               default:
                 return m;
             }
@@ -1594,6 +1645,17 @@ function ChatBubble({ message }: { message: ChatMessage }) {
                 {message.agentUsed}
               </span>
             )}
+            {message.reflectionScore !== undefined && (
+              <span
+                className={`text-xs px-2 py-0.5 rounded-full border font-medium ${
+                  message.reflectionScore >= 0.7
+                    ? 'bg-green-50 border-green-200 text-green-700'
+                    : 'bg-amber-50 border-amber-200 text-amber-700'
+                }`}
+              >
+                quality {message.reflectionScore.toFixed(2)}
+              </span>
+            )}
             {message.intentMethod && message.intentConfidence !== undefined && (
               <span className="text-xs text-gray-400">
                 via {message.intentMethod} · {Math.round(message.intentConfidence * 100)}%
@@ -1652,7 +1714,11 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           ) : (
             <div className="flex items-center gap-2 text-gray-400 text-sm">
               <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              Thinking...
+              {message.reflectionStage === 'critiquing'
+                ? 'Checking answer quality...'
+                : message.reflectionStage === 'refining'
+                ? 'Refining the answer...'
+                : 'Thinking...'}
             </div>
           )}
           {message.isStreaming && message.content && (

@@ -16,6 +16,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _scope_where(filter_type: Optional[str], user_id: Optional[int]) -> Optional[Dict]:
+    """
+    Build a ChromaDB `where` clause that scopes "user_doc" chunks to their
+    owner. "paper"/"article" are global, shared content and are never scoped.
+
+    A caller that knows filter_type == "user_doc" but omits user_id gets a
+    clause matching no real document, rather than silently falling back to
+    an unscoped query — the missing identity is a caller bug, and this
+    fails closed instead of leaking every user's uploads.
+    """
+    if filter_type == "user_doc":
+        return {"$and": [{"type": "user_doc"}, {"user_id": user_id if user_id is not None else -1}]}
+    if filter_type:
+        return {"type": filter_type}
+    if user_id is not None:
+        # Unfiltered search still must not leak other users' uploads: any
+        # non-user_doc hit passes through, a user_doc hit only if it's this
+        # user's own.
+        return {
+            "$or": [
+                {"type": {"$ne": "user_doc"}},
+                {"$and": [{"type": "user_doc"}, {"user_id": user_id}]},
+            ]
+        }
+    # No identity at all (trusted system/background path) — exclude user_doc
+    # entirely rather than search across every user's private uploads.
+    return {"type": {"$ne": "user_doc"}}
+
+
 class EmbeddingManager:
     """Manages embeddings and vector database
     
@@ -244,6 +273,90 @@ class EmbeddingManager:
 
         return len(chunks)
 
+    def has_paper_fulltext(self, arxiv_id: str) -> bool:
+        """Whether this paper's full text has already been fetched, parsed, and cached."""
+        try:
+            existing = self.collection.get(
+                where={"$and": [{"type": "paper_fulltext"}, {"arxiv_id": arxiv_id}]},
+                limit=1,
+                include=[],
+            )
+            return bool(existing.get("ids"))
+        except Exception as e:
+            logger.debug(f"has_paper_fulltext check failed for {arxiv_id}: {e}")
+            return False
+
+    def add_paper_fulltext(self, arxiv_id: str, title: str, full_text: str, metadata: Dict) -> int:
+        """
+        Chunk and embed a paper's full body text (beyond the title+abstract
+        add_paper stores), for on-demand deep lookups via the fetch_full_paper
+        tool. Stored under a distinct "paper_fulltext" type + arxiv_id filter
+        so it never surfaces in default search_knowledge_base calls — those
+        callers expect a handful of whole-paper hits, not dozens of chunks
+        from one paper's body.
+
+        Returns:
+            Number of chunks added (0 if the paper has no extractable text).
+        """
+        clean_content = clean_text(full_text)
+        if not clean_content:
+            return 0
+
+        chunks = chunk_text(
+            clean_content,
+            chunk_size=settings.CHUNK_SIZE,
+            overlap=settings.CHUNK_OVERLAP,
+        )
+        if not chunks:
+            return 0
+
+        embeddings = self.generate_embeddings(chunks)
+        ids = [f"paperfull_{arxiv_id}_{i}" for i in range(len(chunks))]
+        metadatas = [{
+            **metadata,
+            "type": "paper_fulltext",
+            "arxiv_id": arxiv_id,
+            "title": title,
+            "chunk_index": i,
+        } for i in range(len(chunks))]
+
+        try:
+            self.collection.add(
+                embeddings=embeddings,
+                documents=chunks,
+                metadatas=metadatas,
+                ids=ids,
+            )
+        except Exception as e:
+            logger.debug(f"Error adding fulltext for {arxiv_id}: {e}")
+            return 0
+
+        return len(chunks)
+
+    def search_paper_fulltext(self, arxiv_id: str, query: str, n_results: int = 5) -> List[Dict]:
+        """Vector search restricted to one paper's cached full-text chunks."""
+        query_embedding = self.generate_embedding(query)
+        try:
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where={"$and": [{"type": "paper_fulltext"}, {"arxiv_id": arxiv_id}]},
+            )
+        except Exception as e:
+            logger.warning(f"search_paper_fulltext failed for {arxiv_id}: {e}")
+            return []
+
+        formatted_results = []
+        if results["ids"] and len(results["ids"][0]) > 0:
+            for i in range(len(results["ids"][0])):
+                formatted_results.append({
+                    "id": results["ids"][0][i],
+                    "document": results["documents"][0][i],
+                    "metadata": results["metadatas"][0][i],
+                    "distance": results["distances"][0][i] if "distances" in results else None,
+                })
+        return formatted_results
+
     def delete_user_document(self, doc_id: str) -> int:
         """
         Delete all ChromaDB chunks that belong to a user document.
@@ -265,24 +378,31 @@ class EmbeddingManager:
             logger.warning(f"Failed to delete ChromaDB chunks for doc_id={doc_id}: {e}")
             return 0
 
-    def search(self, query: str, n_results: int = 10, filter_type: Optional[str] = None) -> List[Dict]:
+    def search(
+        self, query: str, n_results: int = 10, filter_type: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> List[Dict]:
         """
         Search the vector database
-        
+
         Args:
             query: Search query text
             n_results: Number of results to return
-            filter_type: Optional filter by "paper" or "article"
-            
+            filter_type: Optional filter by "paper", "article", or "user_doc"
+            user_id: Requesting user's id. "user_doc" chunks are private per-user
+                (unlike "paper"/"article", which are global) — this scopes any
+                user_doc results to this user so one user's uploads never surface
+                in another user's search results. Pass the current user's id on
+                every user-facing call; omit only for trusted system/background
+                paths that intentionally have no per-user scope.
+
         Returns:
             List of search results with metadata
         """
         query_embedding = self.generate_embedding(query)
-        
-        where = None
-        if filter_type:
-            where = {"type": filter_type}
-        
+
+        where = _scope_where(filter_type, user_id)
+
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=n_results,

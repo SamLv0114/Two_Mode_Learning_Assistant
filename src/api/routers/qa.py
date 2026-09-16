@@ -46,65 +46,72 @@ class DocumentListItem(BaseModel):
     created_at: str
 
 
-@router.post("/ask", response_model=QuestionResponse)
-async def ask_question(
-    request: QuestionRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db_session),
-    embedding_manager: EmbeddingManager = Depends(get_embedding_manager)
-):
-    """
-    Ask a question and get an answer from the knowledge base
-
-    - **question**: The question to ask
-    - **n_context**: Number of context documents to retrieve (3-10)
-    - **filter_type**: Optional filter by content type
-    """
-    if not request.question.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Question cannot be empty"
-        )
-
-    try:
-        # Import QA components
-        from src.rag.retriever import Retriever
-        from src.rag.generator import Generator
-
-        retriever = Retriever(embedding_manager)
-        generator = Generator()
-
-        # Retrieve relevant documents
-        results = retriever.retrieve(
-            query=request.question,
-            n_results=request.n_context,
-            filter_type=request.filter_type
-        )
-
-        if not results:
-            return QuestionResponse(
-                answer="I couldn't find any relevant information in the knowledge base to answer your question.",
-                citations=[],
-                sources_used=0
-            )
-
-        # Generate answer
-        answer_result = generator.generate_answer(
-            question=request.question,
-            context=results
-        )
-
-        return QuestionResponse(
-            answer=answer_result.get("answer", ""),
-            citations=answer_result.get("citations", []),
-            sources_used=len(results)
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate answer: {str(e)}"
-        )
+# Disabled — zero callers from the frontend. The Knowledge Base panel only
+# does document management (upload/list/delete); actual Q&A over the
+# knowledge base happens through the chat agent's search_knowledge_base /
+# search_user_documents tools instead, not this direct endpoint. Left
+# commented rather than deleted in case a direct, non-agent Q&A endpoint is
+# wanted again later.
+# @router.post("/ask", response_model=QuestionResponse)
+# async def ask_question(
+#     request: QuestionRequest,
+#     current_user: User = Depends(get_current_user),
+#     db: Session = Depends(get_db_session),
+#     embedding_manager: EmbeddingManager = Depends(get_embedding_manager)
+# ):
+#     """
+#     Ask a question and get an answer from the knowledge base
+#
+#     - **question**: The question to ask
+#     - **n_context**: Number of context documents to retrieve (3-10)
+#     - **filter_type**: Optional filter by content type
+#     """
+#     if not request.question.strip():
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Question cannot be empty"
+#         )
+#
+#     try:
+#         # Import QA components
+#         from src.rag.retriever import Retriever
+#         from src.rag.generator import Generator
+#
+#         retriever = Retriever(embedding_manager)
+#         generator = Generator()
+#
+#         # Retrieve relevant documents
+#         results = retriever.retrieve(
+#             query=request.question,
+#             n_results=request.n_context,
+#             filter_type=request.filter_type,
+#             user_id=current_user.id,
+#         )
+#
+#         if not results:
+#             return QuestionResponse(
+#                 answer="I couldn't find any relevant information in the knowledge base to answer your question.",
+#                 citations=[],
+#                 sources_used=0
+#             )
+#
+#         # Generate answer
+#         answer_result = generator.generate_answer(
+#             question=request.question,
+#             context=results
+#         )
+#
+#         return QuestionResponse(
+#             answer=answer_result.get("answer", ""),
+#             citations=answer_result.get("citations", []),
+#             sources_used=len(results)
+#         )
+#
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail=f"Failed to generate answer: {str(e)}"
+#         )
 
 
 @router.post("/documents", response_model=DocumentUploadResponse)

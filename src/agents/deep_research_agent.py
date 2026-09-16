@@ -69,7 +69,7 @@ class TodoPlanner:
     """
 
     _PROMPT = """\
-You are a research planning assistant for an ML research platform.
+You are a research planning assistant for a research platform focused on deep learning, LLMs, and AI agents.
 
 Break the following complex question into {max_tasks} or fewer focused sub-tasks.
 Each sub-task should be independently searchable and together cover the full question.
@@ -218,7 +218,7 @@ class ReportWriter:
     """Synthesizes all ResearchNotes into a structured Markdown report using gpt-4o."""
 
     _SYSTEM = """\
-You are a senior ML research writer. Synthesize the provided research notes into
+You are a senior research writer covering deep learning, LLMs, and AI agents. Synthesize the provided research notes into
 a well-structured Markdown report with clear sections. Requirements:
 - Use ## section headers for each major theme
 - Be specific and cite sources inline (e.g., "According to [Paper Title]...")

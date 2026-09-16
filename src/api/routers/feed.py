@@ -9,13 +9,12 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from src.database.models import User, Paper, Article, UserInteraction, UserPaperRecommendation, UserArticleRecommendation
+from src.database.models import User, Paper, UserInteraction, UserPaperRecommendation
 from src.api.deps import get_db_session, get_current_user, get_embedding_manager
 from src.schemas.feed import (
     FeedRequest,
     FeedResponse,
     PaperResponse,
-    ArticleResponse
 )
 from src.utils.config import settings
 from src.models.embeddings import EmbeddingManager
@@ -261,40 +260,46 @@ async def get_recommended_papers(
     ]
 
 
-@router.get("/articles", response_model=List[ArticleResponse])
-async def get_recommended_articles(
-    limit: int = settings.TOP_ARTICLES_COUNT,
-    offset: int = 0,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db_session)
-):
-    """Get this user's most recently generated article feed, ordered by rank."""
-    rows = (
-        db.query(Article, UserArticleRecommendation)
-        .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
-        .filter(UserArticleRecommendation.user_id == current_user.id)
-        .order_by(UserArticleRecommendation.rank.asc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-
-    return [
-        ArticleResponse(
-            id=article.id,
-            rank=rec.rank or (offset + i),
-            source=article.source,
-            title=article.title,
-            url=article.url,
-            author=article.author,
-            published_date=article.published_date,
-            upvotes=article.upvotes,
-            relevance_score=rec.relevance_score,
-            summary=rec.personalized_summary,
-            digest_summary=article.digest_summary,
-        )
-        for i, (article, rec) in enumerate(rows, offset + 1)
-    ]
+# Disabled — Article subsystem retired (superseded by What's Hot), nothing
+# writes new UserArticleRecommendation rows anymore (daily_feed.py's
+# top_articles is hardcoded to []). Left commented rather than deleted;
+# Article/UserArticleRecommendation tables and the ranking/training code
+# that still branches on item_type == "article" are unchanged for now —
+# see the tool_aware_agent-era notes for why this is being done in stages.
+# @router.get("/articles", response_model=List[ArticleResponse])
+# async def get_recommended_articles(
+#     limit: int = settings.TOP_ARTICLES_COUNT,
+#     offset: int = 0,
+#     current_user: User = Depends(get_current_user),
+#     db: Session = Depends(get_db_session)
+# ):
+#     """Get this user's most recently generated article feed, ordered by rank."""
+#     rows = (
+#         db.query(Article, UserArticleRecommendation)
+#         .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
+#         .filter(UserArticleRecommendation.user_id == current_user.id)
+#         .order_by(UserArticleRecommendation.rank.asc())
+#         .offset(offset)
+#         .limit(limit)
+#         .all()
+#     )
+#
+#     return [
+#         ArticleResponse(
+#             id=article.id,
+#             rank=rec.rank or (offset + i),
+#             source=article.source,
+#             title=article.title,
+#             url=article.url,
+#             author=article.author,
+#             published_date=article.published_date,
+#             upvotes=article.upvotes,
+#             relevance_score=rec.relevance_score,
+#             summary=rec.personalized_summary,
+#             digest_summary=article.digest_summary,
+#         )
+#         for i, (article, rec) in enumerate(rows, offset + 1)
+#     ]
 
 
 @router.post("/refine")
@@ -465,29 +470,34 @@ async def get_saved_items(
                     arxiv_url=paper.arxiv_url,
                     pdf_url=paper.pdf_url,
                     citation_count=paper.citation_count,
-                    relevance_score=rec.relevance_score if rec else paper.relevance_score,
+                    relevance_score=rec.relevance_score if rec else 0.0,
                     impact_score=paper.heuristic_impact_score,
                     summary=rec.personalized_summary if rec else None,
                 ))
-        else:
-            article = db.query(Article).filter(Article.id == interaction.item_id).first()
-            if article:
-                rec = db.query(UserArticleRecommendation).filter(
-                    UserArticleRecommendation.user_id == current_user.id,
-                    UserArticleRecommendation.article_id == article.id,
-                ).first()
-                articles.append(ArticleResponse(
-                    id=article.id,
-                    rank=len(articles) + 1,
-                    source=article.source,
-                    title=article.title,
-                    url=article.url,
-                    author=article.author,
-                    published_date=article.published_date,
-                    upvotes=article.upvotes,
-                    relevance_score=rec.relevance_score if rec else article.relevance_score,
-                    summary=rec.personalized_summary if rec else None,
-                ))
+        # Disabled — Article subsystem retired, see the note on the (also
+        # disabled) GET /feed/articles endpoint above. `articles` stays an
+        # empty list rather than being removed from the response, so the
+        # response shape doesn't change for whatever's still reading it.
+        #
+        # else:
+        #     article = db.query(Article).filter(Article.id == interaction.item_id).first()
+        #     if article:
+        #         rec = db.query(UserArticleRecommendation).filter(
+        #             UserArticleRecommendation.user_id == current_user.id,
+        #             UserArticleRecommendation.article_id == article.id,
+        #         ).first()
+        #         articles.append(ArticleResponse(
+        #             id=article.id,
+        #             rank=len(articles) + 1,
+        #             source=article.source,
+        #             title=article.title,
+        #             url=article.url,
+        #             author=article.author,
+        #             published_date=article.published_date,
+        #             upvotes=article.upvotes,
+        #             relevance_score=rec.relevance_score if rec else 0.0,
+        #             summary=rec.personalized_summary if rec else None,
+        #         ))
 
     return {
         "papers": papers,

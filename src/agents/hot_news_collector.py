@@ -5,14 +5,24 @@ HotNewsCollector — fetches What's Hot from two community sources:
      GET https://huggingface.co/api/papers?sort=trending&limit=N
      → community-voted paper hotness, no time parameter needed
 
-  2. GitHub Trending repos (trending ML tools/libraries)
+  2. GitHub Trending repos (trending AI/ML/data tools, not just research code)
      GitHub Search API: repos pushed recently, sorted by stars
      Window auto-inferred from user's last visit:
        ≤ 1 day  → "daily"  (last day's stars)
        > 1 day  → "weekly" (last 7 days)
 
-Results are cached in Redis for 6 hours (shared across all users —
-What's Hot is global, not personalised).
+     Topic coverage is deliberately wider than ArXiv's: papers rarely cover
+     the practical/engineering side of AI-adjacent roles (MLOps, data
+     pipelines, agent frameworks), so GitHub is where that content actually
+     lives. See _fetch_github_trending's topic list.
+
+Results are cached in Redis for 6 hours, keyed by date AND github_window.
+The paper/repo *content* is shared across all users (What's Hot is global,
+not personalised), but the cache key still has to vary with the window,
+since two viewers inferred into different windows must not silently reuse
+each other's github_repos list. A date-only key let whoever happened to
+populate the cache first decide the window everyone else saw for the next
+6 hours, regardless of their own visit history.
 """
 import json
 import logging
@@ -29,7 +39,7 @@ GH_API = (
     "&sort=stars&order=desc&per_page={limit}"
 )
 CACHE_TTL = 6 * 3600  # 6 hours
-CACHE_KEY = "whats_hot:{date}"
+CACHE_KEY = "whats_hot:{date}:{window}"
 
 
 class HotNewsCollector:
@@ -44,24 +54,26 @@ class HotNewsCollector:
         """
         Return combined What's Hot payload.
 
-        Checks Redis cache first (6h TTL, date-keyed).
-        If miss: fetches both sources, synthesizes HF digests, caches result.
+        Checks Redis cache first (6h TTL, keyed by date + this caller's
+        inferred github_window (see module docstring for why the window is
+        part of the key). If miss: fetches both sources, synthesizes HF
+        digests, caches result.
         """
+        gh_window = "daily" if user_last_visit_days <= 1 else "weekly"
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        cache_key = CACHE_KEY.format(date=today)
+        cache_key = CACHE_KEY.format(date=today, window=gh_window)
 
         # ── Cache read ────────────────────────────────────────────────────────
         if redis_client:
             try:
                 raw = redis_client.get(cache_key)
                 if raw:
-                    logger.info("What's Hot: cache hit")
+                    logger.info(f"What's Hot: cache hit (window={gh_window})")
                     return json.loads(raw)
             except Exception:
                 pass
 
         # ── Fetch ─────────────────────────────────────────────────────────────
-        gh_window = "daily" if user_last_visit_days <= 1 else "weekly"
         logger.info(f"What's Hot: fetching (gh_window={gh_window})")
 
         hf_papers = self._fetch_hf_trending(limit=hf_limit)
@@ -136,12 +148,17 @@ class HotNewsCollector:
         days = 1 if window == "daily" else 7
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        # Topic filter: machine-learning OR deep-learning OR llm
-        queries = [
-            f"topic:machine-learning+pushed:>{cutoff}",
-            f"topic:deep-learning+pushed:>{cutoff}",
-            f"topic:llm+pushed:>{cutoff}",
+        # Topic filter: covers DL/LLM/agent research tooling plus the
+        # practical AI-engineer / data-engineer / data-scientist side
+        # (MLOps, data pipelines) that ArXiv's paper categories miss.
+        # GitHub's unauthenticated Search API caps at 10 req/min. This list
+        # is kept short enough that one collect() call (one request per
+        # topic) stays well under that even under light concurrent misses.
+        topics = [
+            "machine-learning", "deep-learning", "llm",
+            "ai-agents", "mlops", "data-engineering", "data-science",
         ]
+        queries = [f"topic:{t}+pushed:>{cutoff}" for t in topics]
 
         seen: Dict[str, Dict] = {}
         for q in queries:

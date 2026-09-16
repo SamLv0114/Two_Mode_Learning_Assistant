@@ -78,8 +78,9 @@ class UserResponse(UserBase):
 class Token(BaseModel):
     """Schema for JWT token response"""
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
-    expires_in: int  # seconds until expiration
+    expires_in: int  # seconds until access_token expiration
 
 
 class TokenPayload(BaseModel):
@@ -90,7 +91,13 @@ class TokenPayload(BaseModel):
     iat: datetime
 
 
+class RefreshRequest(BaseModel):
+    """Schema for POST /auth/refresh"""
+    refresh_token: str
+
+
 class UserWithToken(UserResponse):
     """Schema for user response with token (used after registration)"""
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"

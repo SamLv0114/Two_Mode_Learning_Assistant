@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/whats_hot", tags=["What's Hot"])
 
+# Global (not per-user) cooldown: the cache /refresh busts is shared across
+# every user, so the thing worth protecting is the HuggingFace/GitHub API
+# quota, not any one user's click rate. While the cooldown is active, refresh
+# returns whatever is currently cached instead of busting + re-fetching.
+REFRESH_COOLDOWN_KEY = "whats_hot:refresh_cooldown"
+REFRESH_COOLDOWN_SECONDS = 300  # 5 minutes
+
 
 def _get_redis():
     from src.utils.config import settings
@@ -83,19 +90,43 @@ async def refresh_whats_hot(
     """
     Manually bust the What's Hot cache and re-fetch immediately.
     Useful when the user clicks the refresh button in the UI.
+
+    Rate-limited globally (not per-user): this busts a cache shared by every
+    user, so within REFRESH_COOLDOWN_SECONDS of the last real bust, this
+    returns whatever is currently cached instead of hitting HuggingFace/
+    GitHub again — any signed-in user can call this endpoint, so without a
+    cooldown a handful of eager clicks could burn through the external API
+    quota for everyone.
     """
     rc = _get_redis()
+    last_visit_days = _infer_last_visit_days(current_user.id, db)
 
-    # Clear today's cache entry
+    from src.agents.hot_news_collector import HotNewsCollector
+
     if rc:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         try:
-            rc.delete(f"whats_hot:{today}")
+            if rc.get(REFRESH_COOLDOWN_KEY):
+                # Cooldown active — someone refreshed recently. Return the
+                # current cache as-is rather than busting again.
+                return HotNewsCollector().collect(
+                    user_last_visit_days=last_visit_days,
+                    redis_client=rc,
+                )
         except Exception:
             pass
 
-    last_visit_days = _infer_last_visit_days(current_user.id, db)
-    from src.agents.hot_news_collector import HotNewsCollector
+    # Clear today's cache entries, keyed by date AND github_window (see
+    # HotNewsCollector), so both possible windows must be busted. Leaving
+    # the other window's entry in place would make refresh silently no-op
+    # for whichever window this clicker didn't happen to be in.
+    if rc:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        try:
+            rc.delete(f"whats_hot:{today}:daily", f"whats_hot:{today}:weekly")
+            rc.setex(REFRESH_COOLDOWN_KEY, REFRESH_COOLDOWN_SECONDS, "1")
+        except Exception:
+            pass
+
     result = HotNewsCollector().collect(
         user_last_visit_days=last_visit_days,
         redis_client=rc,

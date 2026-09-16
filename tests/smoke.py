@@ -138,7 +138,7 @@ def _():
         "/api/v1/feed/refine",
         "/api/v1/feed/coldstart",
         "/api/v1/whats_hot",
-        "/api/v1/chat/",
+        "/api/v1/chat/stream",
         "/api/v1/interactions",
         "/health",
     }
@@ -296,6 +296,22 @@ def _():
 
     others = [tuple(rng_for(u).sample(pool, 5)) for u in range(1, 8)]
     assert len(set(others)) > 1, "every user drew identical picks"
+
+
+@check("FEATURE_NAMES stays in sync between UserModelTrainer and UserRecommender")
+def _():
+    # Two independently-maintained copies of the same list, no shared source
+    # of truth — edit one and forget the other, and training builds a
+    # feature vector in one column order while ranking reads it back in a
+    # different one. No exception anywhere; the model just silently learns
+    # and predicts against the wrong feature at each position.
+    from src.models.user_trainer import UserModelTrainer
+    from src.models.user_recommender import UserRecommender
+
+    assert UserModelTrainer.FEATURE_NAMES == UserRecommender.FEATURE_NAMES, (
+        f"trainer={UserModelTrainer.FEATURE_NAMES} vs "
+        f"recommender={UserRecommender.FEATURE_NAMES}"
+    )
 
 
 # ── 7. Documented behaviour matches the code ──────────────────────────────────

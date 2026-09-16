@@ -29,7 +29,7 @@ class Generator:
         """
         Generate answer with citations from context
         """
-        if user_interests is None:
+        if not user_interests:
             user_interests = settings.USER_INTERESTS
         
         # Format context
@@ -98,7 +98,7 @@ Answer:"""
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": "You are a helpful AI assistant specialized in machine learning and research."},
+                        {"role": "system", "content": "You are a helpful AI assistant specialized in deep learning, LLMs, AI agents, and research."},
                         {"role": "user", "content": prompt}
                     ],
                     max_completion_tokens=max_tokens,
@@ -114,12 +114,12 @@ Answer:"""
         """
         Generate personalized summary for a paper/article
         """
-        if user_interests is None:
+        if not user_interests:
             user_interests = settings.USER_INTERESTS
         
         interests_str = ", ".join(user_interests)
         
-        prompt = f"""Summarize this for an ML grad student focused on {interests_str}.
+        prompt = f"""Summarize this for a grad student focused on {interests_str}.
 
 Title: {title}
 Content: {content[:2000]}

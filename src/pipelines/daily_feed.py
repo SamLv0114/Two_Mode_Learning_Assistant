@@ -64,7 +64,7 @@ from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
 from src.rag import Generator
-from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction, UserPaperRecommendation, UserArticleRecommendation
+from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction, UserPaperRecommendation, UserArticleRecommendation, UserPaperImpression
 from src.utils.config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -173,18 +173,23 @@ FOCUS_AREA_TERMS = {
     "CV": "computer vision",
     "AI": "artificial intelligence",
     "DL": "deep learning",
+    "LLM": "large language models",
+    "AGENT": "AI agents",
 }
 
 # Same keys as FOCUS_AREA_TERMS, mapped to the arXiv category codes actually
 # indexed by run_nightly_index (settings.ARXIV_CATEGORIES) — used to give
 # declared interests a prior in _compute_target_category_distribution. DL has
-# no distinct arXiv code of its own, so it shares cs.LG with ML.
+# no distinct arXiv code of its own, so it shares cs.LG with ML; LLM shares
+# cs.CL with NLP for the same reason.
 FOCUS_AREA_CATEGORY_MAP = {
     "ML": "cs.LG",
     "NLP": "cs.CL",
     "CV": "cs.CV",
     "AI": "cs.AI",
     "DL": "cs.LG",
+    "LLM": "cs.CL",
+    "AGENT": "cs.MA",
 }
 
 
@@ -450,6 +455,16 @@ class DailyFeedPipeline:
             semantic_scores_override=semantic_scores or None,
             top_k=limit,
         )
+
+        # ranked papers come straight from the corpus, so .personalized_summary
+        # is still unset at this point (_db_paper_to_paperdata never copies a
+        # summary onto PaperData — there is nothing to copy from since Paper
+        # has no personalized_summary column). Generate a real one here (same
+        # call _generate_summaries makes for a normally-generated feed),
+        # otherwise a paper swapped in by /feed/refine renders with no Key
+        # Insight / Why It Matters / Relevance to You.
+        self._user_interests = selected_interests
+        self._generate_summaries(ranked, "paper")
 
         by_arxiv = {p.arxiv_id: p for p in db_papers}
         return [
@@ -845,18 +860,48 @@ class DailyFeedPipeline:
         return [arxiv_id for _, arxiv_id in rows]
 
     def _get_recently_recommended_arxiv_ids(self) -> set:
-        """ArXiv IDs already recommended to this user in the novelty lookback window."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.NOVELTY_LOOKBACK_DAYS)
-        rows = (
+        """
+        ArXiv IDs to exclude from this run's candidates — two independent
+        signals, unioned:
+          - dismissed within NOVELTY_LOOKBACK_DAYS: an explicit negative
+            signal (UserInteraction is append-only, so this reliably covers
+            the full window no matter how many times the user has since
+            regenerated).
+          - merely shown (no dismiss, no save) within SHOWN_LOOKBACK_DAYS: a
+            much shorter cooldown, since exposure alone is not evidence of
+            dislike and locking it out for the full novelty window would
+            needlessly burn through the candidate pool.
+
+        Deliberately does NOT read UserPaperRecommendation for this: that
+        table is wiped and replaced by _store_results on every generation,
+        so it only ever reflects the single most recent batch, not history.
+        UserPaperImpression is the append-only table that actually survives
+        repeated force_refresh calls.
+        """
+        dismiss_cutoff = datetime.now(timezone.utc) - timedelta(days=settings.NOVELTY_LOOKBACK_DAYS)
+        dismissed_rows = (
             self.db.query(Paper.arxiv_id)
-            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+            .join(UserInteraction, UserInteraction.item_id == Paper.id)
             .filter(
-                UserPaperRecommendation.user_id == self.user_id,
-                UserPaperRecommendation.recommended_date >= cutoff,
+                UserInteraction.user_id == self.user_id,
+                UserInteraction.item_type == "paper",
+                UserInteraction.interaction_type == "dismissed",
+                UserInteraction.timestamp >= dismiss_cutoff,
             )
             .all()
         )
-        return {r[0] for r in rows}
+
+        shown_cutoff = datetime.now(timezone.utc) - timedelta(days=settings.SHOWN_LOOKBACK_DAYS)
+        shown_rows = (
+            self.db.query(UserPaperImpression.arxiv_id)
+            .filter(
+                UserPaperImpression.user_id == self.user_id,
+                UserPaperImpression.shown_date >= shown_cutoff,
+            )
+            .all()
+        )
+
+        return {r[0] for r in dismissed_rows} | {r[0] for r in shown_rows}
 
     # ── Shared Redis handle ───────────────────────────────────────────────────
 
@@ -1640,7 +1685,7 @@ class DailyFeedPipeline:
         recent_texts = self._get_recent_item_texts(item_type)
         for item in items:
             feat = self.feature_extractor.extract_features(
-                item, item_type, self.embedding_manager, selected_interests,
+                item, self.embedding_manager, selected_interests,
                 recent_texts=recent_texts,
             )
             features.append(feat)
@@ -1844,10 +1889,18 @@ class DailyFeedPipeline:
                 # Update shared paper fields (citation count, impact score)
                 if paper_data.citation_count is not None:
                     paper.citation_count = paper_data.citation_count
-                if getattr(paper_data, "heuristic_impact_score", None) is not None:
-                    paper.heuristic_impact_score = paper_data.heuristic_impact_score
+                # PaperData never actually carries a heuristic_impact_score
+                # (no field for it, nothing ever set one), so the old
+                # getattr-guarded copy here was permanently a no-op — the
+                # column sat NULL for ~99.7% of papers despite being read
+                # for fallback candidate sorting and shown to users as the
+                # feed's "Impact" score. Compute it directly from the Paper
+                # row instead, which already has title/abstract/authors.
+                paper.heuristic_impact_score = self.recommender.calculate_impact_score(paper)
 
-                # Per-user recommendation row
+                # Per-user recommendation row — this table is wiped and replaced
+                # on every generation (see comment above), so it only ever
+                # reflects the current feed, never history.
                 self.db.add(UserPaperRecommendation(
                     user_id=self.user_id,
                     paper_id=paper.id,
@@ -1857,6 +1910,15 @@ class DailyFeedPipeline:
                     rank=rank,
                     feed_mode=mode,
                     feed_time_window_days=time_window_days,
+                ))
+
+                # Append-only impression record — never deleted, this is what
+                # _get_recently_recommended_arxiv_ids actually reads to enforce
+                # the novelty window across repeated regenerations.
+                self.db.add(UserPaperImpression(
+                    user_id=self.user_id,
+                    arxiv_id=paper_data.arxiv_id,
+                    shown_date=now,
                 ))
 
                 try:

@@ -2,6 +2,7 @@
 Authentication endpoints
 """
 import json
+import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -12,6 +13,8 @@ from src.api.security import (
     verify_password,
     get_password_hash,
     create_access_token,
+    create_refresh_token,
+    decode_token,
     get_token_expiry_seconds
 )
 from src.schemas.user import (
@@ -20,17 +23,61 @@ from src.schemas.user import (
     UserResponse,
     UserUpdate,
     Token,
-    UserWithToken
+    UserWithToken,
+    RefreshRequest
 )
 from src.utils.config import settings
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+REFRESH_JTI_PREFIX = "refresh_jti:"
+
+
+def _get_redis():
+    if not settings.REDIS_URL:
+        return None
+    try:
+        import redis
+        client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        client.ping()
+        return client
+    except Exception:
+        return None
+
+
+def _issue_tokens(user: User, redis_client) -> tuple[str, str]:
+    """
+    Create an (access_token, refresh_token) pair and register the refresh
+    token's jti in Redis so it can be redeemed exactly once (see
+    create_refresh_token's docstring for why). If Redis isn't available,
+    the refresh_token is still returned — the client can hold onto it —
+    but /auth/refresh will reject it, since there is nowhere to record or
+    check "has this jti been redeemed" without Redis. That is a deliberate
+    fail-closed choice: silently accepting refresh tokens with no
+    revocation tracking would be worse than refresh simply not working
+    until Redis is back.
+    """
+    access_token = create_access_token(user.id, user.email)
+    refresh_token, jti = create_refresh_token(user.id)
+    if redis_client:
+        try:
+            redis_client.setex(
+                f"{REFRESH_JTI_PREFIX}{jti}",
+                settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+                str(user.id),
+            )
+        except Exception as e:
+            logger.warning(f"Could not register refresh token jti: {e}")
+    return access_token, refresh_token
 
 
 @router.post("/register", response_model=UserWithToken, status_code=status.HTTP_201_CREATED)
 async def register(
     user_data: UserCreate,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    redis_client=Depends(_get_redis)
 ):
     """
     Register a new user account
@@ -71,8 +118,7 @@ async def register(
     db.commit()
     db.refresh(user)
 
-    # Create access token
-    access_token = create_access_token(user.id, user.email)
+    access_token, refresh_token = _issue_tokens(user, redis_client)
 
     return UserWithToken(
         id=user.id,
@@ -85,6 +131,7 @@ async def register(
         interaction_count=0,
         model_trained=False,
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer"
     )
 
@@ -92,7 +139,8 @@ async def register(
 @router.post("/login", response_model=Token)
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    redis_client=Depends(_get_redis)
 ):
     """
     Login with email and password to get an access token
@@ -124,11 +172,11 @@ async def login(
             detail="User account is deactivated"
         )
 
-    # Create access token
-    access_token = create_access_token(user.id, user.email)
+    access_token, refresh_token = _issue_tokens(user, redis_client)
 
     return Token(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
         expires_in=get_token_expiry_seconds()
     )
@@ -137,7 +185,8 @@ async def login(
 @router.post("/login/json", response_model=Token)
 async def login_json(
     credentials: UserLogin,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    redis_client=Depends(_get_redis)
 ):
     """
     Login with JSON body (alternative to form-based login)
@@ -166,11 +215,81 @@ async def login_json(
             detail="User account is deactivated"
         )
 
-    # Create access token
-    access_token = create_access_token(user.id, user.email)
+    access_token, refresh_token = _issue_tokens(user, redis_client)
 
     return Token(
         access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=get_token_expiry_seconds()
+    )
+
+
+@router.post("/refresh", response_model=Token)
+async def refresh(
+    body: RefreshRequest,
+    db: Session = Depends(get_db_session),
+    redis_client=Depends(_get_redis)
+):
+    """
+    Exchange a refresh token for a new access token + refresh token pair.
+
+    One-time use: redeeming a refresh token immediately deletes its jti
+    from Redis and issues a brand new refresh token (rotation), so a
+    captured refresh token is only good until whichever of the legitimate
+    client or the attacker uses it next — after that, the jti is gone and
+    the other party's copy of the same token is permanently rejected, even
+    though it hasn't reached its 7-day expiry yet.
+
+    Requires Redis: there is nowhere else this endpoint could check "has
+    this jti already been redeemed". Returns 401 (not 503) when Redis is
+    unavailable — a general client shouldn't be able to tell "Redis is
+    down" from "token invalid", so the caller's only correct response
+    either way is the same: fall back to a normal login.
+    """
+    invalid = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired refresh token",
+    )
+
+    payload = decode_token(body.refresh_token)
+    if payload is None or payload.get("type") != "refresh":
+        raise invalid
+
+    jti = payload.get("jti")
+    user_id_str = payload.get("sub")
+    if not jti or not user_id_str:
+        raise invalid
+
+    if not redis_client:
+        raise invalid
+
+    key = f"{REFRESH_JTI_PREFIX}{jti}"
+    try:
+        stored_user_id = redis_client.get(key)
+        if stored_user_id is None:
+            raise invalid
+        redis_client.delete(key)  # one-time use: gone the instant it's redeemed
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Refresh token lookup failed: {e}")
+        raise invalid
+
+    try:
+        user_id = int(user_id_str)
+    except (TypeError, ValueError):
+        raise invalid
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None or not user.is_active:
+        raise invalid
+
+    access_token, new_refresh_token = _issue_tokens(user, redis_client)
+
+    return Token(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
         token_type="bearer",
         expires_in=get_token_expiry_seconds()
     )

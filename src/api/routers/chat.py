@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -127,103 +128,108 @@ def _extract_facts_bg(
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
-@router.post("/", response_model=ChatResponse)
-async def chat(
-    request: ChatRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db_session),
-    embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
-):
-    """
-    Main conversational endpoint with automatic agent routing.
-
-    Pipeline per request:
-      1. Load relevant conversation history (ContextBuilder: semantic selection)
-      2. Inject long-term user facts into system prompt (UserFactMemory)
-      3. Classify intent → dispatch to agent (router)
-      4. Record tool-call trace in Redis
-      5. Background: extract and store new user facts (UserFactMemory)
-
-    Pass `session_id` from a previous response to continue the same conversation.
-    """
-    if not request.message.strip():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
-
-    session_id = request.session_id or ConversationMemory.new_session_id()
-    redis_client = _get_redis()
-    memory = ConversationMemory(redis_client=redis_client, user_id=current_user.id)
-    retriever = Retriever(embedding_manager)
-    agent_router = _get_agent_router(embedding_manager)
-
-    # ── Feature 2: Semantic history selection ─────────────────────────────────
-    raw_history = memory.get_history(session_id, max_messages=20)
-    builder = ContextBuilder(embedding_model=getattr(embedding_manager, "model", None))
-    history = builder.build(request.message, raw_history, top_k=8)
-
-    # ── Feature 1: Inject user facts into system prompt ───────────────────────
-    user_facts_context = _fact_memory.get_context_string(current_user.id, redis_client)
-
-    # ── Feature 4: Initialise trace list ──────────────────────────────────────
-    trace: List[dict] = []
-
-    context = {
-        "db": db,
-        "user": current_user,
-        "retriever": retriever,
-        "embedding_manager": embedding_manager,
-        "user_facts_context": user_facts_context,   # Feature 1
-        "_trace": trace,                             # Feature 4
-    }
-
-    result, intent, method, confidence, agent_used = agent_router.route(
-        message=request.message,
-        conversation_history=history,
-        context=context,
-    )
-
-    # ── Feature 4: Persist trace ───────────────────────────────────────────────
-    _store_trace(session_id, trace, redis_client)
-
-    memory.add_message(session_id, "user", request.message)
-    memory.add_message(session_id, "assistant", result.reply)
-
-    # ── Feature 1: Background fact extraction ─────────────────────────────────
-    threading.Thread(
-        target=_extract_facts_bg,
-        args=(current_user.id, request.message, result.reply, redis_client),
-        daemon=True,
-    ).start()
-
-    eval_scores = None
-    if request.enable_eval:
-        try:
-            from src.evaluation.llm_judge import LLMJudge
-            score = LLMJudge().evaluate(question=request.message, response=result.reply)
-            eval_scores = score.to_dict()
-        except Exception as e:
-            logger.warning(f"LLM judge skipped: {e}")
-
-    record_request(
-        intent=intent,
-        agent=agent_used,
-        method=method,
-        latency_ms=result.processing_time_ms,
-        tools_called=result.tools_called,
-        eval_scores=eval_scores,
-    )
-
-    return ChatResponse(
-        reply=result.reply,
-        intent=intent,
-        agent_used=agent_used,
-        citations=result.citations,
-        tools_called=result.tools_called,
-        session_id=session_id,
-        recognition_method=method,
-        confidence=round(confidence, 3),
-        processing_time_ms=result.processing_time_ms,
-        eval_scores=eval_scores,
-    )
+# Disabled — zero callers from the frontend. The dashboard only ever calls
+# POST /chat/stream; this non-streaming endpoint (and the enable_eval path
+# on it, which was the only reachable way LLMJudge got exercised outside of
+# /chat/eval/run) has never been hit by real traffic. Left commented rather
+# than deleted in case a non-streaming chat endpoint is wanted again later.
+# @router.post("/", response_model=ChatResponse)
+# async def chat(
+#     request: ChatRequest,
+#     current_user: User = Depends(get_current_user),
+#     db: Session = Depends(get_db_session),
+#     embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
+# ):
+#     """
+#     Main conversational endpoint with automatic agent routing.
+#
+#     Pipeline per request:
+#       1. Load relevant conversation history (ContextBuilder: semantic selection)
+#       2. Inject long-term user facts into system prompt (UserFactMemory)
+#       3. Classify intent → dispatch to agent (router)
+#       4. Record tool-call trace in Redis
+#       5. Background: extract and store new user facts (UserFactMemory)
+#
+#     Pass `session_id` from a previous response to continue the same conversation.
+#     """
+#     if not request.message.strip():
+#         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
+#
+#     session_id = request.session_id or ConversationMemory.new_session_id()
+#     redis_client = _get_redis()
+#     memory = ConversationMemory(redis_client=redis_client, user_id=current_user.id)
+#     retriever = Retriever(embedding_manager)
+#     agent_router = _get_agent_router(embedding_manager)
+#
+#     # ── Feature 2: Semantic history selection ─────────────────────────────────
+#     raw_history = memory.get_history(session_id, max_messages=20)
+#     builder = ContextBuilder(embedding_model=getattr(embedding_manager, "model", None))
+#     history = builder.build(request.message, raw_history, top_k=8)
+#
+#     # ── Feature 1: Inject user facts into system prompt ───────────────────────
+#     user_facts_context = _fact_memory.get_context_string(current_user.id, redis_client)
+#
+#     # ── Feature 4: Initialise trace list ──────────────────────────────────────
+#     trace: List[dict] = []
+#
+#     context = {
+#         "db": db,
+#         "user": current_user,
+#         "retriever": retriever,
+#         "embedding_manager": embedding_manager,
+#         "user_facts_context": user_facts_context,   # Feature 1
+#         "_trace": trace,                             # Feature 4
+#     }
+#
+#     result, intent, method, confidence, agent_used = agent_router.route(
+#         message=request.message,
+#         conversation_history=history,
+#         context=context,
+#     )
+#
+#     # ── Feature 4: Persist trace ───────────────────────────────────────────────
+#     _store_trace(session_id, trace, redis_client)
+#
+#     memory.add_message(session_id, "user", request.message)
+#     memory.add_message(session_id, "assistant", result.reply)
+#
+#     # ── Feature 1: Background fact extraction ─────────────────────────────────
+#     threading.Thread(
+#         target=_extract_facts_bg,
+#         args=(current_user.id, request.message, result.reply, redis_client),
+#         daemon=True,
+#     ).start()
+#
+#     eval_scores = None
+#     if request.enable_eval:
+#         try:
+#             from src.evaluation.llm_judge import LLMJudge
+#             score = LLMJudge().evaluate(question=request.message, response=result.reply)
+#             eval_scores = score.to_dict()
+#         except Exception as e:
+#             logger.warning(f"LLM judge skipped: {e}")
+#
+#     record_request(
+#         intent=intent,
+#         agent=agent_used,
+#         method=method,
+#         latency_ms=result.processing_time_ms,
+#         tools_called=result.tools_called,
+#         eval_scores=eval_scores,
+#     )
+#
+#     return ChatResponse(
+#         reply=result.reply,
+#         intent=intent,
+#         agent_used=agent_used,
+#         citations=result.citations,
+#         tools_called=result.tools_called,
+#         session_id=session_id,
+#         recognition_method=method,
+#         confidence=round(confidence, 3),
+#         processing_time_ms=result.processing_time_ms,
+#         eval_scores=eval_scores,
+#     )
 
 
 @router.get("/history/{session_id}")
@@ -322,6 +328,7 @@ async def chat_stream(
                 "user_facts_context": user_facts_context,
             }
 
+            start = time.time()
             agent_router = _get_agent_router(embedding_manager)
             raw_agent, intent, method, confidence = agent_router.route_stream(request.message)
 
@@ -346,9 +353,19 @@ async def chat_stream(
             history = builder.build(request.message, raw_history, top_k=8)
 
             reply_parts = []
+            tools_called: list = []
+            eval_scores = None
             for event in aware_agent.stream(request.message, history, context):
-                if event.get("type") == "token":
+                etype = event.get("type")
+                if etype == "token":
                     reply_parts.append(event["value"])
+                elif etype == "done":
+                    tools_called = event.get("tools_called", [])
+                elif etype == "critique_result":
+                    # Only ReflectionAgent emits this — real CriticAgent
+                    # scores from the reflection loop, not the separate
+                    # opt-in LLMJudge the non-streaming endpoint uses.
+                    eval_scores = {k: v for k, v in event.items() if k != "type"}
                 loop.call_soon_threadsafe(queue.put_nowait, event)
 
             full_reply = "".join(reply_parts)
@@ -362,6 +379,18 @@ async def chat_stream(
                     args=(current_user.id, request.message, full_reply, redis_client),
                     daemon=True,
                 ).start()
+
+            # Prometheus metrics: same call the non-streaming endpoint makes,
+            # so /chat/stream (the path the frontend actually uses) stops
+            # being invisible to agent_requests_total / agent_latency_seconds.
+            record_request(
+                intent=intent,
+                agent=aware_agent.name,
+                method=method,
+                latency_ms=int((time.time() - start) * 1000),
+                tools_called=tools_called,
+                eval_scores=eval_scores,
+            )
 
         except Exception as e:
             logger.error(f"Stream error: {e}")

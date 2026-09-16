@@ -52,7 +52,7 @@ class CriticAgent:
     """
 
     _PROMPT = """\
-You are an expert evaluator for a machine learning research assistant.
+You are an expert evaluator for a research assistant.
 
 Score the following question-answer pair on three dimensions (each 0.0–1.0):
 
@@ -67,15 +67,48 @@ Question: {question}
 
 Answer: {answer}
 
-Sources cited: {citations}
+Sources cited: {citations}"""
 
-Respond with a JSON object ONLY (no markdown, no explanation outside JSON):
-{{
-  "groundedness": <float 0-1>,
-  "completeness": <float 0-1>,
-  "clarity": <float 0-1>,
-  "critique": "<one sentence of specific, actionable improvement feedback>"
-}}"""
+    # Forced function call instead of a "Respond with a JSON object ONLY"
+    # prompt instruction — that soft version's failure mode was worse than a
+    # crash: json.loads() raising on a markdown-fenced reply was caught below
+    # and silently replaced with a neutral 0.5/0.5/0.5 score, which (since
+    # DEFAULT_THRESHOLD=0.70) forces should_retry=True every single time it
+    # happens — an invisible extra reflection pass with no error surfaced
+    # anywhere but a debug log line. required=[...] also removes the need for
+    # the .get(key, 0.5) defensive fallback that was masking missing keys the
+    # same way. Private to this class, not an agent-invokable tool.
+    _SCORE_ANSWER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "score_answer",
+            "description": "Score the question-answer pair on groundedness, completeness, and clarity.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "groundedness": {
+                        "type": "number",
+                        "description": "0.0-1.0: is the answer factually supported by the cited sources?",
+                    },
+                    "completeness": {
+                        "type": "number",
+                        "description": "0.0-1.0: does the answer address all parts of the question?",
+                    },
+                    "clarity": {
+                        "type": "number",
+                        "description": "0.0-1.0: is the answer well-structured and easy to understand?",
+                    },
+                    "critique": {
+                        "type": "string",
+                        "description": "One sentence of specific, actionable improvement feedback",
+                    },
+                },
+                "required": ["groundedness", "completeness", "clarity", "critique"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
     def __init__(self, threshold: float = DEFAULT_THRESHOLD):
         if not settings.OPENAI_API_KEY:
@@ -111,13 +144,17 @@ Respond with a JSON object ONLY (no markdown, no explanation outside JSON):
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=256,
                 temperature=0.0,
+                tools=[self._SCORE_ANSWER_TOOL],
+                tool_choice={"type": "function", "function": {"name": "score_answer"}},
             )
-            raw = response.choices[0].message.content.strip()
-            data = json.loads(raw)
-            g = max(0.0, min(1.0, float(data.get("groundedness", 0.5))))
-            co = max(0.0, min(1.0, float(data.get("completeness", 0.5))))
-            cl = max(0.0, min(1.0, float(data.get("clarity", 0.5))))
-            critique = str(data.get("critique", ""))
+            call = response.choices[0].message.tool_calls[0]
+            data = json.loads(call.function.arguments)
+            # required=[...] guarantees these keys exist — the clamp stays
+            # regardless, since strict mode doesn't enforce numeric ranges.
+            g = max(0.0, min(1.0, float(data["groundedness"])))
+            co = max(0.0, min(1.0, float(data["completeness"])))
+            cl = max(0.0, min(1.0, float(data["clarity"])))
+            critique = str(data["critique"])
             agg = (g + co + cl) / 3
             result = CriticResult(
                 groundedness=g,

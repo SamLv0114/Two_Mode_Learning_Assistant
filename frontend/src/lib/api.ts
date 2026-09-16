@@ -1,7 +1,7 @@
 /**
  * API client for the Learning Assistant backend
  */
-import axios, { AxiosError, AxiosInstance } from 'axios';
+import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 const API_URL = API_BASE_URL;
@@ -23,15 +23,82 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// A 401 means the access token is gone (expired after its fixed lifetime —
+// there's no way to renew it in place), not necessarily that the session
+// is over: try the refresh token once before giving up. Concurrent 401s
+// (several requests in flight when the token expired) must not each fire
+// their own refresh call — the refresh token is one-time-use server-side
+// (see auth.py's rotation), so a second concurrent refresh would find the
+// first one had already redeemed and deleted it, and fail a session that
+// was actually still fine. isRefreshing + a subscriber queue collapses
+// concurrent 401s into a single refresh, and replays every waiting
+// request once it resolves.
+let isRefreshing = false;
+let refreshSubscribers: ((newToken: string) => void)[] = [];
+
+function subscribeTokenRefresh(cb: (newToken: string) => void) {
+  refreshSubscribers.push(cb);
+}
+
+function onRefreshed(newToken: string) {
+  refreshSubscribers.forEach((cb) => cb(newToken));
+  refreshSubscribers = [];
+}
+
+function goToLogin() {
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+  window.location.href = '/login';
+}
+
 // Handle auth errors
 api.interceptors.response.use(
   (response) => response,
-  (error: AxiosError) => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem('access_token');
-      window.location.href = '/login';
+  async (error: AxiosError) => {
+    const originalRequest = error.config as (AxiosRequestConfig & { _retried?: boolean }) | undefined;
+
+    if (error.response?.status !== 401 || !originalRequest || originalRequest._retried) {
+      return Promise.reject(error);
     }
-    return Promise.reject(error);
+
+    const refreshToken = localStorage.getItem('refresh_token');
+    if (!refreshToken) {
+      goToLogin();
+      return Promise.reject(error);
+    }
+
+    originalRequest._retried = true;
+
+    if (isRefreshing) {
+      // A refresh triggered by a sibling request is already in flight —
+      // wait for it instead of starting a second one.
+      return new Promise((resolve, reject) => {
+        subscribeTokenRefresh((newToken) => {
+          if (!newToken) {
+            reject(error);
+            return;
+          }
+          originalRequest.headers = { ...originalRequest.headers, Authorization: `Bearer ${newToken}` };
+          resolve(api(originalRequest));
+        });
+      });
+    }
+
+    isRefreshing = true;
+    try {
+      const data = await authApi.refresh(refreshToken);
+      localStorage.setItem('access_token', data.access_token);
+      localStorage.setItem('refresh_token', data.refresh_token);
+      isRefreshing = false;
+      onRefreshed(data.access_token);
+      originalRequest.headers = { ...originalRequest.headers, Authorization: `Bearer ${data.access_token}` };
+      return api(originalRequest);
+    } catch (refreshError) {
+      isRefreshing = false;
+      onRefreshed('');
+      goToLogin();
+      return Promise.reject(refreshError);
+    }
   }
 );
 
@@ -50,6 +117,7 @@ export interface User {
 
 export interface Token {
   access_token: string;
+  refresh_token: string;
   token_type: string;
   expires_in: number;
 }
@@ -152,7 +220,18 @@ export type AgentEvent =
   | { type: 'error'; value: string }
   | { type: 'plan'; tasks: { id: number; title: string; intent: string }[] }
   | { type: 'task_started'; id: number; title: string }
-  | { type: 'task_done'; id: number; citations: number };
+  | { type: 'task_done'; id: number; citations: number }
+  | { type: 'critiquing' }
+  | {
+      type: 'critique_result';
+      groundedness: number;
+      completeness: number;
+      clarity: number;
+      aggregate: number;
+      critique: string;
+      should_retry: boolean;
+    }
+  | { type: 'refining' };
 
 // Auth API
 export const authApi = {
@@ -163,7 +242,7 @@ export const authApi = {
     interests?: string[];
     focus_areas?: string[];
   }) => {
-    const response = await api.post<User & { access_token: string }>('/auth/register', data);
+    const response = await api.post<User & { access_token: string; refresh_token: string }>('/auth/register', data);
     return response.data;
   },
 
@@ -174,6 +253,18 @@ export const authApi = {
 
     const response = await api.post<Token>('/auth/login', formData, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    return response.data;
+  },
+
+  // Exchanges a refresh token for a new access+refresh pair. Uses a bare
+  // axios call, not the shared `api` instance: that instance's response
+  // interceptor is what calls this function on a 401, so routing this
+  // call through it too would risk a loop if the refresh call itself
+  // ever came back 401.
+  refresh: async (refreshToken: string) => {
+    const response = await axios.post<Token>(`${API_URL}/api/v1/auth/refresh`, {
+      refresh_token: refreshToken,
     });
     return response.data;
   },
@@ -379,6 +470,15 @@ export const chatApi = {
 
   getAuthToken: () =>
     typeof window !== 'undefined' ? localStorage.getItem('access_token') : null,
+
+  getHistory: async (sessionId: string) => {
+    const response = await api.get<{
+      session_id: string;
+      messages: { role: 'user' | 'assistant'; content: string }[];
+      count: number;
+    }>(`/chat/history/${sessionId}`);
+    return response.data;
+  },
 };
 
 export default api;

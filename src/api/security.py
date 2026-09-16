@@ -1,8 +1,9 @@
 """
 Security utilities for authentication and authorization
 """
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 from jose import jwt, JWTError
 import bcrypt
 from src.utils.config import settings
@@ -64,16 +65,28 @@ def create_access_token(
 def create_refresh_token(
     subject: Union[str, int],
     expires_delta: Optional[timedelta] = None
-) -> str:
+) -> Tuple[str, str]:
     """
-    Create a JWT refresh token (longer-lived)
+    Create a JWT refresh token (longer-lived).
+
+    Unlike the access token, a refresh token has to be revocable — a stolen
+    one is valid for REFRESH_TOKEN_EXPIRE_DAYS otherwise, with no way to cut
+    it off short of rotating SECRET_KEY (which invalidates every access
+    token too). Carrying a `jti` (a random, single-use id, not tied to any
+    other field on the token) lets the caller track *this specific token*
+    server-side — see auth.py's refresh endpoint, which deletes the jti the
+    moment it's redeemed, so a captured refresh token is only ever good for
+    one silent re-login, not repeated use for its full week of validity.
 
     Args:
         subject: The user ID to encode in the token
         expires_delta: Optional custom expiration time
 
     Returns:
-        Encoded JWT refresh token string
+        (encoded JWT refresh token string, its jti) — the caller is
+        responsible for recording the jti somewhere it can later check
+        "has this been redeemed yet", since the token itself carries no
+        such state.
     """
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
@@ -82,11 +95,13 @@ def create_refresh_token(
             days=settings.REFRESH_TOKEN_EXPIRE_DAYS
         )
 
+    jti = str(uuid.uuid4())
     to_encode = {
         "sub": str(subject),
         "exp": expire,
         "iat": datetime.now(timezone.utc),
-        "type": "refresh"
+        "type": "refresh",
+        "jti": jti,
     }
 
     encoded_jwt = jwt.encode(
@@ -94,7 +109,7 @@ def create_refresh_token(
         settings.SECRET_KEY,
         algorithm=settings.JWT_ALGORITHM
     )
-    return encoded_jwt
+    return encoded_jwt, jti
 
 
 def decode_token(token: str) -> Optional[dict]:

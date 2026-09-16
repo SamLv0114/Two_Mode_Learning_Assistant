@@ -43,6 +43,7 @@ export const useAuth = create<AuthState>()(
         try {
           const response = await authApi.login(email, password);
           localStorage.setItem('access_token', response.access_token);
+          localStorage.setItem('refresh_token', response.refresh_token);
           set({
             token: response.access_token,
             isAuthenticated: true,
@@ -59,6 +60,7 @@ export const useAuth = create<AuthState>()(
         try {
           const response = await authApi.register(data);
           localStorage.setItem('access_token', response.access_token);
+          localStorage.setItem('refresh_token', response.refresh_token);
           set({
             user: response,
             token: response.access_token,
@@ -71,6 +73,7 @@ export const useAuth = create<AuthState>()(
 
       logout: () => {
         localStorage.removeItem('access_token');
+        localStorage.removeItem('refresh_token');
         set({
           user: null,
           token: null,
@@ -94,8 +97,10 @@ export const useAuth = create<AuthState>()(
             isAuthenticated: true,
           });
         } catch (error) {
-          // Token invalid
+          // Token invalid, and the response interceptor's own refresh
+          // attempt (if any) already failed too by the time this runs.
           localStorage.removeItem('access_token');
+          localStorage.removeItem('refresh_token');
           set({
             user: null,
             token: null,
