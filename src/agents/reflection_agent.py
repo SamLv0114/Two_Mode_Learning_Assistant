@@ -115,9 +115,21 @@ class ReflectionAgent(BaseAgent):
 
         try:
             refined = self._inner.run(refined_prompt, conversation_history, context)
-            if len(refined.reply) >= len(result.reply) * 0.7:
-                logger.info(f"[ReflectionAgent] Using refined answer ({len(refined.reply)} chars)")
+            # Re-score the refined draft instead of only checking it isn't
+            # suspiciously short — a length check can't tell "improved" from
+            # "still bad but not truncated". Only swap in the refined answer
+            # if it actually scored better than what it's replacing.
+            refined_crit = self._critic.evaluate(message, refined.reply, refined.citations)
+            if refined_crit.aggregate >= crit.aggregate:
+                logger.info(
+                    f"[ReflectionAgent] Using refined answer "
+                    f"(agg={refined_crit.aggregate:.2f} vs draft {crit.aggregate:.2f})"
+                )
                 return refined
+            logger.info(
+                f"[ReflectionAgent] Refined answer did not improve "
+                f"(agg={refined_crit.aggregate:.2f} vs draft {crit.aggregate:.2f}) — keeping draft"
+            )
         except Exception as e:
             logger.warning(f"[ReflectionAgent] Refinement step failed: {e}")
 
@@ -213,11 +225,27 @@ class ReflectionAgent(BaseAgent):
             # onto rather than replace.
             try:
                 refined = self._inner.run(refined_prompt, conversation_history, context)
-                if len(refined.reply) >= len(draft_text) * 0.7:
-                    logger.info(f"[ReflectionAgent] Using refined answer (stream, {len(refined.reply)} chars)")
+                # Re-score the refined draft rather than only checking length
+                # (see run()'s identical fix). Only swap it in — and only
+                # then update the quality badge the frontend already showed
+                # for the draft — if it actually scored better; otherwise the
+                # draft's score stays correct for the draft that's still
+                # what gets shown.
+                refined_crit = self._critic.evaluate(message, refined.reply, refined.citations)
+                if refined_crit.aggregate >= crit.aggregate:
+                    logger.info(
+                        f"[ReflectionAgent] Using refined answer (stream, "
+                        f"agg={refined_crit.aggregate:.2f} vs draft {crit.aggregate:.2f})"
+                    )
                     final_text = refined.reply
                     final_tools = refined.tools_called
                     final_citations = refined.citations
+                    yield {"type": "critique_result", **refined_crit.to_dict()}
+                else:
+                    logger.info(
+                        f"[ReflectionAgent] Refined answer did not improve (stream, "
+                        f"agg={refined_crit.aggregate:.2f} vs draft {crit.aggregate:.2f}) — keeping draft"
+                    )
             except Exception as e:
                 logger.warning(f"[ReflectionAgent] Streaming refinement failed: {e}")
 
