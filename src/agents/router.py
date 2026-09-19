@@ -30,17 +30,30 @@ logger = logging.getLogger(__name__)
 
 _ANALYTICAL_KEYWORDS = {
     "compare", "comparison", "difference between", "differences between",
-    "pros and cons", "trade-off", "trade off", "tradeoffs", "tradeoff",
-    "when should i use", "vs", "versus", "advantages of", "disadvantages of",
-    "benefits of", "limitations of", "better than", "worse than",
-    "which is better", "should i use",
+    "pros and cons", "when should i use", "vs", "versus",
+    "advantages of", "disadvantages of", "benefits of", "limitations of",
+    "better than", "worse than", "which is better", "should i use",
+    # "tradeoff" on its own is a noun in plenty of concept names
+    # ("the bias-variance tradeoff"), which is a definition request, not a
+    # comparison. Requiring "between" keeps the real comparisons
+    # ("the tradeoff between LoRA and full fine-tuning") and drops those.
+    "trade-off between", "trade off between", "tradeoff between",
+    "tradeoffs between",
 }
 
 _COMPLEX_KEYWORDS = {
-    "how does", "why does", "comprehensive", "overview of", "survey",
+    "comprehensive", "overview of", "survey",
     "explain in detail", "walk me through", "what are the implications",
     "multiple", "several", "various", "relationship between",
+    "deep dive", "thorough analysis",
 }
+# "how does" / "why does" used to live in the set above. They are the ordinary
+# opening of a *simple* explanation request — "how does backpropagation work"
+# — and were responsible for 6 of the 7 simple questions that the routing
+# evaluation caught being sent to DeepResearchAgent, each costing a planner
+# plus parallel summarisers plus a writer. Depth has to be asked for
+# explicitly ("deep dive", "thorough analysis", "comprehensive"), not inferred
+# from an interrogative.
 
 _COMPLEX_LENGTH = 90        # long enough to *consider* the deep path
 _VERY_LONG_LENGTH = 220     # long enough that multi-part intent is near-certain

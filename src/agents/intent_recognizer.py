@@ -7,6 +7,7 @@ Stage 3 (LLM): GPT-4o-mini classification for ambiguous messages
 """
 import json
 import logging
+import re
 from enum import Enum
 from typing import Tuple, List, Dict, Optional
 
@@ -23,6 +24,11 @@ class Intent(str, Enum):
     DOCUMENT_MANAGEMENT = "document_management"
     GENERAL_CHAT = "general_chat"
 
+
+# Confidence returned when two intents both have keyword evidence and the
+# leader is not strictly dominant: deliberately below the 0.6 gate in
+# recognize(), so the decision falls through to the semantic stages.
+CONTESTED_CONFIDENCE = 0.45
 
 # Stage 1: keyword rules
 KEYWORD_RULES: Dict[str, List[str]] = {
@@ -128,19 +134,53 @@ class IntentRecognizer:
     # ── Stage 1: keyword matching ─────────────────────────────────────────────
 
     def _keyword_match(self, text: str) -> Tuple[Optional[str], float]:
+        """
+        Weighted keyword vote, deferring when two intents both have evidence.
+
+        Two things a plain match count got wrong, both measured on
+        evaluation/datasets/routing.jsonl:
+
+        1. Every keyword counted the same, so the single generic word "feed"
+           in "how does a feed-forward network work" outvoted nothing and
+           still won on a tie. Longer phrases are far more decisive than
+           single words, so a match is now worth its word count.
+
+        2. A keyword from one intent appearing inside a question *about*
+           another intent ("explain what a knowledge base is in RAG systems")
+           was treated as confidently as an uncontested match. When a second
+           intent also has lexical evidence and the leader is not strictly
+           dominant, this stage now returns a low confidence on purpose so the
+           decision falls through to the embedding/LLM stages, which read the
+           sentence rather than spot words in it.
+
+        Word boundaries matter here for the same reason they do in
+        router.py's analytical check: a bare substring test lets "hey" fire on
+        "they" and "vs" on "VSA".
+        """
         text_lower = text.lower()
         scores: Dict[str, int] = {}
         for intent, keywords in KEYWORD_RULES.items():
-            count = sum(1 for kw in keywords if kw in text_lower)
-            if count:
-                scores[intent] = count
+            weight = sum(
+                len(kw.split())
+                for kw in keywords
+                if re.search(rf"\b{re.escape(kw)}\b", text_lower)
+            )
+            if weight:
+                scores[intent] = weight
 
         if not scores:
             return None, 0.0
 
-        best = max(scores, key=scores.get)
-        # Scale: 1 match → ~0.5 conf, 2 matches → ~0.75, 3+ → ~0.9
-        confidence = min(0.95, 0.4 + scores[best] * 0.25)
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        best, best_weight = ranked[0]
+        runner_weight = ranked[1][1] if len(ranked) > 1 else 0
+
+        # Contested and not strictly dominant -> hand it to the next stage.
+        if runner_weight and best_weight <= 2 * runner_weight:
+            return best, CONTESTED_CONFIDENCE
+
+        # 1 word → 0.65, 2 → 0.80, 3 → 0.90, 4+ → 0.95
+        confidence = min(0.95, 0.5 + best_weight * 0.15)
         return best, confidence
 
     # ── Stage 2: embedding cosine similarity ──────────────────────────────────
