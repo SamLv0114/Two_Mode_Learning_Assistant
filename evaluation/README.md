@@ -83,8 +83,16 @@ python evaluation/runners/run_retrieval_eval.py   # 只跑检索
 - `intent_accuracy`：四分类准确率
 - `stage_distribution`：三阶段各自解决的占比（关键词 / 向量相似度 / LLM 兜底）
 - `llm_call_rate`：需要走第三阶段 LLM 分类的 query 占比（= 成本）
-- `adversarial_accuracy`：对抗样本子集上的准确率（子串误匹配那一类，
-  如 `"VSA"` 不应触发 `"vs"` 的分析型路由）
+- `adversarial_accuracy`：对抗样本子集上的准确率
+
+**对抗样本的构造要求**：每一条在写入数据集前，必须先用
+`IntentRecognizer._keyword_match()` 实际跑一遍，确认它在 `KEYWORD_RULES`
+里真的同时命中了两个不同意图的关键词——不能只是"看起来像陷阱"就收进去。
+第一版对抗集里有两条以 `"vs"` 子串为陷阱（如 `"VSA"`、`"vsync"`），但
+`"vs"` 根本不在 `KEYWORD_RULES` 里，它只出现在 `router.py` 的
+`_ANALYTICAL_KEYWORDS`（第二次路由阶段），测的是另一段代码、而且那段代码
+的单词边界修复在这次评估之前就已经做过了。这两条已替换为真实撞上
+`KEYWORD_RULES` 的案例，替换前后的判断过程见 git 历史。
 
 **阈值扫描**：关键词阈值 ∈ {0.50, 0.55, 0.60, 0.65, 0.70, 0.75}，
 向量阈值 ∈ {0.55, 0.60, 0.65, 0.70, 0.75}。报告 `intent_accuracy` 与
