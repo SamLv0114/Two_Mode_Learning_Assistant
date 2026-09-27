@@ -5,6 +5,10 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { authApi, User } from './api';
 
+// Ignore profile responses started under a previous login session.
+let sessionVersion = 0;
+let profileRequestVersion = 0;
+
 interface AuthState {
   user: User | null;
   token: string | null;
@@ -42,6 +46,7 @@ export const useAuth = create<AuthState>()(
         set({ isLoading: true });
         try {
           const response = await authApi.login(email, password);
+          sessionVersion += 1;
           localStorage.setItem('access_token', response.access_token);
           localStorage.setItem('refresh_token', response.refresh_token);
           set({
@@ -59,6 +64,7 @@ export const useAuth = create<AuthState>()(
         set({ isLoading: true });
         try {
           const response = await authApi.register(data);
+          sessionVersion += 1;
           localStorage.setItem('access_token', response.access_token);
           localStorage.setItem('refresh_token', response.refresh_token);
           set({
@@ -72,6 +78,7 @@ export const useAuth = create<AuthState>()(
       },
 
       logout: () => {
+        sessionVersion += 1;
         localStorage.removeItem('access_token');
         localStorage.removeItem('refresh_token');
         set({
@@ -82,21 +89,28 @@ export const useAuth = create<AuthState>()(
       },
 
       fetchProfile: async () => {
+        const requestVersion = sessionVersion;
+        const profileVersion = ++profileRequestVersion;
+        const isCurrent = () => requestVersion === sessionVersion && profileVersion === profileRequestVersion;
         const token = localStorage.getItem('access_token');
         if (!token) {
-          set({ isAuthenticated: false });
+          if (isCurrent()) {
+            set({ user: null, token: null, isAuthenticated: false });
+          }
           return;
         }
 
         set({ isLoading: true });
         try {
           const user = await authApi.getProfile();
+          if (!isCurrent()) return;
           set({
             user,
-            token,
+            token: localStorage.getItem('access_token'),
             isAuthenticated: true,
           });
         } catch (error) {
+          if (!isCurrent()) return;
           // Token invalid, and the response interceptor's own refresh
           // attempt (if any) already failed too by the time this runs.
           localStorage.removeItem('access_token');
@@ -107,7 +121,9 @@ export const useAuth = create<AuthState>()(
             isAuthenticated: false,
           });
         } finally {
-          set({ isLoading: false });
+          if (isCurrent()) {
+            set({ isLoading: false });
+          }
         }
       },
 

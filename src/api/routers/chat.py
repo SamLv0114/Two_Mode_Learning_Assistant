@@ -1,7 +1,7 @@
 """
 Chat endpoint: unified conversational interface with agent routing.
 
-POST   /chat            — send a message, get a routed agent response
+POST   /chat/stream     — stream a routed agent response
 GET    /chat/history/{session_id}    — retrieve conversation history
 DELETE /chat/history/{session_id}    — clear a session
 GET    /chat/trace/{session_id}      — retrieve agent tool-call trace (Feature 4)
@@ -21,7 +21,8 @@ import threading
 import time
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from contextlib import closing
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -69,20 +70,7 @@ def _get_redis():
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
-    enable_eval: bool = False
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    intent: str
-    agent_used: str
-    citations: List[dict]
-    tools_called: List[str]
-    session_id: str
-    recognition_method: str
-    confidence: float
-    processing_time_ms: int
-    eval_scores: Optional[dict] = None
+    resume_run_id: Optional[str] = None
 
 
 class EvalTestCase(BaseModel):
@@ -103,16 +91,6 @@ class EvalRunResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _store_trace(session_id: str, trace: List[dict], redis_client) -> None:
-    """Persist the tool-call trace for a session to Redis."""
-    if not trace or not redis_client:
-        return
-    try:
-        redis_client.setex(f"agent_trace:{session_id}", 3600, json.dumps(trace))
-    except Exception as e:
-        logger.debug(f"Trace persist failed: {e}")
-
-
 def _extract_facts_bg(
     user_id: int,
     user_message: str,
@@ -127,110 +105,6 @@ def _extract_facts_bg(
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
-
-# Disabled — zero callers from the frontend. The dashboard only ever calls
-# POST /chat/stream; this non-streaming endpoint (and the enable_eval path
-# on it, which was the only reachable way LLMJudge got exercised outside of
-# /chat/eval/run) has never been hit by real traffic. Left commented rather
-# than deleted in case a non-streaming chat endpoint is wanted again later.
-# @router.post("/", response_model=ChatResponse)
-# async def chat(
-#     request: ChatRequest,
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db_session),
-#     embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
-# ):
-#     """
-#     Main conversational endpoint with automatic agent routing.
-#
-#     Pipeline per request:
-#       1. Load relevant conversation history (ContextBuilder: semantic selection)
-#       2. Inject long-term user facts into system prompt (UserFactMemory)
-#       3. Classify intent → dispatch to agent (router)
-#       4. Record tool-call trace in Redis
-#       5. Background: extract and store new user facts (UserFactMemory)
-#
-#     Pass `session_id` from a previous response to continue the same conversation.
-#     """
-#     if not request.message.strip():
-#         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
-#
-#     session_id = request.session_id or ConversationMemory.new_session_id()
-#     redis_client = _get_redis()
-#     memory = ConversationMemory(redis_client=redis_client, user_id=current_user.id)
-#     retriever = Retriever(embedding_manager)
-#     agent_router = _get_agent_router(embedding_manager)
-#
-#     # ── Feature 2: Semantic history selection ─────────────────────────────────
-#     raw_history = memory.get_history(session_id, max_messages=20)
-#     builder = ContextBuilder(embedding_model=getattr(embedding_manager, "model", None))
-#     history = builder.build(request.message, raw_history, top_k=8)
-#
-#     # ── Feature 1: Inject user facts into system prompt ───────────────────────
-#     user_facts_context = _fact_memory.get_context_string(current_user.id, redis_client)
-#
-#     # ── Feature 4: Initialise trace list ──────────────────────────────────────
-#     trace: List[dict] = []
-#
-#     context = {
-#         "db": db,
-#         "user": current_user,
-#         "retriever": retriever,
-#         "embedding_manager": embedding_manager,
-#         "user_facts_context": user_facts_context,   # Feature 1
-#         "_trace": trace,                             # Feature 4
-#     }
-#
-#     result, intent, method, confidence, agent_used = agent_router.route(
-#         message=request.message,
-#         conversation_history=history,
-#         context=context,
-#     )
-#
-#     # ── Feature 4: Persist trace ───────────────────────────────────────────────
-#     _store_trace(session_id, trace, redis_client)
-#
-#     memory.add_message(session_id, "user", request.message)
-#     memory.add_message(session_id, "assistant", result.reply)
-#
-#     # ── Feature 1: Background fact extraction ─────────────────────────────────
-#     threading.Thread(
-#         target=_extract_facts_bg,
-#         args=(current_user.id, request.message, result.reply, redis_client),
-#         daemon=True,
-#     ).start()
-#
-#     eval_scores = None
-#     if request.enable_eval:
-#         try:
-#             from src.evaluation.llm_judge import LLMJudge
-#             score = LLMJudge().evaluate(question=request.message, response=result.reply)
-#             eval_scores = score.to_dict()
-#         except Exception as e:
-#             logger.warning(f"LLM judge skipped: {e}")
-#
-#     record_request(
-#         intent=intent,
-#         agent=agent_used,
-#         method=method,
-#         latency_ms=result.processing_time_ms,
-#         tools_called=result.tools_called,
-#         eval_scores=eval_scores,
-#     )
-#
-#     return ChatResponse(
-#         reply=result.reply,
-#         intent=intent,
-#         agent_used=agent_used,
-#         citations=result.citations,
-#         tools_called=result.tools_called,
-#         session_id=session_id,
-#         recognition_method=method,
-#         confidence=round(confidence, 3),
-#         processing_time_ms=result.processing_time_ms,
-#         eval_scores=eval_scores,
-#     )
-
 
 @router.get("/history/{session_id}")
 async def get_history(session_id: str, current_user: User = Depends(get_current_user)):
@@ -266,7 +140,7 @@ async def get_trace(session_id: str, current_user: User = Depends(get_current_us
     the session has expired.
     """
     redis_client = _get_redis()
-    trace = ToolAwareAgent.load_trace(session_id, redis_client)
+    trace = ToolAwareAgent.load_trace(current_user.id, session_id, redis_client)
     return {
         "session_id": session_id,
         "trace": trace,
@@ -277,9 +151,20 @@ async def get_trace(session_id: str, current_user: User = Depends(get_current_us
 
 # ── Streaming endpoint ────────────────────────────────────────────────────────
 
+@router.get("/research-runs")
+async def list_research_runs(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    """Return this user's recent durable research runs for recovery after reload."""
+    from src.agents.research_run_store import ResearchRunStore
+    return {"runs": ResearchRunStore(db, current_user.id).list_recent()}
+
+
 @router.post("/stream")
 async def chat_stream(
     request: ChatRequest,
+    http_request: Request,
     current_user: User = Depends(get_current_user),
     embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
 ):
@@ -301,12 +186,13 @@ async def chat_stream(
       {"type": "task_started", "id": int, "title": str}
       {"type": "task_done",    "id": int, "citations": int}
     """
-    if not request.message.strip():
+    if not request.message.strip() and not request.resume_run_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
 
     session_id = request.session_id or ConversationMemory.new_session_id()
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+    cancel_event = threading.Event()
 
     def run_in_thread():
         from src.database.models import SessionLocal
@@ -323,17 +209,34 @@ async def chat_stream(
             context = {
                 "db": db,
                 "user": current_user,
+                "session_id": session_id,
+                "redis_client": redis_client,
+                "_cancel_event": cancel_event,
                 "retriever": retriever,
                 "embedding_manager": embedding_manager,
                 "user_facts_context": user_facts_context,
+                "resume_run_id": request.resume_run_id,
             }
 
             start = time.time()
-            agent_router = _get_agent_router(embedding_manager)
-            raw_agent, intent, method, confidence = agent_router.route_stream(request.message)
+            if request.resume_run_id:
+                from src.agents.deep_research_agent import DeepResearchAgent
+                from src.agents.research_run_store import ResearchRunStore
+                saved_run = ResearchRunStore(db, current_user.id).load(request.resume_run_id)
+                if saved_run is None:
+                    loop.call_soon_threadsafe(queue.put_nowait, {
+                        "type": "error", "value": "Research run not found for this user",
+                    })
+                    return
+                question = saved_run["question"]
+                raw_agent, intent, method, confidence = DeepResearchAgent(), "research_qa", "resume", 1.0
+            else:
+                question = request.message
+                agent_router = _get_agent_router(embedding_manager)
+                raw_agent, intent, method, confidence = agent_router.route_stream(question)
 
             # ── Feature 4: wrap agent for observability ────────────────────────
-            aware_agent = ToolAwareAgent(raw_agent, session_id=session_id, redis_client=redis_client)
+            aware_agent = ToolAwareAgent(raw_agent, user_id=current_user.id, session_id=session_id, redis_client=redis_client)
 
             loop.call_soon_threadsafe(queue.put_nowait, {
                 "type": "intent",
@@ -348,35 +251,77 @@ async def chat_stream(
 
             # ── Feature 2: semantic history ────────────────────────────────────
             memory = ConversationMemory(redis_client=redis_client, user_id=current_user.id)
-            raw_history = memory.get_history(session_id, max_messages=20)
+            raw_history = memory.get_history(session_id, max_messages=100)
             builder = ContextBuilder(embedding_model=getattr(embedding_manager, "model", None))
-            history = builder.build(request.message, raw_history, top_k=8)
+            history = builder.build(question, raw_history, top_k=20)
+            context["_full_history"] = raw_history
+
+            answer_cache = None
+            cache_scope = None
+            cached_answer = None
+            if settings.ANSWER_CACHE_ENABLED and redis_client and not request.resume_run_id:
+                from src.rag.answer_cache import SemanticAnswerCache, eligible_answer
+                if eligible_answer(intent, raw_history, user_facts_context, raw_agent.name):
+                    try:
+                        answer_cache = SemanticAnswerCache(redis_client, embedding_manager.generate_embedding)
+                        cache_scope = answer_cache.scope(
+                            current_user.id, settings.LLM_MODEL, raw_agent.system_prompt,
+                            embedding_manager.collection.count(),
+                        )
+                        cached_answer = answer_cache.get(question, cache_scope)
+                    except Exception as exc:
+                        logger.debug("Answer cache lookup failed: %s", exc)
+                        answer_cache = None
+
+            def cached_events():
+                yield {"type": "token", "value": cached_answer["reply"]}
+                yield {"type": "done", "tools_called": [], "citations": cached_answer["citations"], "cache_hit": True}
 
             reply_parts = []
             tools_called: list = []
+            citations: list = []
             eval_scores = None
-            for event in aware_agent.stream(request.message, history, context):
-                etype = event.get("type")
-                if etype == "token":
-                    reply_parts.append(event["value"])
-                elif etype == "done":
-                    tools_called = event.get("tools_called", [])
-                elif etype == "critique_result":
-                    # Only ReflectionAgent emits this — real CriticAgent
-                    # scores from the reflection loop, not the separate
-                    # opt-in LLMJudge the non-streaming endpoint uses.
-                    eval_scores = {k: v for k, v in event.items() if k != "type"}
-                loop.call_soon_threadsafe(queue.put_nowait, event)
+            done_seen = False
+            event_stream = cached_events() if cached_answer else aware_agent.stream(question, history, context)
+            with closing(event_stream) as events:
+                for event in events:
+                    if cancel_event.is_set() or event.get("type") == "cancelled":
+                        break
+                    etype = event.get("type")
+                    if etype in ("token", "draft_token"):
+                        reply_parts.append(event["value"])
+                    elif etype == "replace":
+                        reply_parts = [event["value"]]
+                    elif etype == "done":
+                        done_seen = True
+                        tools_called = event.get("tools_called", [])
+                        citations = event.get("citations", [])
+                    elif etype == "critique_result":
+                        # Only ReflectionAgent emits this — real CriticAgent
+                        # scores from the reflection loop, not the separate
+                        # opt-in LLMJudge the non-streaming endpoint uses.
+                        eval_scores = {k: v for k, v in event.items() if k != "type"}
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
 
             full_reply = "".join(reply_parts)
-            if full_reply:
-                memory.add_message(session_id, "user", request.message)
+            if full_reply and done_seen and answer_cache and cache_scope and not cached_answer and not cancel_event.is_set():
+                from src.rag.answer_cache import cacheable_result
+                if cacheable_result(full_reply, tools_called, citations):
+                    answer_cache.put(question, cache_scope, {
+                        "reply": full_reply, "citations": citations,
+                    })
+            if full_reply and done_seen and not cancel_event.is_set():
+                if not request.resume_run_id or not any(
+                    item.get("role") == "user" and item.get("content") == question
+                    for item in raw_history
+                ):
+                    memory.add_message(session_id, "user", question)
                 memory.add_message(session_id, "assistant", full_reply)
 
                 # ── Feature 1: background fact extraction ─────────────────────
                 threading.Thread(
                     target=_extract_facts_bg,
-                    args=(current_user.id, request.message, full_reply, redis_client),
+                    args=(current_user.id, question, full_reply, redis_client),
                     daemon=True,
                 ).start()
 
@@ -403,12 +348,20 @@ async def chat_stream(
     thread.start()
 
     async def event_generator():
-        yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
+            while True:
+                if await http_request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            cancel_event.set()
 
     return StreamingResponse(
         event_generator(),
@@ -458,7 +411,8 @@ async def eval_run(
             conversation_history=[],
             context=context,
         )
-        score = judge.evaluate(question=case.question, response=result.reply)
+        score = judge.evaluate(question=case.question, response=result.reply,
+                               citations=result.citations)
 
         for k in totals:
             totals[k] += getattr(score, k)

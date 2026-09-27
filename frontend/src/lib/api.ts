@@ -61,6 +61,16 @@ api.interceptors.response.use(
       return Promise.reject(error);
     }
 
+    // A login or registration may have replaced the token while this request
+    // was in flight. Retry with the current session before touching refresh.
+    const currentToken = localStorage.getItem('access_token');
+    const requestToken = originalRequest.headers?.Authorization;
+    if (currentToken && requestToken !== `Bearer ${currentToken}`) {
+      originalRequest._retried = true;
+      originalRequest.headers = { ...originalRequest.headers, Authorization: `Bearer ${currentToken}` };
+      return api(originalRequest);
+    }
+
     const refreshToken = localStorage.getItem('refresh_token');
     if (!refreshToken) {
       goToLogin();
@@ -160,6 +170,8 @@ export interface FeedResponse {
   time_window_days: number;
   focus_areas: string[];
   used_ml_ranking: boolean;
+  ranking_source?: string;
+  ranking_fallback_reason?: string | null;
   total_papers_considered: number;
   total_articles_considered: number;
 }
@@ -198,6 +210,15 @@ export interface InteractionStats {
   interactions_until_training: number;
 }
 
+export interface ModelStatus {
+  is_trained: boolean;
+  interaction_count: number;
+  interaction_count_at_training: number;
+  training_sample_count: number;
+  training_label_counts?: Record<string, number> | null;
+  last_trained_at?: string | null;
+}
+
 export interface FeedJobStatus {
   status: 'generating' | 'collecting' | 'ranking' | 'done' | 'error' | 'not_found';
   message?: string;
@@ -206,6 +227,8 @@ export interface FeedJobStatus {
   papers_count?: number;
   articles_count?: number;
   used_ml_ranking?: boolean;
+  ranking_source?: string;
+  ranking_fallback_reason?: string | null;
 }
 
 export type AgentEvent =
@@ -216,8 +239,12 @@ export type AgentEvent =
   | { type: 'tool_result'; tool: string; count: number }
   | { type: 'generating' }
   | { type: 'token'; value: string }
-  | { type: 'done'; tools_called: string[]; citations: { title: string; url: string; type: string }[] }
+  | { type: 'draft_token'; value: string }
+  | { type: 'replace'; value: string }
+  | { type: 'done'; tools_called: string[]; citations: { title: string; url: string; type: string }[]; stop_reason?: string; run_id?: string; resumable?: boolean }
   | { type: 'error'; value: string }
+  | { type: 'cancelled' }
+  | { type: 'run'; run_id: string }
   | { type: 'plan'; tasks: { id: number; title: string; intent: string }[] }
   | { type: 'task_started'; id: number; title: string }
   | { type: 'task_done'; id: number; citations: number }
@@ -298,28 +325,22 @@ export const feedApi = {
   }) => {
     const response = await api.post<{ job_id: string; status: string; message: string }>(
       '/feed/generate',
-      params
+      params,
+      { timeout: 20000 }
     );
     return response.data;
   },
 
   getJobStatus: async (jobId: string) => {
-    const response = await api.get<FeedJobStatus>(`/feed/status/${jobId}`);
+    const response = await api.get<FeedJobStatus>(`/feed/status/${jobId}`, { timeout: 15000 });
     return response.data;
   },
 
   /** Omit `limit` to let the server return its configured feed size. */
   getPapers: async (limit?: number, offset = 0) => {
     const response = await api.get<Paper[]>('/feed/papers', {
+      timeout: 15000,
       params: { ...(limit !== undefined && { limit }), offset },
-    });
-    return response.data;
-  },
-
-  /** @deprecated V4 retired feed articles — use whatsHotApi for trending content. */
-  getArticles: async (limit = 10, offset = 0) => {
-    const response = await api.get<Article[]>('/feed/articles', {
-      params: { limit, offset },
     });
     return response.data;
   },
@@ -331,8 +352,8 @@ export const feedApi = {
     return response.data;
   },
 
-  // V4: Evaluator-Optimizer refinement pass over the current feed.
-  // Reads feed_ctx from Redis (2h TTL) — requires a prior /feed/generate.
+  // Evaluator-Optimizer refinement pass over the current feed.
+  // Cached feed context is optional; the server recomputes it after expiry.
   refine: async (): Promise<RefineResponse> => {
     const response = await api.post<RefineResponse>('/feed/refine');
     return response.data;
@@ -406,7 +427,7 @@ export const interactionsApi = {
   },
 
   getModelStatus: async () => {
-    const response = await api.get('/interactions/model/status');
+    const response = await api.get<ModelStatus>('/interactions/model/status');
     return response.data;
   },
 
@@ -477,6 +498,11 @@ export const chatApi = {
       messages: { role: 'user' | 'assistant'; content: string }[];
       count: number;
     }>(`/chat/history/${sessionId}`);
+    return response.data;
+  },
+
+  getResearchRuns: async () => {
+    const response = await api.get<{ runs: { run_id: string; question: string; status: string; resumable: boolean }[] }>('/chat/research-runs');
     return response.data;
   },
 };

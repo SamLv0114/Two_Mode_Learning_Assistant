@@ -3,22 +3,23 @@ ToolAwareAgent — observability wrapper for any BaseAgent.
 
 Inspired by Hello-Agents ch14 ToolAwareSimpleAgent with tool_call_listener.
 
-Attaches a tool_call_listener to any BaseAgent that:
+Adds a request-local tool-call listener that:
   - Records the tool name, arguments, result preview, and wall-clock duration
-  - Optionally persists the trace to Redis under  agent_trace:{session_id}
+  - Optionally persists the trace to Redis under  agent_trace:{user_id}:{session_id}
 
 The GET /chat/trace/{session_id} endpoint reads these traces to expose
 full agent reasoning to developers and demos.
 
 Usage:
     agent = ResearchAgent()
-    aware = ToolAwareAgent(agent, session_id=session_id, redis_client=redis)
+    aware = ToolAwareAgent(agent, user_id=user_id, session_id=session_id, redis_client=redis)
     result = aware.run(message, history, context)
     trace = aware.get_trace()   # list of ToolTraceEntry dicts
 """
 import json
 import logging
 import time
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Generator, List, Optional
 
@@ -51,10 +52,12 @@ class ToolAwareAgent:
     def __init__(
         self,
         agent: BaseAgent,
+        user_id: int,
         session_id: str,
         redis_client=None,
     ):
         self._inner = agent
+        self.user_id = user_id
         self.session_id = session_id
         self.redis = redis_client
         self._trace: List[ToolTraceEntry] = []
@@ -62,8 +65,17 @@ class ToolAwareAgent:
         # Expose inner agent's name for router compatibility
         self.name = agent.name
 
-        # Attach the listener to the inner agent
-        agent.tool_call_listener = self._on_tool_call
+        # Never assign agent.tool_call_listener: the router caches agents and
+        # another request can be using this same instance concurrently.
+
+    @staticmethod
+    def trace_key(user_id: int, session_id: str) -> str:
+        return f"agent_trace:{user_id}:{session_id}"
+
+    def _request_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        request_context = dict(context)
+        request_context["_tool_call_listener"] = self._on_tool_call
+        return request_context
 
     # ── Listener ──────────────────────────────────────────────────────────────
 
@@ -93,13 +105,14 @@ class ToolAwareAgent:
         if not self.redis:
             return
         try:
-            key = f"agent_trace:{self.session_id}"
-            raw = self.redis.get(key)
-            trace = json.loads(raw) if raw else []
-            trace.append(asdict(entry))
-            if len(trace) > MAX_TRACE_ENTRIES:
-                trace = trace[-MAX_TRACE_ENTRIES:]
-            self.redis.setex(key, TRACE_TTL_SECONDS, json.dumps(trace))
+            key = self.trace_key(self.user_id, self.session_id)
+            # Redis list append is atomic. A transaction keeps the size cap
+            # and TTL together with the append under concurrent tool calls.
+            with self.redis.pipeline(transaction=True) as pipe:
+                pipe.rpush(key, json.dumps(asdict(entry)))
+                pipe.ltrim(key, -MAX_TRACE_ENTRIES, -1)
+                pipe.expire(key, TRACE_TTL_SECONDS)
+                pipe.execute()
         except Exception as e:
             logger.debug(f"ToolAwareAgent: Redis persist failed: {e}")
 
@@ -111,7 +124,7 @@ class ToolAwareAgent:
         conversation_history: List[Dict],
         context: Dict[str, Any],
     ) -> AgentResult:
-        return self._inner.run(message, conversation_history, context)
+        return self._inner.run(message, conversation_history, self._request_context(context))
 
     def stream(
         self,
@@ -119,7 +132,14 @@ class ToolAwareAgent:
         conversation_history: List[Dict],
         context: Dict[str, Any],
     ) -> Generator:
-        yield from self._inner.stream(message, conversation_history, context)
+        request_context = self._request_context(context)
+        with closing(self._inner.stream(message, conversation_history, request_context)) as events:
+            for event in events:
+                cancel = request_context.get("_cancel_event")
+                if cancel is not None and cancel.is_set():
+                    yield {"type": "cancelled"}
+                    return
+                yield event
 
     # ── Trace access ──────────────────────────────────────────────────────────
 
@@ -128,12 +148,12 @@ class ToolAwareAgent:
         return [asdict(e) for e in self._trace]
 
     @staticmethod
-    def load_trace(session_id: str, redis_client) -> List[Dict]:
+    def load_trace(user_id: int, session_id: str, redis_client) -> List[Dict]:
         """Load a persisted trace from Redis (e.g., from a prior request)."""
         if not redis_client:
             return []
         try:
-            raw = redis_client.get(f"agent_trace:{session_id}")
-            return json.loads(raw) if raw else []
+            raw = redis_client.lrange(ToolAwareAgent.trace_key(user_id, session_id), 0, -1)
+            return [json.loads(item) for item in raw]
         except Exception:
             return []

@@ -1,0 +1,76 @@
+name: Scheduled model evaluation
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/agents/**'
+      - 'src/rag/**'
+      - 'src/models/embeddings.py'
+      - 'src/utils/config.py'
+      - 'evaluation/rubrics/**'
+      - 'evaluation/datasets/**'
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+jobs:
+  model-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - name: Require model credentials
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo 'OPENAI_API_KEY secret is required for scheduled model evaluation'
+            exit 1
+          fi
+      - name: Prompt injection regression
+        run: python evaluation/runners/run_prompt_injection_eval.py
+      - name: Download fixed corpus if human golden exists
+        if: hashFiles('evaluation/datasets/generation_golden.jsonl') != ''
+        run: |
+          gh release download eval-corpus-v1 -p chroma-snapshot.tar.zst
+          mkdir -p "$RUNNER_TEMP/eval-corpus"
+          tar --zstd -xf chroma-snapshot.tar.zst -C "$RUNNER_TEMP/eval-corpus"
+          echo "VECTOR_DB_DIR=$RUNNER_TEMP/eval-corpus" >> "$GITHUB_ENV"
+      - name: Generation quality
+        if: hashFiles('evaluation/datasets/generation_golden.jsonl') != ''
+        run: python evaluation/run_all.py generation
+      - name: Check for human trajectory labels
+        id: trajectory_labels
+        if: hashFiles('evaluation/datasets/generation_golden.jsonl') != ''
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('evaluation/datasets/generation_golden.jsonl').read_text().splitlines() if line.strip()]
+          print('available=' + str(any(any(key in row for key in ('expected_tools', 'forbidden_tools', 'before')) for row in rows)).lower())
+          PY
+      - name: Tool trajectory
+        if: steps.trajectory_labels.outputs.available == 'true'
+        run: python evaluation/run_all.py trajectory
+      - name: Preserve model evaluation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduled-model-evaluation
+          path: |
+            evaluation/results/*_prompt_injection_eval.md
+            evaluation/results/*_generation_eval.md
+            evaluation/results/*_generation_eval.jsonl
+            evaluation/results/*_trajectory_eval.md
+            evaluation/results/*_trajectory_eval.jsonl
+          if-no-files-found: ignore

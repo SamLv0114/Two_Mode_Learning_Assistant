@@ -13,16 +13,14 @@ This is the "before" measurement for the clarify / interrupt-resume feature.
 Token, latency and tool-call counts for the same run are reported here too —
 they double as the cost baseline for the context-compression work.
 """
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-os.environ["VECTOR_DB_DIR"] = "/Users/samlv/researchmate_eval/vector_db_prod"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _harness import (  # noqa: E402
-    install_usage_patch, load_jsonl, markdown_table, mean, measure, pct,
+    estimated_cost_usd, install_usage_patch, load_jsonl, markdown_table, mean, measure, pct,
     result_header, write_result,
 )
 
@@ -95,6 +93,8 @@ def main() -> None:
             "id": row["id"], "query": row["query"], "agent": agent_name,
             "label": label, "reply": reply,
             "tokens": m["total_tokens"], "llm_calls": m["llm_calls"],
+            "estimated_cost_usd": m["estimated_cost_usd"],
+            "by_stage": m["by_stage"],
             "latency_ms": m["latency_ms"], "tool_calls": len(tools), "dup_tools": dup,
         })
         print(f"[{i:2d}/{len(rows)}] {label:<8} {agent_name:<20} "
@@ -102,12 +102,22 @@ def main() -> None:
 
     counts = {l: sum(1 for r in records if r["label"] == l) for l in LABELS}
     n = len(records)
+    stage_totals = {}
+    for row in records:
+        for stage, models in row["by_stage"].items():
+            slot = stage_totals.setdefault(stage, {})
+            for model, usage in models.items():
+                bucket = slot.setdefault(model, {key: 0 for key in
+                    ("prompt_tokens", "cached_tokens", "completion_tokens", "calls")})
+                for key in bucket:
+                    bucket[key] += usage[key]
 
     parts = [result_header("歧义处理基线 + Token/延迟基线", {
         "llm_model": settings.LLM_MODEL,
         "dataset": f"ambiguity.jsonl ({n} underspecified queries)",
         "corpus_snapshot": "prod 2026-09-19",
         "labelling": "gpt-4o-mini, 原始回答全文见附录",
+        "pricing": "evaluation/pricing.json (2026-09-26 snapshot; estimated, not invoice)",
     })]
 
     parts.append(f"""
@@ -139,12 +149,25 @@ def main() -> None:
             ["tool_calls", f"{pct([r['tool_calls'] for r in records], 0.5):.0f}",
              f"{pct([r['tool_calls'] for r in records], 0.95):.0f}",
              f"{mean([r['tool_calls'] for r in records]):.1f}"],
+            ["estimated_cost_usd", "—", "—",
+             (f"{mean([r['estimated_cost_usd'] for r in records]):.6f}"
+              if all(r['estimated_cost_usd'] is not None for r in records) else "unpriced model")],
         ],
     ))
     total_tools = sum(r["tool_calls"] for r in records)
     total_dup = sum(r["dup_tools"] for r in records)
     parts.append(f"\n工具调用总数 {total_tools}，其中参数完全相同的重复调用 {total_dup} 次，"
                  f"**重复调用率 {total_dup / total_tools if total_tools else 0:.1%}**\n")
+    parts.append("\n分阶段 LLM 调用与估算费用（不含行为标签 judge）：\n")
+    parts.append(markdown_table(["stage", "calls", "input tokens", "output tokens", "estimated USD"], [
+        [stage,
+         sum(bucket["calls"] for bucket in models.values()),
+         sum(bucket["prompt_tokens"] for bucket in models.values()),
+         sum(bucket["completion_tokens"] for bucket in models.values()),
+         (f"{estimated_cost_usd({'by_model': models}):.6f}"
+          if estimated_cost_usd({"by_model": models}) is not None else "unpriced")]
+        for stage, models in sorted(stage_totals.items())
+    ]))
 
     parts.append("\n## 3. 逐条结果\n")
     parts.append(markdown_table(

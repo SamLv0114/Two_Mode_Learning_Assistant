@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List
 
 from src.agents.base_agent import AgentResult, BaseAgent
+from src.agents.source_safety import SOURCE_POLICY, untrusted_block
 from src.agents.tools import SEARCH_KNOWLEDGE_BASE, SEARCH_WEB, execute_tool
 from src.utils.config import settings
 
@@ -160,7 +161,7 @@ Be precise and directly answer the original question."""
             self._fire_listener("search_knowledge_base", kb_args, kb,
                                 int((time.time() - t0) * 1000), context)
             snippets = [f"[{r.get('title','')}] {r.get('content','')[:300]}" for r in kb.get("results", [])]
-            search_text = "\n".join(snippets[:3]) or "No relevant results found."
+            search_text = "\n".join(untrusted_block(snippet, "knowledge_base") for snippet in snippets[:3]) or "No relevant results found."
         except Exception:
             search_text = "Search unavailable."
 
@@ -179,7 +180,7 @@ Be precise and directly answer the original question."""
             resp = self.client.chat.completions.create(
                 model=SOLVER_MODEL,
                 messages=[
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": self.system_prompt + "\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=600,
@@ -200,7 +201,7 @@ Be precise and directly answer the original question."""
             resp = self.client.chat.completions.create(
                 model=PLANNER_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents."},
+                    {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents.\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": self._SYNTHESIZE_PROMPT.format(
                         question=question,
                         steps_and_results=steps_text[:4000],
@@ -228,6 +229,8 @@ Be precise and directly answer the original question."""
         completed: List[AnalysisStep] = []
 
         for step in plan:
+            if self._cancelled(context):
+                return AgentResult(reply="", processing_time_ms=int((time.time() - start) * 1000))
             step.result = self._execute_step(message, step, plan, completed, context)
             completed.append(step)
 
@@ -247,7 +250,13 @@ Be precise and directly answer the original question."""
         conversation_history: List[Dict],
         context: Dict[str, Any],
     ) -> Generator:
+        if self._cancelled(context):
+            yield {"type": "cancelled"}
+            return
         plan = self._generate_plan(message)
+        if self._cancelled(context):
+            yield {"type": "cancelled"}
+            return
 
         yield {
             "type": "plan",
@@ -256,8 +265,14 @@ Be precise and directly answer the original question."""
 
         completed: List[AnalysisStep] = []
         for step in plan:
+            if self._cancelled(context):
+                yield {"type": "cancelled"}
+                return
             yield {"type": "task_started", "id": step.number, "title": step.step}
             step.result = self._execute_step(message, step, plan, completed, context)
+            if self._cancelled(context):
+                yield {"type": "cancelled"}
+                return
             completed.append(step)
             yield {"type": "task_done", "id": step.number, "citations": 0}
 
@@ -270,7 +285,7 @@ Be precise and directly answer the original question."""
             stream = self.client.chat.completions.create(
                 model=PLANNER_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents."},
+                    {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents.\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": self._SYNTHESIZE_PROMPT.format(
                         question=message,
                         steps_and_results=steps_text[:4000],
@@ -280,10 +295,18 @@ Be precise and directly answer the original question."""
                 temperature=0.3,
                 stream=True,
             )
-            for chunk in stream:
-                token = chunk.choices[0].delta.content
-                if token:
-                    yield {"type": "token", "value": token}
+            try:
+                for chunk in stream:
+                    if self._cancelled(context):
+                        yield {"type": "cancelled"}
+                        return
+                    token = chunk.choices[0].delta.content
+                    if token:
+                        yield {"type": "token", "value": token}
+            finally:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
         except Exception as e:
             logger.error(f"[PlanAndSolveAgent] Stream synthesis failed: {e}")
             for char in steps_text:

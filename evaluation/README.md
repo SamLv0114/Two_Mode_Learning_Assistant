@@ -4,7 +4,8 @@
 结果文件记录了跑分时的 git commit、模型和关键配置。
 
 ```bash
-python evaluation/run_all.py              # 跑全部
+python evaluation/run_all.py              # 跑默认的五项离线基线
+python evaluation/run_all.py generation   # 单独跑真实 Agent 生成评测，需 API 与固定语料
 python evaluation/runners/run_retrieval_eval.py   # 只跑检索
 ```
 
@@ -136,6 +137,26 @@ Agent 的行为。
 
 ---
 
+## 5. 长期记忆压缩率（memory_compression）
+
+**任务**：`UserFactMemory` 把跨会话对话压缩成结构化事实列表，压缩率不是靠
+单次对话演示报告，而是靠覆盖不同对话风格的多个样本报告分布。
+
+**三种对话风格**（方差的真实来源，不是随机噪声）：
+| profile | 特征 | 预期压缩率 |
+|---|---|---|
+| refining | 反复修正/收窄同一小组主题 | 高——重复内容被去重逻辑合并 |
+| diverse | 每轮都是全新无关事实，主题不重复 | 低——没有可合并的重复项 |
+| mixed_qa | 多数轮次是纯技术问答（不含个人信息，按抽取prompt规则应返回0条事实），少数轮次才真正披露信息 | 高——原文因问答内容变长，但压缩后的事实列表几乎不受影响 |
+
+每种风格各跑 short（6-8轮）和 long（18-22轮）两档、5个话题种子，共30段对话。
+
+**指标**：`reduction = 1 - 压缩后token数 / 原始token数`，逐段计算后报告
+均值、最小值、最大值、四分位数，并按profile分组报告——分组数字比总体均值
+更有信息量，因为方差主要由对话风格决定，不是随机误差。
+
+---
+
 ## 结果文件约定
 
 `results/YYYY-MM-DD_<label>.md`，文件头必须记录：
@@ -146,3 +167,77 @@ corpus_size, keyword_threshold, embedding_threshold, rerank_enabled
 ```
 
 改动前后对比时，两份结果文件除被测变量外的配置必须一致，否则不构成对照。
+
+---
+
+## 6. 离线生成质量与工具轨迹
+
+`rubrics/generation_v1.md` 固定 faithfulness、answer relevancy、无证据断言的
+判定口径。`run_generation_eval.py` 使用与生成模型分开的 judge 模型（默认
+`gpt-4o`，可由 `EVAL_JUDGE_MODEL` 指定）。忠实度 judge 只看**实际返回给
+Agent 的证据片段**，不看参考答案；另一次独立调用把人工确认的参考答案和
+标注证据交给正确性 judge，衡量关键事实覆盖与矛盾。具备人工相关性标注时，
+另按返回来源的排名计算 returned_context_precision：只对已返回的相关来源
+取命中位置 precision 的平均值；当前每题只有一个相关来源时等于其倒数排名，
+不是对全部相关来源归一化的 AP。原始回答与逐题结果单独存 JSONL，
+报告披露数据集、预测文件及两版 rubric 的 SHA-256。
+
+`run_trajectory_eval.py` 对人工标注的必需工具、禁止工具、关键先后约束打分。
+多余但合理的调用不会因不匹配某一条完整序列而自动判错。
+
+`datasets/generation_candidates.jsonl` 是从检索集及指定 ChromaDB 快照
+提取的 50 条候选。项目所有者在对话中确认已逐条核验答案后，
+`datasets/generation_golden.jsonl` 保存了 50 条 `human_verified` 记录。
+其中 47 条为摘录支持的答案，3 条记录原摘录不足；后者不计入答案正确性
+均值。草稿出自与生成 Agent 相同的 `gpt-4o-mini`，因此报告需披露相关偏差。
+工具期望来自自动候选，尚未经单独人工确认，未纳入 golden 的轨迹标签。
+
+2026-09-26 的 50 题真实 Agent 评测结果保存在
+`results/2026-09-26_generation_eval.md`，逐题评分和回答另存 JSONL。
+faithfulness 为 0.736（50 题），answer correctness 为 0.500（47 条证据充足题）；
+参考论文仅出现在 22/50 条返回引文中。题目没有指明目标论文，可能存在其他合理
+答案，所以这组结果是探索性基线，不是线上准确率或任何改动的提升幅度。
+judge 尚无人工评分子集校准，生成成本估算不含 judge。复现实验仍需归档固定语料快照。
+该历史报告的 `context_precision` 使用上述命中位置口径；新报告将其明确标为
+`returned_context_precision`，两者公式相同。
+
+```bash
+python evaluation/runners/build_generation_candidates.py --chroma-sqlite /path/to/chroma.sqlite3
+VECTOR_DB_DIR=/path/to/fixed/chroma-copy python evaluation/run_all.py generation
+```
+
+检索 runner 不再覆盖 `VECTOR_DB_DIR`：需在运行前把它设为同一语料快照
+的**可写副本**路径（Chroma 初始化会写数据库文件）。结果中的
+`corpus_snapshot` 应与实际路径、样本量和版本一致。
+GitHub Actions 的 `ci.yml` 在分支 push 与 PR 上运行确定性回归和 smoke test；
+需要 API 密钥、固定语料快照及人工审核集的全量模型评测仍按明确的输入条件单独运行，
+不能把未执行的模型评测写成已通过的 CI 门禁。
+
+可选地用 `python evaluation/draft_generation_answers.py` 生成答案草稿；
+这会把候选问题和证据摘录发送到模型 API，输出到
+`datasets/generation_answer_drafts.jsonl`，状态仅为 `ai_draft`。
+当前 50 条草稿中，47 条给出候选答案，`gq011`、`gq013`、`gq030`
+因摘录未覆盖问题所需结论而标为证据不足；审核者可确认拒答或改写答案。
+人工审核使用 `python evaluation/review_golden.py --reviewer <姓名或稳定ID>`；
+工具逐条展示候选问题、证据和匹配的草稿。Enter 可选用草稿答案，但审核者仍须
+亲自核验该答案、填写预期行为与标注说明，并单独确认工具期望；未确认的工具
+期望不会作为人工轨迹标签保存。完成后才会写入 `generation_golden.jsonl`。
+judge 的人工一致性抽样可放在
+`datasets/judge_calibration.jsonl`，每行包含 `id`、`human_faithfulness`、
+`human_answer_relevancy`（0–1）；报告给出 MAE 和 0.70 阈值的一致率，缺文件时
+明确标为未校准。全量模型评测不能由自动生成候选代替人工核验。
+
+新增的可复现实验：`run_context_budget_eval.py --dry-run` 只核对输入 token
+与组装路径，不给问答质量分数；去掉 `--dry-run` 才比较长会话精确事实/URL 保留率。
+`run_chunking_eval.py` 使用同一全文快照比较固定块、语义子块及父块证据。
+本地快照只有一篇论文全文，结果是该论文分段上的弱监督结果，不代表跨论文性能，
+也不测表格解析质量。`run_cache_eval.py` 用 12 对人工标记的相似/相反查询测错误复用，
+不代表线上命中率或成本节省。`run_prompt_injection_eval.py` 测构造的提示词层攻击，
+不代表端到端工具越权率。`run_supervisor_eval.py` 要求上述人工 golden，且不会
+自动启用生产 supervisor。
+
+`ci.yml` 每次分支 push/PR 运行确定性测试与可离线执行的上下文、缓存实验。
+`evaluation-live.yml` 每周一运行需要 API 的注入评测；仓库出现人工 golden 后，
+还需维护者提供名为 `eval-corpus-v1` 的 GitHub Release，其中
+`chroma-snapshot.tar.zst` 解压后直接包含 Chroma 数据库及索引文件，才会运行
+生成与轨迹全量评测。没有密钥、快照或人工标注时，相应指标必须标为未测。

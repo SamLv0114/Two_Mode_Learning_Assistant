@@ -18,13 +18,11 @@ within NEIGHBOUR_DIST. This is computed from the *paper's own* embedding, not
 from any query, so it does not favour or penalise any of the four retrieval
 configurations being compared.
 """
-import os
 import re
 import random
 import sys
 from pathlib import Path
 
-os.environ["VECTOR_DB_DIR"] = "/Users/samlv/researchmate_eval/vector_db_prod"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _harness import dump_jsonl, install_usage_patch, USAGE  # noqa: E402

@@ -19,6 +19,9 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # Install remaining Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA
+
 # Copy application code
 COPY src/ src/
 # Create data directories

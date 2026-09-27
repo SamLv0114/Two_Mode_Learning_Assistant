@@ -1,13 +1,14 @@
 """
 User interaction endpoints
 """
+import json
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from src.database.models import User, UserInteraction, UserModelState, Paper, Article
+from src.database.models import User, UserInteraction, UserModelState, Paper, Article, upsert_user_interaction, count_labeled_paper_interactions
 from src.api.deps import get_db_session, get_current_user
 
 logger = logging.getLogger(__name__)
@@ -24,61 +25,9 @@ from src.utils.config import settings
 router = APIRouter(prefix="/interactions", tags=["Interactions"])
 
 
-# ── V4: Dismiss Reflexion ─────────────────────────────────────────────────────
-
-def _extract_dismiss_reason_and_store(user_id: int, paper_title: str, paper_abstract: str) -> None:
-    """
-    Background task: use gpt-4o-mini to infer why a user dismissed a paper,
-    then store the result as a negative fact in UserFactMemory.
-
-    This implements the 'Dismiss Reflexion' pattern — the system learns not just
-    that the user dismissed something, but *why*, and uses that signal to avoid
-    similar content in future feeds.
-    """
-    from openai import OpenAI
-    from src.agents.memory import UserFactMemory
-    from src.utils.config import settings
-
-    if not settings.OPENAI_API_KEY:
-        return
-
-    try:
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        prompt = (
-            f"A researcher dismissed this paper from their feed. "
-            f"In 5-10 words, why might they have dismissed it?\n\n"
-            f"Title: {paper_title}\n"
-            f"Abstract: {(paper_abstract or '')[:300]}\n\n"
-            f"Return only the reason phrase, e.g. 'too theoretical, no practical applications'"
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=40,
-            temperature=0.3,
-        )
-        reason = resp.choices[0].message.content.strip().strip('"').strip("'")
-        if reason:
-            # Get Redis client
-            redis_client = None
-            try:
-                import redis
-                if settings.REDIS_URL:
-                    redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-                    redis_client.ping()
-            except Exception:
-                redis_client = None
-
-            UserFactMemory().add_negative_fact(user_id, reason, redis_client)
-            logger.info(f"Dismiss reflexion stored for user {user_id}: {reason[:60]}")
-    except Exception as e:
-        logger.debug(f"Dismiss reflexion failed: {e}")
-
-
 @router.post("", response_model=InteractionResponse, status_code=status.HTTP_201_CREATED)
 async def create_interaction(
     interaction: InteractionCreate,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
 ):
@@ -103,39 +52,9 @@ async def create_interaction(
             detail=f"{interaction.item_type.capitalize()} not found"
         )
 
-    # Check for existing interaction
-    existing = db.query(UserInteraction).filter(
-        UserInteraction.user_id == current_user.id,
-        UserInteraction.item_type == interaction.item_type,
-        UserInteraction.item_id == interaction.item_id
-    ).first()
-
-    if existing:
-        existing.interaction_type = interaction.interaction_type
-        existing.timestamp = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(existing)
-        result = InteractionResponse.model_validate(existing)
-    else:
-        new_interaction = UserInteraction(
-            user_id=current_user.id,
-            item_type=interaction.item_type,
-            item_id=interaction.item_id,
-            interaction_type=interaction.interaction_type
-        )
-        db.add(new_interaction)
-        db.commit()
-        db.refresh(new_interaction)
-        result = InteractionResponse.model_validate(new_interaction)
-
-    # V4: Dismiss Reflexion — infer why user dismissed a paper and store as negative fact
-    if interaction.interaction_type == "dismissed" and interaction.item_type == "paper":
-        background_tasks.add_task(
-            _extract_dismiss_reason_and_store,
-            user_id=current_user.id,
-            paper_title=item.title,
-            paper_abstract=getattr(item, "abstract", "") or "",
-        )
+    saved = upsert_user_interaction(db, current_user.id, interaction.item_type,
+                                    interaction.item_id, interaction.interaction_type)
+    result = InteractionResponse.model_validate(saved)
 
     return result
 
@@ -199,7 +118,8 @@ async def get_interaction_stats(
     total = sum(stats_dict.values())
 
     min_required = settings.MIN_INTERACTIONS_FOR_TRAINING
-    ready_for_training = total >= min_required
+    labeled_papers = count_labeled_paper_interactions(db, current_user.id)
+    ready_for_training = labeled_papers >= min_required
 
     return InteractionStats(
         total=total,
@@ -207,7 +127,7 @@ async def get_interaction_stats(
         viewed=stats_dict.get("viewed", 0),
         dismissed=stats_dict.get("dismissed", 0),
         ready_for_training=ready_for_training,
-        interactions_until_training=max(0, min_required - total)
+        interactions_until_training=max(0, min_required - labeled_papers)
     )
 
 
@@ -245,9 +165,7 @@ async def get_model_status(
     Get the status of the user's personalized ML model
     """
     # Get interaction count
-    interaction_count = db.query(UserInteraction).filter(
-        UserInteraction.user_id == current_user.id
-    ).count()
+    interaction_count = count_labeled_paper_interactions(db, current_user.id)
 
     # Get model state
     model_state = db.query(UserModelState).filter(
@@ -256,10 +174,14 @@ async def get_model_status(
 
     if model_state:
         return ModelStatus(
-            is_trained=model_state.is_trained,
+            is_trained=bool(model_state.model_blob and model_state.is_trained and
+                            (model_state.training_sample_count or 0) >= settings.MIN_INTERACTIONS_FOR_TRAINING),
             last_trained_at=model_state.last_trained_at,
             interaction_count=interaction_count,
             min_interactions_required=settings.MIN_INTERACTIONS_FOR_TRAINING,
+            training_sample_count=model_state.training_sample_count or 0,
+            training_label_counts=json.loads(model_state.training_label_counts) if model_state.training_label_counts else None,
+            interaction_count_at_training=model_state.interaction_count_at_training or 0,
             train_ndcg=model_state.train_ndcg,
             train_mrr=model_state.train_mrr,
             val_ndcg=model_state.val_ndcg,
@@ -284,9 +206,7 @@ async def retrain_model(
     Requires at least 50 interactions.
     """
     # Check interaction count
-    interaction_count = db.query(UserInteraction).filter(
-        UserInteraction.user_id == current_user.id
-    ).count()
+    interaction_count = count_labeled_paper_interactions(db, current_user.id)
 
     min_required = settings.MIN_INTERACTIONS_FOR_TRAINING
     if interaction_count < min_required:

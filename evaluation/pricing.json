@@ -1,0 +1,18 @@
+{
+  "checked_on": "2026-09-26",
+  "unit": "USD per 1000000 tokens",
+  "models": {
+    "gpt-4o-mini": {
+      "input": 0.15,
+      "cached_input": 0.075,
+      "output": 0.60,
+      "source": "https://developers.openai.com/api/docs/models/gpt-4o-mini"
+    },
+    "gpt-4o": {
+      "input": 2.50,
+      "cached_input": 1.25,
+      "output": 10.00,
+      "source": "https://developers.openai.com/api/docs/models/gpt-4o"
+    }
+  }
+}

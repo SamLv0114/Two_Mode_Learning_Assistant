@@ -9,6 +9,7 @@ import time
 
 from src.models.embeddings import EmbeddingManager
 from src.utils.config import settings
+from src.rag.semantic_cache import SemanticRetrievalCache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -74,6 +75,15 @@ class Retriever:
 
     def __init__(self, embedding_manager: Optional[EmbeddingManager] = None):
         self.embedding_manager = embedding_manager or EmbeddingManager()
+        self.cache = None
+        if settings.SEMANTIC_CACHE_ENABLED and settings.REDIS_URL:
+            try:
+                import redis
+                client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+                client.ping()
+                self.cache = SemanticRetrievalCache(client, self.embedding_manager.generate_embedding)
+            except Exception as exc:
+                logger.warning("Semantic retrieval cache unavailable: %s", exc)
         self._bm25 = None  # None = not built yet, False = tried, unavailable
         self._bm25_doc_ids: List[str] = []
         self._bm25_docs: List[str] = []
@@ -266,6 +276,24 @@ class Retriever:
         on every user-facing call; only a trusted system/background path
         should omit it.
         """
+        cache_config = None
+        if self.cache and self.cache.eligible(filter_type):
+            try:
+                cache_config = {
+                    "corpus_count": self.embedding_manager.collection.count(),
+                    "corpus_revision": self.cache.redis.get("rag:public_corpus_revision") or "0",
+                    "user_id": user_id,
+                    "filter_type": filter_type, "n_results": n_results,
+                    "use_hybrid": use_hybrid, "rerank": settings.RAG_RERANK_ENABLED,
+                    "embedding_model": settings.EMBEDDING_MODEL, "version": 1,
+                }
+                cached = self.cache.get(query, cache_config)
+                if cached is not None:
+                    return cached
+            except Exception as exc:
+                logger.debug("Semantic cache lookup skipped: %s", exc)
+                cache_config = None
+
         vector_pool = self.embedding_manager.search(
             query=query, n_results=RERANK_CANDIDATE_POOL, filter_type=filter_type,
             user_id=user_id,
@@ -273,6 +301,8 @@ class Retriever:
 
         if not use_hybrid:
             results = vector_pool[:n_results]
+            if cache_config is not None:
+                self.cache.put(query, cache_config, results)
             logger.info(f"Retrieved {len(results)} documents (vector-only) for query: {query[:50]}...")
             return results
 
@@ -290,4 +320,6 @@ class Retriever:
             f"Retrieved {len(results)} documents (hybrid: {len(vector_pool)} vector + "
             f"{len(bm25_pool)} bm25 -> {len(fused)} fused -> {stage}) for query: {query[:50]}..."
         )
+        if cache_config is not None:
+            self.cache.put(query, cache_config, results)
         return results

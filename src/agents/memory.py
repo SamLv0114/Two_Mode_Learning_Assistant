@@ -16,7 +16,7 @@ from src.utils.config import settings
 
 logger = logging.getLogger(__name__)
 
-MAX_HISTORY_LENGTH = 20
+MAX_HISTORY_LENGTH = 100
 SESSION_TTL_SECONDS = 86400       # 24 hours
 FACTS_TTL_SECONDS = 86400 * 30   # 30 days
 MAX_FACTS = 25                    # rolling cap per user
@@ -38,7 +38,7 @@ class ConversationMemory:
         return f"chat:{self.user_id}:{session_id}"
 
     def add_message(self, session_id: str, role: str, content: str) -> None:
-        message = {"role": role, "content": content}
+        message = {"id": uuid.uuid4().hex, "role": role, "content": content}
         if self.redis:
             try:
                 key = self._key(session_id)
@@ -71,9 +71,12 @@ class ConversationMemory:
         return history[-max_messages:]
 
     def clear_session(self, session_id: str) -> None:
+        from src.agents.context_budget import ContextBudget
+        ContextBudget._fallback.pop(f"chat_summary:{self.user_id}:{session_id}", None)
         if self.redis:
             try:
                 self.redis.delete(self._key(session_id))
+                self.redis.delete(f"chat_summary:{self.user_id}:{session_id}")
                 return
             except Exception:
                 pass
@@ -333,7 +336,7 @@ new and useful about the user, extract no facts."""
             replace_idx = None
             for i, e in enumerate(merged):
                 if e.get("negative"):
-                    continue  # dismiss-reason facts aren't merged against topic facts
+                    continue  # legacy inferred dismiss reasons are not preferences
                 relation = self._classify_fact_relation(fact_text, e["fact"])
                 if relation in ("duplicate", "redundant"):
                     action = "skip"
@@ -361,37 +364,21 @@ new and useful about the user, extract no facts."""
         logger.debug(f"UserFactMemory: stored {len(new_facts)} new facts for user {user_id}")
         return new_facts
 
-    def add_negative_fact(self, user_id: int, reason: str, redis_client=None) -> None:
-        """
-        Store a negative preference extracted from a dismiss action.
-        Called by the interactions router when a paper is dismissed.
-        Reason should be a short phrase like 'too theoretical, no code examples'.
-        """
-        fact_text = f"user disliked: {reason}"
-        now_str = datetime.now(timezone.utc).isoformat()
-        fact_dict = {"fact": fact_text, "created_at": now_str, "negative": True}
-
-        existing = self._load(user_id, redis_client)
-        # Avoid near-duplicate negative facts
-        if not any(reason.lower() in e["fact"].lower() for e in existing if e.get("negative")):
-            existing.append(fact_dict)
-            if len(existing) > MAX_FACTS:
-                existing = sorted(existing, key=lambda f: self._decay_weight(f), reverse=True)[:MAX_FACTS]
-            self._save(user_id, existing, redis_client)
-            logger.debug(f"UserFactMemory: stored negative fact for user {user_id}: {reason[:60]}")
-
     def get_context_string(self, user_id: int, redis_client=None) -> str:
         """Return a context block to prepend to an agent's system prompt.
 
-        V4: Facts are sorted by temporal decay weight (most recent first),
-        top 15 injected. Negative facts are labeled to guide avoidance.
+        Facts are sorted by temporal decay weight (most recent first).
+        Legacy model-guessed dismiss reasons are excluded.
         """
         facts = self._load(user_id, redis_client)
         if not facts:
             return ""
 
         # Sort by decay weight — newest facts get highest weight
-        weighted = sorted(facts, key=lambda f: self._decay_weight(f), reverse=True)
+        weighted = sorted((f for f in facts if not f.get("negative")),
+                          key=lambda f: self._decay_weight(f), reverse=True)
+        if not weighted:
+            return ""
         top = weighted[:15]
 
         lines = "\n".join(f"- {f['fact']}" for f in top)

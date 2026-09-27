@@ -50,6 +50,9 @@ class ModelStatus(BaseModel):
     last_trained_at: Optional[datetime] = None
     interaction_count: int = 0
     min_interactions_required: int = 50
+    training_sample_count: int = 0
+    training_label_counts: Optional[dict] = None
+    interaction_count_at_training: int = 0
     train_ndcg: Optional[float] = None
     train_mrr: Optional[float] = None
     val_ndcg: Optional[float] = None

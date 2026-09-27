@@ -6,7 +6,7 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Optional
 from src.utils.config import settings
-from src.utils.preprocessing import clean_text, chunk_text
+from src.utils.preprocessing import chunk_text, semantic_parent_child_chunks
 import logging
 import threading
 from pathlib import Path
@@ -144,6 +144,27 @@ class EmbeddingManager:
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate embeddings for multiple texts"""
         return self.model.encode(texts, show_progress_bar=True).tolist()
+
+    @staticmethod
+    def _chunk_records(text: str) -> List[Dict]:
+        if settings.RAG_SEMANTIC_CHUNKING_ENABLED:
+            return semantic_parent_child_chunks(
+                text, child_size=settings.CHUNK_SIZE, overlap=settings.CHUNK_OVERLAP,
+            )
+        chunks = chunk_text(text, chunk_size=settings.CHUNK_SIZE, overlap=settings.CHUNK_OVERLAP)
+        return [{"child": chunk, "parent": chunk, "parent_index": i}
+                for i, chunk in enumerate(chunks) if chunk]
+
+    @staticmethod
+    def _bump_public_corpus_revision() -> None:
+        """Invalidate Redis retrieval caches even when an update preserves count."""
+        if not settings.REDIS_URL:
+            return
+        try:
+            import redis
+            redis.from_url(settings.REDIS_URL).incr("rag:public_corpus_revision")
+        except Exception as exc:
+            logger.warning("Could not advance public corpus revision: %s", exc)
     
     def add_paper(self, paper_id: str, title: str, abstract: str, metadata: Dict):
         """Add a paper to the vector database (updates if exists)"""
@@ -166,6 +187,7 @@ class EmbeddingManager:
                         "paper_id": paper_id
                     }]
                 )
+                self._bump_public_corpus_revision()
                 return
         except Exception:
             pass
@@ -185,6 +207,7 @@ class EmbeddingManager:
                 }],
                 ids=[paper_id_str]
             )
+            self._bump_public_corpus_revision()
         except Exception as e:
             logger.debug(f"Error adding paper {paper_id}: {e}")
     
@@ -209,6 +232,7 @@ class EmbeddingManager:
                         "article_id": article_id
                     }]
                 )
+                self._bump_public_corpus_revision()
                 return
         except Exception:
             pass
@@ -228,6 +252,7 @@ class EmbeddingManager:
                 }],
                 ids=[article_id_str]
             )
+            self._bump_public_corpus_revision()
         except Exception as e:
             logger.debug(f"Error adding article {article_id}: {e}")
 
@@ -238,18 +263,15 @@ class EmbeddingManager:
         Returns:
             Number of chunks added
         """
-        clean_content = clean_text(content)
+        clean_content = content.strip() if content else ""
         if not clean_content:
             return 0
 
-        chunks = chunk_text(
-            clean_content,
-            chunk_size=settings.CHUNK_SIZE,
-            overlap=settings.CHUNK_OVERLAP,
-        )
-        if not chunks:
+        chunk_records = self._chunk_records(clean_content)
+        if not chunk_records:
             return 0
 
+        chunks = [record["child"] for record in chunk_records]
         embeddings = self.generate_embeddings(chunks)
         ids = [f"userdoc_{doc_id}_{i}" for i in range(len(chunks))]
         metadatas = [{
@@ -258,6 +280,8 @@ class EmbeddingManager:
             "doc_id": doc_id,
             "title": title,
             "chunk_index": i,
+            "parent_index": chunk_records[i]["parent_index"],
+            "parent_text": chunk_records[i]["parent"],
         } for i in range(len(chunks))]
 
         try:
@@ -298,18 +322,15 @@ class EmbeddingManager:
         Returns:
             Number of chunks added (0 if the paper has no extractable text).
         """
-        clean_content = clean_text(full_text)
+        clean_content = full_text.strip() if full_text else ""
         if not clean_content:
             return 0
 
-        chunks = chunk_text(
-            clean_content,
-            chunk_size=settings.CHUNK_SIZE,
-            overlap=settings.CHUNK_OVERLAP,
-        )
-        if not chunks:
+        chunk_records = self._chunk_records(clean_content)
+        if not chunk_records:
             return 0
 
+        chunks = [record["child"] for record in chunk_records]
         embeddings = self.generate_embeddings(chunks)
         ids = [f"paperfull_{arxiv_id}_{i}" for i in range(len(chunks))]
         metadatas = [{
@@ -318,6 +339,8 @@ class EmbeddingManager:
             "arxiv_id": arxiv_id,
             "title": title,
             "chunk_index": i,
+            "parent_index": chunk_records[i]["parent_index"],
+            "parent_text": chunk_records[i]["parent"],
         } for i in range(len(chunks))]
 
         try:

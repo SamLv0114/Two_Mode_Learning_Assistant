@@ -24,6 +24,9 @@ jobs:
           pip install -q -r requirements.txt
           python tests/smoke.py -v
 
+      - name: Security and behavior regressions
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -64,13 +67,12 @@ jobs:
             # everything (including torch) on every dependency change, which
             # is what blew through the SSH action's timeout in the first
             # place.
-            if echo "$CHANGED" | grep -q "^requirements.txt\|^Dockerfile.api"; then
-              echo "Dependencies changed — rebuilding API image"
-              docker compose build api
+            API_REBUILT=0
+            if echo "$CHANGED" | grep -Eq '^(requirements\.txt|Dockerfile\.api|src/)'; then
+              echo "API image input changed — rebuilding API image"
+              docker compose build --build-arg GIT_SHA="$AFTER" api
               docker compose up -d --force-recreate api
-            elif echo "$CHANGED" | grep -q "^src/"; then
-              echo "API code changed — restarting container"
-              docker compose restart api
+              API_REBUILT=1
             else
               echo "No API changes"
             fi
@@ -103,6 +105,13 @@ jobs:
                    python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)" \
                    > /dev/null 2>&1; then
                 echo "API healthy after ${i}s"
+                if [ "$API_REBUILT" = 1 ]; then
+                  RUNNING_SHA=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' learning_assistant_api)
+                  if [ "$RUNNING_SHA" != "$AFTER" ]; then
+                    echo "API image revision $RUNNING_SHA does not match deployed commit $AFTER"
+                    exit 1
+                  fi
+                fi
                 docker image prune -f
                 echo "Deploy complete"
                 exit 0

@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
 import {
   feedApi, interactionsApi, qaApi, authApi, chatApi, whatsHotApi,
-  Paper, Article, FeedResponse, InteractionStats, FeedJobStatus, AgentEvent,
+  Paper, Article, FeedResponse, InteractionStats, ModelStatus, FeedJobStatus, AgentEvent,
   HFPaper, GithubRepo, WhatsHotData,
   ColdStartSeed, ColdStartResponse,
   API_BASE_URL,
@@ -25,9 +25,11 @@ const EXAMPLE_INTERESTS = [
 export default function DashboardPage() {
   const { user, isAuthenticated, isLoading, fetchProfile, logout } = useAuth();
   const router = useRouter();
+  const [authChecked, setAuthChecked] = useState(false);
 
   const [feed, setFeed] = useState<FeedResponse | null>(null);
   const [stats, setStats] = useState<InteractionStats | null>(null);
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [whatsHot, setWhatsHot] = useState<WhatsHotData | null>(null);
   const [isLoadingHot, setIsLoadingHot] = useState(false);
@@ -46,43 +48,54 @@ export default function DashboardPage() {
     arxivId: string;
     arxivUrl: string;
   } | null>(null);
-  const feedPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const feedPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const feedPollRunRef = useRef(0);
+  const feedGenerationActiveRef = useRef(false);
 
   useEffect(() => {
-    fetchProfile();
+    let mounted = true;
+    fetchProfile().finally(() => {
+      if (mounted) setAuthChecked(true);
+    });
+    return () => { mounted = false; };
   }, [fetchProfile]);
 
   useEffect(() => {
-    if (!isLoading && !isAuthenticated) {
-      router.push('/login');
+    if (authChecked && !isLoading && !isAuthenticated) {
+      router.replace('/login');
     }
-  }, [isAuthenticated, isLoading, router]);
+  }, [authChecked, isAuthenticated, isLoading, router]);
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (authChecked && isAuthenticated) {
       loadStats();
       loadColdStart();
     }
-  }, [isAuthenticated]);
+  }, [authChecked, isAuthenticated]);
 
   // What's Hot has its own tab now, so fetch it when that tab is first opened
   // rather than on every dashboard load. Kept in state after the first visit.
   useEffect(() => {
-    if (isAuthenticated && activeTab === 'hot' && !whatsHot && !isLoadingHot) {
+    if (authChecked && isAuthenticated && activeTab === 'hot' && !whatsHot && !isLoadingHot) {
       loadWhatsHot();
     }
-  }, [isAuthenticated, activeTab]);
+  }, [authChecked, isAuthenticated, activeTab]);
 
   useEffect(() => {
     return () => {
-      if (feedPollRef.current) clearInterval(feedPollRef.current);
+      feedPollRunRef.current += 1;
+      feedGenerationActiveRef.current = false;
+      if (feedPollRef.current) clearTimeout(feedPollRef.current);
     };
   }, []);
 
   const loadStats = async () => {
     try {
-      const data = await interactionsApi.getStats();
-      setStats(data);
+      const [statsResult, modelResult] = await Promise.allSettled([
+        interactionsApi.getStats(), interactionsApi.getModelStatus(),
+      ]);
+      if (statsResult.status === 'fulfilled') setStats(statsResult.value);
+      if (modelResult.status === 'fulfilled') setModelStatus(modelResult.value);
     } catch (error) {
       console.error('Failed to load stats:', error);
     }
@@ -144,11 +157,15 @@ export default function DashboardPage() {
   };
 
   const generateFeed = async (forceRefresh = false) => {
-    if (feedPollRef.current) clearInterval(feedPollRef.current);
+    if (feedGenerationActiveRef.current) return;
+    feedGenerationActiveRef.current = true;
+    if (feedPollRef.current) clearTimeout(feedPollRef.current);
+    const run = ++feedPollRunRef.current;
     setIsGenerating(true);
     setFeedProgress(forceRefresh ? 'Drawing a new batch...' : 'Loading your feed...');
     setFeed(null);
     setRefineResult(null);
+    const deadline = Date.now() + 5 * 60_000;
     try {
       const { job_id } = await feedApi.generate({
         time_window_days: timeWindow,
@@ -158,9 +175,19 @@ export default function DashboardPage() {
         force_refresh: forceRefresh,
       });
 
-      feedPollRef.current = setInterval(async () => {
+      let failures = 0;
+      const poll = async () => {
+        if (run !== feedPollRunRef.current) return;
+        if (Date.now() >= deadline) {
+          toast.error('Feed generation is taking too long. Please try again.');
+          setIsGenerating(false);
+          feedGenerationActiveRef.current = false;
+          return;
+        }
         try {
           const status: FeedJobStatus = await feedApi.getJobStatus(job_id);
+          if (run !== feedPollRunRef.current) return;
+          failures = 0;
 
           const msgMap: Record<string, string> = {
             generating: 'Loading your feed...',
@@ -173,12 +200,12 @@ export default function DashboardPage() {
           setFeedProgress(msgMap[status.status] || status.message || status.status);
 
           if (status.status === 'done') {
-            clearInterval(feedPollRef.current!);
             feedPollRef.current = null;
             // Articles retired in V4 — trending content now comes from What's Hot.
             // No count — the server decides how large a feed is, so this does
             // not need updating if that size changes.
             const papers = await feedApi.getPapers();
+            if (run !== feedPollRunRef.current) return;
             setFeed({
               papers,
               articles: [],
@@ -186,25 +213,41 @@ export default function DashboardPage() {
               time_window_days: timeWindow,
               focus_areas: user?.focus_areas || [],
               used_ml_ranking: status.used_ml_ranking ?? false,
+              ranking_source: status.ranking_source,
+              ranking_fallback_reason: status.ranking_fallback_reason,
               total_papers_considered: status.papers_count ?? papers.length,
               total_articles_considered: 0,
             });
             toast.success(status.reused ? "Showing today's feed" : 'Feed ready!');
             loadStats();
             setIsGenerating(false);
+            feedGenerationActiveRef.current = false;
           } else if (status.status === 'error' || status.status === 'not_found') {
-            clearInterval(feedPollRef.current!);
             feedPollRef.current = null;
             toast.error(status.message || 'Feed generation failed');
             setIsGenerating(false);
+            feedGenerationActiveRef.current = false;
+          } else {
+            feedPollRef.current = setTimeout(poll, 2500);
           }
-        } catch (_) {
-          // transient error — keep polling
+        } catch (error) {
+          if (run !== feedPollRunRef.current) return;
+          failures += 1;
+          if (failures >= 3 || Date.now() >= deadline) {
+            feedPollRef.current = null;
+            toast.error('Could not check feed progress. Please try again.');
+            setIsGenerating(false);
+            feedGenerationActiveRef.current = false;
+          } else {
+            feedPollRef.current = setTimeout(poll, 2500);
+          }
         }
-      }, 2500);
+      };
+      feedPollRef.current = setTimeout(poll, 2500);
     } catch (error: any) {
       toast.error(error.response?.data?.detail || 'Failed to start feed generation');
       setIsGenerating(false);
+      feedGenerationActiveRef.current = false;
     }
   };
 
@@ -214,7 +257,14 @@ export default function DashboardPage() {
     setIsRefining(true);
     try {
       const result = await feedApi.refine();
-      setFeed((prev) => (prev ? { ...prev, papers: result.papers } : prev));
+      setFeed((prev) => {
+        if (!prev) return prev;
+        const changed = result.papers.some((paper, i) => paper.arxiv_id !== prev.papers[i]?.arxiv_id);
+        return changed
+          ? { ...prev, papers: result.papers, used_ml_ranking: false,
+              ranking_source: 'refined', ranking_fallback_reason: null }
+          : { ...prev, papers: result.papers };
+      });
       setRefineResult({ score: result.score, rounds: result.rounds, passed: result.passed });
       toast.success(result.message || 'Feed refined!');
     } catch (error: any) {
@@ -246,7 +296,7 @@ export default function DashboardPage() {
     }
   };
 
-  if (isLoading) {
+  if (!authChecked || isLoading || !isAuthenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50">
         <div className="animate-spin rounded-full h-10 w-10 border-[3px] border-gray-200 border-t-primary-600" />
@@ -299,11 +349,13 @@ export default function DashboardPage() {
             <p className="text-2xl font-bold text-rose-600">{stats?.dismissed || 0}</p>
           </div>
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex items-center">
-            {stats?.ready_for_training ? (
+            {modelStatus?.is_trained ? (
               <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-emerald-700">
                 <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                ML model active
+                Model trained on {modelStatus.training_sample_count} labeled papers{feed?.ranking_source === 'refined' ? ' · this feed was refined' : feed && !feed.used_ml_ranking ? ' · this feed used heuristic ranking' : ''}
               </span>
+            ) : stats?.ready_for_training ? (
+              <span className="text-xs text-amber-700">Enough paper feedback to attempt training; {feed ? 'choose New batch.' : 'generate a feed.'}</span>
             ) : (
               <span className="text-xs text-gray-400 leading-relaxed">
                 <span className="font-semibold text-gray-600">{stats?.interactions_until_training ?? 50}</span> more interactions to enable ML ranking
@@ -435,8 +487,9 @@ export default function DashboardPage() {
                 {/* Meta info */}
                 <div className="flex items-center justify-center gap-2 pt-2">
                   <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full ${feed.used_ml_ranking ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
-                    {feed.used_ml_ranking ? '🧠 Personalized ML ranking' : '📊 Heuristic ranking — interact more to unlock ML'}
+                    {feed.ranking_source === 'refined' ? '✨ Refined feed' : feed.used_ml_ranking ? '🧠 Personalized ML ranking' : '📊 Heuristic ranking'}
                   </span>
+                  {feed.ranking_fallback_reason && <span className="text-xs text-amber-700" title={feed.ranking_fallback_reason}>ML fallback: {feed.ranking_fallback_reason}</span>}
                   <span className="text-xs text-gray-400">
                     {feed.total_papers_considered} papers considered
                   </span>
@@ -1176,8 +1229,11 @@ interface ChatMessage {
   citations?: { title: string; url: string; type: string }[];
   isStreaming?: boolean;
   researchPlan?: ResearchTask[];
+  researchRunId?: string;
+  researchComplete?: boolean;
   reflectionStage?: 'critiquing' | 'refining';
   reflectionScore?: number;
+  isDraft?: boolean;
 }
 
 const CHAT_SESSION_STORAGE_KEY = 'chat_session_id';
@@ -1197,6 +1253,7 @@ function AgentChat({
     typeof window !== 'undefined' ? localStorage.getItem(CHAT_SESSION_STORAGE_KEY) : null
   );
   const [showKB, setShowKB] = useState(false);
+  const [pausedRun, setPausedRun] = useState<{ run_id: string; question: string } | null>(null);
   const [kbDocs, setKbDocs] = useState<any[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -1209,6 +1266,10 @@ function AgentChat({
 
   useEffect(() => {
     loadKbDocs();
+    chatApi.getResearchRuns().then(({ runs }) => {
+      const paused = runs.find(run => run.resumable);
+      if (paused) setPausedRun(paused);
+    }).catch(() => {});
     return () => {
       abortRef.current?.abort();
     };
@@ -1295,10 +1356,10 @@ function AgentChat({
     }
   };
 
-  const sendMessage = async () => {
-    if (!input.trim() || isStreaming) return;
+  const sendMessage = async (resumeRunId?: string) => {
+    if ((!input.trim() && !resumeRunId) || isStreaming) return;
 
-    const userMsg: ChatMessage = { id: `u-${Date.now()}`, role: 'user', content: input };
+    const userMsg: ChatMessage = { id: `u-${Date.now()}`, role: 'user', content: resumeRunId ? 'Resume research' : input };
     const assistantId = `a-${Date.now() + 1}`;
     const assistantMsg: ChatMessage = {
       id: assistantId,
@@ -1318,6 +1379,7 @@ function AgentChat({
       paperContextInjected.current = true;
     }
     setInput('');
+    if (resumeRunId) setPausedRun(null);
     setIsStreaming(true);
 
     abortRef.current = new AbortController();
@@ -1330,7 +1392,7 @@ function AgentChat({
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ message: text, session_id: sessionId }),
+        body: JSON.stringify({ message: resumeRunId ? '' : text, session_id: sessionId, resume_run_id: resumeRunId }),
         signal: abortRef.current.signal,
       });
 
@@ -1350,6 +1412,8 @@ function AgentChat({
               case 'session':
                 setSessionId(event.session_id);
                 return m;
+              case 'run':
+                return { ...m, researchRunId: event.run_id };
               case 'intent':
                 return { ...m, intent: event.value, intentMethod: event.method, intentConfidence: event.confidence };
               case 'agent':
@@ -1364,10 +1428,17 @@ function AgentChat({
               }
               case 'token':
                 return { ...m, content: m.content + event.value };
+              case 'draft_token':
+                return { ...m, content: m.content + event.value, isDraft: true };
+              case 'replace':
+                return { ...m, content: event.value, isDraft: false };
               case 'done':
-                return { ...m, isStreaming: false, citations: event.citations };
+                return { ...m, isStreaming: false, citations: event.citations,
+                  researchComplete: Boolean(m.researchRunId || event.run_id) && !event.resumable, isDraft: false };
               case 'error':
                 return { ...m, isStreaming: false, content: m.content || `Error: ${event.value}` };
+              case 'cancelled':
+                return { ...m, isStreaming: false, content: `${m.content}\n\n[Generation stopped]`.trim() };
               case 'plan':
                 return {
                   ...m,
@@ -1431,6 +1502,13 @@ function AgentChat({
     }
   };
 
+  const stopGeneration = () => {
+    abortRef.current?.abort();
+    setMessages(prev => prev.map(m =>
+      m.isStreaming ? { ...m, isStreaming: false, content: `${m.content}\n\n[Generation stopped]`.trim() } : m
+    ));
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -1466,6 +1544,14 @@ function AgentChat({
           New Chat
         </button>
       </div>
+
+      {pausedRun && (
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs">
+          <span className="truncate text-indigo-800">Unfinished research: {pausedRun.question}</span>
+          <button type="button" disabled={isStreaming} onClick={() => sendMessage(pausedRun.run_id)}
+            className="shrink-0 font-medium text-indigo-700 underline disabled:opacity-50">Resume</button>
+        </div>
+      )}
 
       {/* Paper Context Banner */}
       {paperContext && (
@@ -1564,9 +1650,9 @@ function AgentChat({
             </p>
             <div className="mt-4 flex flex-wrap gap-2 justify-center">
               {(paperContext ? [
-                '这篇论文的核心贡献是什么？',
-                '它有哪些局限性和不足？',
-                '帮我找引用了这篇论文的相关工作',
+                "What is this paper's main contribution?",
+                "What are this paper's limitations?",
+                'Find related work that cites this paper',
               ] : [
                 'What are recent advances in transformers?',
                 'Recommend papers on reinforcement learning',
@@ -1584,7 +1670,7 @@ function AgentChat({
           </div>
         )}
         {messages.map(msg => (
-          <ChatBubble key={msg.id} message={msg} />
+          <ChatBubble key={msg.id} message={msg} onResume={(runId) => sendMessage(runId)} canResume={!isStreaming} />
         ))}
         <div ref={bottomRef} />
       </div>
@@ -1601,7 +1687,7 @@ function AgentChat({
           disabled={isStreaming}
         />
         <button
-          onClick={sendMessage}
+          onClick={() => sendMessage()}
           disabled={isStreaming || !input.trim()}
           className="btn-primary flex items-center gap-2 disabled:opacity-50 shrink-0"
         >
@@ -1612,13 +1698,26 @@ function AgentChat({
           )}
           Send
         </button>
+        {isStreaming && (
+          <button
+            onClick={stopGeneration}
+            className="px-3 py-2 rounded border border-gray-300 text-sm text-gray-700 hover:bg-gray-100"
+            type="button"
+          >
+            Stop
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
 /* ── Chat Bubble ── */
-function ChatBubble({ message }: { message: ChatMessage }) {
+function ChatBubble({ message, onResume, canResume }: {
+  message: ChatMessage;
+  onResume: (runId: string) => void;
+  canResume: boolean;
+}) {
   if (message.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -1709,6 +1808,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
 
         {/* Reply */}
         <div className="bg-white border border-gray-100 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
+          {message.isDraft && <p className="mb-2 text-xs text-amber-700">Draft answer — checking evidence</p>}
           {message.content ? (
             <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{message.content}</p>
           ) : (
@@ -1725,6 +1825,14 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             <span className="inline-block w-0.5 h-4 bg-gray-400 animate-pulse align-middle ml-0.5" />
           )}
         </div>
+
+        {message.researchRunId && !message.researchComplete && !message.isStreaming && (
+          <button type="button" disabled={!canResume}
+            onClick={() => onResume(message.researchRunId!)}
+            className="text-xs text-indigo-700 underline disabled:opacity-50">
+            Resume research
+          </button>
+        )}
 
         {/* Citations */}
         {message.citations && message.citations.length > 0 && (

@@ -10,11 +10,9 @@ Metric definitions live in evaluation/README.md. Results are reported per
 slice (semantic / exact / topic) as well as overall, because a single blended
 number hides which retrieval mode each configuration actually wins on.
 """
-import os
 import sys
 from pathlib import Path
 
-os.environ["VECTOR_DB_DIR"] = "/Users/samlv/researchmate_eval/vector_db_prod"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _harness import (  # noqa: E402

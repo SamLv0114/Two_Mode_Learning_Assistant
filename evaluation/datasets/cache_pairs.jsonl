@@ -1,0 +1,12 @@
+{"id":"c01","source":"Explain reciprocal rank fusion in hybrid search","probe":"How does RRF combine lexical and vector rankings?","equivalent":true}
+{"id":"c02","source":"Explain reciprocal rank fusion in hybrid search","probe":"Explain why reciprocal rank fusion is harmful for hybrid search","equivalent":false}
+{"id":"c03","source":"What is BM25 used for in retrieval?","probe":"How does BM25 help lexical document search?","equivalent":true}
+{"id":"c04","source":"What is BM25 used for in retrieval?","probe":"What is BM25 not used for in retrieval?","equivalent":false}
+{"id":"c05","source":"Summarize the paper on contrastive learning","probe":"Summarize the paper on contrastive learning","equivalent":true}
+{"id":"c06","source":"Summarize the paper on contrastive learning","probe":"Summarize the paper on causal learning","equivalent":false}
+{"id":"c07","source":"How do parent and child chunks work in RAG?","probe":"Explain parent-child chunk retrieval for RAG","equivalent":true}
+{"id":"c08","source":"How do parent and child chunks work in RAG?","probe":"How do parent and child chunks fail in RAG?","equivalent":false}
+{"id":"c09","source":"What is the citation count of paper A?","probe":"What is the citation count of paper B?","equivalent":false}
+{"id":"c10","source":"Find recent papers about tool calling","probe":"Find new papers about function calling","equivalent":true}
+{"id":"c11","source":"What is the best paper for my interests?","probe":"What is the best paper for another user's interests?","equivalent":false}
+{"id":"c12","source":"How does a circuit breaker prevent tool failures?","probe":"Explain tool-call circuit breakers","equivalent":true}
