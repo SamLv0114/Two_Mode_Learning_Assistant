@@ -38,6 +38,7 @@ services:
     environment:
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-learning_assistant}:${POSTGRES_PASSWORD:-password123}@db:5432/${POSTGRES_DB:-learning_assistant}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set for deployment}
       - REDIS_URL=redis://redis:6379
       - CORS_ORIGINS=http://localhost:3000,http://frontend:3000,https://researchmate.site,https://www.researchmate.site
