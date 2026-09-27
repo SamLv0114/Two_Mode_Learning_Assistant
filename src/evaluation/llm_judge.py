@@ -84,10 +84,10 @@ class LLMJudge:
         Args:
             question:  The original user question.
             response:  The agent's reply to evaluate.
-            context:   (legacy) retrieved context string — unused but kept for compat.
+            context:   Retrieved evidence text used for grounding assessment.
             citations: List of citation dicts passed through to CriticAgent.
         """
-        crit = self._critic.evaluate(question, response, citations=citations)
+        crit = self._critic.evaluate(question, response, citations=citations, context=context)
 
         # Convert 0-1 → 0-10
         accuracy = round(crit.groundedness * 10, 1)

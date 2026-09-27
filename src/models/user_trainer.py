@@ -1,13 +1,14 @@
 """
 Per-user model trainer for collecting interactions and retraining
 """
+import json
 import numpy as np
 import logging
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
-from src.database.models import UserInteraction, Paper, Article, UserPaperRecommendation, UserArticleRecommendation
+from src.database.models import UserInteraction, UserModelState, Paper, UserPaperRecommendation, upsert_user_interaction, count_labeled_paper_interactions
 from src.models.feature_extractor import FeatureExtractor
 from src.models.embeddings import EmbeddingManager
 from src.models.evaluator import compute_ndcg, compute_mrr
@@ -53,37 +54,11 @@ class UserModelTrainer:
             item_id: Database ID of the item
             interaction_type: "saved", "viewed", or "dismissed"
         """
-        now = datetime.now(timezone.utc)
-
-        # Check for existing interaction
-        existing = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == self.user_id,
-            UserInteraction.item_type == item_type,
-            UserInteraction.item_id == item_id,
-        ).first()
-
-        if existing:
-            existing.interaction_type = interaction_type
-            existing.timestamp = now
-            logger.debug(f"Updated interaction for user {self.user_id}: {item_type} {item_id} -> {interaction_type}")
-        else:
-            interaction = UserInteraction(
-                user_id=self.user_id,
-                item_type=item_type,
-                item_id=item_id,
-                interaction_type=interaction_type,
-                timestamp=now,
-            )
-            self.db.add(interaction)
-            logger.debug(f"Recorded interaction for user {self.user_id}: {item_type} {item_id} -> {interaction_type}")
-
-        self.db.commit()
+        upsert_user_interaction(self.db, self.user_id, item_type, item_id, interaction_type)
 
     def get_interaction_count(self) -> int:
-        """Get total number of interactions for this user"""
-        return self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == self.user_id
-        ).count()
+        """Count paper feedback eligible for the paper-only ranker."""
+        return count_labeled_paper_interactions(self.db, self.user_id)
 
     def _get_user_interests(self) -> List[str]:
         """Get user interests from database or use defaults"""
@@ -95,41 +70,50 @@ class UserModelTrainer:
                 return interests
         return settings.USER_INTERESTS
 
-    def _get_recent_texts(self, item_type: str) -> List[str]:
-        """Get recently recommended item texts for novelty calculation"""
+    def _get_recent_texts(self) -> List[str]:
+        """Get recently recommended paper texts for novelty calculation."""
         cutoff = datetime.now(timezone.utc) - timedelta(days=settings.NOVELTY_LOOKBACK_DAYS)
         texts = []
-
-        if item_type == "paper":
-            items = (
-                self.db.query(Paper)
-                .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
-                .filter(
-                    UserPaperRecommendation.user_id == self.user_id,
-                    UserPaperRecommendation.recommended_date >= cutoff,
-                )
-                .order_by(UserPaperRecommendation.recommended_date.desc())
-                .limit(settings.NOVELTY_MAX_ITEMS)
-                .all()
+        items = (
+            self.db.query(Paper)
+            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
+            .filter(
+                UserPaperRecommendation.user_id == self.user_id,
+                UserPaperRecommendation.recommended_date >= cutoff,
             )
-            for item in items:
-                texts.append(f"{item.title} {item.abstract or ''}")
-        else:
-            items = (
-                self.db.query(Article)
-                .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
-                .filter(
-                    UserArticleRecommendation.user_id == self.user_id,
-                    UserArticleRecommendation.recommended_date >= cutoff,
-                )
-                .order_by(UserArticleRecommendation.recommended_date.desc())
-                .limit(settings.NOVELTY_MAX_ITEMS)
-                .all()
-            )
-            for item in items:
-                texts.append(f"{item.title} {item.content or ''}")
+            .order_by(UserPaperRecommendation.recommended_date.desc())
+            .limit(settings.NOVELTY_MAX_ITEMS)
+            .all()
+        )
+        for item in items:
+            texts.append(f"{item.title} {item.abstract or ''}")
 
         return texts
+
+    def _labeled_papers(self):
+        """One real, explicit feedback label per paper, including older feeds.
+
+        UserPaperRecommendation is only the latest five items, so it cannot be
+        used as the training population. Cold-start cards also count because
+        their Save/Dismiss events are explicit feedback on real Paper rows.
+        """
+        rows = (
+            self.db.query(Paper, UserInteraction)
+            .join(UserInteraction, Paper.id == UserInteraction.item_id)
+            .filter(UserInteraction.user_id == self.user_id,
+                    UserInteraction.item_type == "paper",
+                    UserInteraction.interaction_type.in_(["saved", "viewed", "dismissed"]))
+            .all()
+        )
+        by_paper = {}
+        for paper, interaction in rows:
+            previous = by_paper.get(paper.id)
+            when = (interaction.timestamp or datetime.min).replace(tzinfo=None)
+            previous_when = (previous[1].timestamp or datetime.min).replace(tzinfo=None) if previous else datetime.min
+            if previous is None or when > previous_when:
+                by_paper[paper.id] = (paper, interaction)
+        return sorted(by_paper.values(), key=lambda row: (
+            (row[1].timestamp or datetime.min).replace(tzinfo=None), row[0].id))
 
     def generate_training_data(
         self,
@@ -140,71 +124,24 @@ class UserModelTrainer:
 
         Returns (None, None) if insufficient data.
         """
-        # Get user's interactions
-        interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == self.user_id
-        ).all()
-
-        if len(interactions) < min_interactions:
-            logger.info(f"User {self.user_id}: Not enough interactions ({len(interactions)} < {min_interactions})")
+        labeled = self._labeled_papers()
+        if len(labeled) < min_interactions:
+            logger.info(f"User {self.user_id}: Only {len(labeled)} labeled papers; need {min_interactions}")
             return None, None
-
-        # Get user interests
         user_interests = self._get_user_interests()
-
-        # Get all papers recommended to this user. Articles are excluded —
-        # the Article subsystem is retired and nothing writes new
-        # UserArticleRecommendation rows anymore.
-        recommended_papers = (
-            self.db.query(Paper)
-            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
-            .filter(UserPaperRecommendation.user_id == self.user_id)
-            .all()
-        )
-
-        # Build interaction score map
-        interaction_scores = {}
-        for interaction in interactions:
-            key = (interaction.item_type, interaction.item_id)
-
-            if interaction.interaction_type == "saved":
-                score = 1.0
-            elif interaction.interaction_type == "viewed":
-                score = 0.6
-            elif interaction.interaction_type == "dismissed":
-                score = 0.0
-            else:
-                score = 0.5
-
-            if key not in interaction_scores or score > interaction_scores[key]:
-                interaction_scores[key] = score
-
         X_list = []
         y_list = []
-
-        # Process papers
-        recent_paper_texts = self._get_recent_texts("paper")
-        for paper in recommended_papers:
+        recent_paper_texts = self._get_recent_texts()
+        labels = {"saved": 1.0, "viewed": 0.6, "dismissed": 0.0}
+        for paper, interaction in labeled:
             features = self.feature_extractor.extract_features(
                 paper, self.embedding_manager, user_interests,
                 recent_texts=recent_paper_texts,
             )
-
             X_list.append([features.get(name, 0.0) for name in self.FEATURE_NAMES])
-
-            key = ("paper", paper.id)
-            if key in interaction_scores:
-                y_list.append(interaction_scores[key])
-            elif settings.INCLUDE_IMPLICIT_NEGATIVES:
-                if np.random.rand() <= settings.IMPLICIT_NEGATIVE_SAMPLE_RATE:
-                    y_list.append(0.0)
-                else:
-                    X_list.pop()
-            else:
-                X_list.pop()
-
-        if len(X_list) == 0:
-            logger.warning(f"User {self.user_id}: No training examples generated")
+            y_list.append(labels[interaction.interaction_type])
+        if len(set(y_list)) < 2:
+            logger.warning("User %s: Training labels have no variation", self.user_id)
             return None, None
 
         X = np.array(X_list)
@@ -219,81 +156,34 @@ class UserModelTrainer:
         min_group_size: int = 10
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[List[int]]]:
         """
-        Generate (X, y, group_sizes) for LTR training, grouped by week.
+        Generate LTR examples from actual paper feedback, grouped by feedback week.
         """
-        interactions = self.db.query(UserInteraction).filter(
-            UserInteraction.user_id == self.user_id
-        ).all()
-
-        if len(interactions) < min_interactions:
-            logger.info(f"User {self.user_id}: Not enough interactions for LTR")
+        labeled = self._labeled_papers()
+        if len(labeled) < min_interactions:
+            logger.info("User %s: Only %s labeled papers; need %s", self.user_id, len(labeled), min_interactions)
             return None, None, None
-
         user_interests = self._get_user_interests()
-
-        paper_recs = (
-            self.db.query(Paper, UserPaperRecommendation.recommended_date)
-            .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
-            .filter(UserPaperRecommendation.user_id == self.user_id)
-            .all()
-        )
-
-        interaction_scores = {}
-        for interaction in interactions:
-            key = (interaction.item_type, interaction.item_id)
-            if interaction.interaction_type == "saved":
-                score = 2
-            elif interaction.interaction_type == "viewed":
-                score = 1
-            elif interaction.interaction_type == "dismissed":
-                score = 0
-            else:
-                score = 1
-            if key not in interaction_scores or score > interaction_scores[key]:
-                interaction_scores[key] = score
-
-        recent_paper_texts = self._get_recent_texts("paper")
-
-        # Group by week using per-user recommended_date from junction table
+        recent_paper_texts = self._get_recent_texts()
         grouped_items = {}
-        for paper, rec_date in paper_recs:
-            if not rec_date:
-                continue
-            group_key = (rec_date.isocalendar()[0], rec_date.isocalendar()[1])
-            grouped_items.setdefault(group_key, []).append(paper)
-
-        if not grouped_items:
-            logger.warning(f"User {self.user_id}: No grouped recommendations")
-            return None, None, None
-
+        labels = {"saved": 2, "viewed": 1, "dismissed": 0}
+        for paper, interaction in labeled:
+            when = interaction.timestamp or datetime.now(timezone.utc)
+            week = when.isocalendar()
+            grouped_items.setdefault((week.year, week.week), []).append((paper, interaction))
         X_list = []
         y_list = []
         group_sizes = []
-
-        sorted_group_keys = sorted(grouped_items.keys())
         current_group_x = []
         current_group_y = []
-
-        for group_key in sorted_group_keys:
-            items = grouped_items[group_key]
-
-            for item in items:
+        for group_key in sorted(grouped_items):
+            for item, interaction in grouped_items[group_key]:
                 features = self.feature_extractor.extract_features(
                     item, self.embedding_manager, user_interests,
                     recent_texts=recent_paper_texts,
                 )
-
                 feature_vec = [features.get(name, 0.0) for name in self.FEATURE_NAMES]
-
-                key = ("paper", item.id)
-                if key in interaction_scores:
-                    current_group_x.append(feature_vec)
-                    current_group_y.append(interaction_scores[key])
-                elif settings.INCLUDE_IMPLICIT_NEGATIVES:
-                    if np.random.rand() <= settings.IMPLICIT_NEGATIVE_SAMPLE_RATE:
-                        current_group_x.append(feature_vec)
-                        current_group_y.append(0)
-
+                current_group_x.append(feature_vec)
+                current_group_y.append(labels[interaction.interaction_type])
             if len(current_group_x) >= min_group_size:
                 X_list.extend(current_group_x)
                 y_list.extend(current_group_y)
@@ -301,14 +191,15 @@ class UserModelTrainer:
                 current_group_x = []
                 current_group_y = []
 
-        # Add remaining
         if len(current_group_x) > 0:
             X_list.extend(current_group_x)
             y_list.extend(current_group_y)
-            group_sizes.append(len(current_group_x))
-
-        if len(X_list) == 0:
-            logger.warning(f"User {self.user_id}: No ranking examples generated")
+            if group_sizes:
+                group_sizes[-1] += len(current_group_x)
+            else:
+                group_sizes.append(len(current_group_x))
+        if len(set(y_list)) < 2:
+            logger.warning("User %s: LTR labels have no variation", self.user_id)
             return None, None, None
 
         X = np.array(X_list)
@@ -347,15 +238,20 @@ class UserModelTrainer:
                 recommender, X, y, group_sizes
             )
             logger.info(f"User {self.user_id}: Train NDCG@10={train_metrics['ndcg']:.3f}, MRR={train_metrics['mrr']:.3f}")
-            logger.info(f"User {self.user_id}: Val NDCG@10={val_metrics['ndcg']:.3f}, MRR={val_metrics['mrr']:.3f}")
+            if val_metrics is not None:
+                logger.info(f"User {self.user_id}: Val NDCG@10={val_metrics['ndcg']:.3f}, MRR={val_metrics['mrr']:.3f}")
 
             recommender.save_training_metrics(
                 train_ndcg=train_metrics['ndcg'],
                 train_mrr=train_metrics['mrr'],
-                val_ndcg=val_metrics['ndcg'],
-                val_mrr=val_metrics['mrr'],
+                val_ndcg=val_metrics['ndcg'] if val_metrics else None,
+                val_mrr=val_metrics['mrr'] if val_metrics else None,
                 interaction_count=interaction_count
             )
+            # Validation scores describe the held-out split. Fit the model
+            # serving the feed on all eligible feedback after measuring them.
+            if val_metrics is not None:
+                recommender.update_model(X, y, group=group_sizes)
         else:
             # Train on all data
             recommender.update_model(X, y, group=group_sizes)
@@ -379,6 +275,17 @@ class UserModelTrainer:
         except Exception as e:
             logger.warning(f"Could not update heuristic weights: {e}")
 
+        state = self.db.query(UserModelState).filter(UserModelState.user_id == self.user_id).first()
+        if state:
+            counts = {"dismissed": int(np.sum(y == 0)),
+                      "viewed": int(np.sum(y == (1 if group_sizes else 0.6))),
+                      "saved": int(np.sum(y == (2 if group_sizes else 1.0)))}
+            state.training_sample_count = len(X)
+            state.training_label_counts = json.dumps(counts)
+            state.interaction_count_at_training = interaction_count
+            state.last_trained_at = datetime.now(timezone.utc)
+            self.db.commit()
+
         logger.info(f"User {self.user_id}: Retrained model with {len(X)} examples")
         return True
 
@@ -388,7 +295,7 @@ class UserModelTrainer:
         X: np.ndarray,
         y: np.ndarray,
         group_sizes: Optional[List[int]] = None
-    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+    ) -> Tuple[Dict[str, float], Optional[Dict[str, float]]]:
         """80/20 temporal split training"""
         if group_sizes:
             train_size = max(1, int(len(group_sizes) * 0.8))
@@ -399,7 +306,8 @@ class UserModelTrainer:
                     'ndcg': compute_ndcg(y, preds, k=10, group_sizes=group_sizes),
                     'mrr': compute_mrr(y, preds, group_sizes=group_sizes)
                 }
-                return metrics, metrics
+                # One temporal group cannot provide a held-out validation set.
+                return metrics, None
 
             train_groups = group_sizes[:train_size]
             val_groups = group_sizes[train_size:]

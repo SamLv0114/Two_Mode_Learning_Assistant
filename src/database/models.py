@@ -69,6 +69,19 @@ class User(Base):
         self.focus_areas = ",".join(areas)
 
 
+class ResearchRun(Base):
+    """Durable, owner-scoped checkpoint for a DeepResearch run."""
+    __tablename__ = "research_runs"
+
+    run_id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    question = Column(Text, nullable=False)
+    state_json = Column(Text, nullable=False)
+    status = Column(String(20), nullable=False, default="running")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
 class UserModelState(Base):
     """Store per-user ML model and heuristic weights"""
     __tablename__ = "user_model_states"
@@ -85,6 +98,10 @@ class UserModelState(Base):
     is_trained = Column(Boolean, default=False)
     interaction_count_at_training = Column(Integer, default=0)
     last_trained_at = Column(DateTime, nullable=True)
+    last_training_attempt_at = Column(DateTime, nullable=True)
+    interaction_count_at_attempt = Column(Integer, default=0)
+    training_sample_count = Column(Integer, nullable=False, default=0)
+    training_label_counts = Column(Text, nullable=True)
 
     # Metrics from last training
     train_ndcg = Column(Float, nullable=True)
@@ -175,11 +192,48 @@ class UserInteraction(Base):
 
     # Composite index for faster lookups
     __table_args__ = (
-        Index('ix_user_item', 'user_id', 'item_type', 'item_id'),
+        Index('ix_user_item', 'user_id', 'item_type', 'item_id', unique=True),
     )
 
     def __repr__(self):
         return f"<UserInteraction(user_id={self.user_id}, type='{self.interaction_type}', item_id={self.item_id})>"
+
+
+def upsert_user_interaction(db, user_id: int, item_type: str, item_id: int,
+                            interaction_type: str) -> UserInteraction:
+    """Atomically keep one latest feedback label for a user and item."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    dialect = db.get_bind().dialect.name
+    if dialect == "postgresql":
+        insert = pg_insert
+    elif dialect == "sqlite":
+        insert = sqlite_insert
+    else:
+        raise RuntimeError(f"Unsupported interaction upsert dialect: {dialect}")
+    now = datetime.now(timezone.utc)
+    stmt = insert(UserInteraction).values(
+        user_id=user_id, item_type=item_type, item_id=item_id,
+        interaction_type=interaction_type, timestamp=now,
+    ).on_conflict_do_update(
+        index_elements=["user_id", "item_type", "item_id"],
+        set_={"interaction_type": interaction_type, "timestamp": now},
+    )
+    db.execute(stmt)
+    db.commit()
+    return db.query(UserInteraction).filter_by(user_id=user_id, item_type=item_type,
+                                               item_id=item_id).one()
+
+
+def count_labeled_paper_interactions(db, user_id: int) -> int:
+    """Count distinct paper feedback rows that can actually enter training."""
+    return (db.query(UserInteraction)
+            .join(Paper, Paper.id == UserInteraction.item_id)
+            .filter(UserInteraction.user_id == user_id,
+                    UserInteraction.item_type == "paper",
+                    UserInteraction.interaction_type.in_(("saved", "viewed", "dismissed")))
+            .count())
 
 
 class UserPaperRecommendation(Base):
@@ -195,6 +249,8 @@ class UserPaperRecommendation(Base):
     rank = Column(Integer, nullable=True)
     feed_mode = Column(String, nullable=True)
     feed_time_window_days = Column(Integer, nullable=True)
+    ranking_source = Column(String(32), nullable=True)
+    ranking_fallback_reason = Column(Text, nullable=True)
 
     __table_args__ = (
         Index('ix_user_paper_rec', 'user_id', 'paper_id', unique=True),
@@ -308,6 +364,20 @@ def init_db():
                 col_type = column.type.compile(dialect=engine.dialect)
                 conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column.name} {col_type}"))
                 logger.info(f"Migrated: added column {table_name}.{column.name} ({col_type})")
+        # Older installations created ix_user_item as a non-unique index and
+        # may already contain duplicate clicks. Keep the newest row, then
+        # replace that index before accepting concurrent writes.
+        indexes = {idx["name"]: idx for idx in inspector.get_indexes("user_interactions")}
+        if not indexes.get("ix_user_item", {}).get("unique"):
+            conn.execute(text("DELETE FROM user_interactions WHERE id IN ("
+                              "SELECT id FROM (SELECT id, ROW_NUMBER() OVER ("
+                              "PARTITION BY user_id, item_type, item_id "
+                              "ORDER BY timestamp DESC, id DESC) AS row_num "
+                              "FROM user_interactions) AS ranked WHERE row_num > 1)"))
+            conn.execute(text("DROP INDEX IF EXISTS ix_user_item"))
+            conn.execute(text("CREATE UNIQUE INDEX ix_user_item ON user_interactions "
+                              "(user_id, item_type, item_id)"))
+            logger.info("Migrated: deduplicated interactions and made ix_user_item unique")
         conn.commit()
 
 

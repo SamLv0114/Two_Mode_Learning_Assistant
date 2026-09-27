@@ -1,6 +1,6 @@
 # ResearchMate
 
-A multi-user ML research platform — personalized paper and article recommendations, multi-agent chat with RAG, and a personal knowledge base that learns from your interactions.
+A multi-user research platform with a personalized paper feed, multi-agent chat with RAG, and a personal knowledge base that learns from your interactions.
 
 **Live:** https://www.researchmate.site
 
@@ -8,12 +8,12 @@ A multi-user ML research platform — personalized paper and article recommendat
 
 ## Features
 
-- **Daily Feed** — ArXiv papers fetched nightly via RSS and ranked per-user with a LightGBM learning-to-rank model (13 features). Tech articles discovered daily via Tavily web search. Two modes: *Recommended* (ChromaDB semantic retrieval + LTR) and *Latest* (pure recency).
+- **Daily Feed** — ArXiv papers fetched nightly via RSS. *Recommended* uses ChromaDB retrieval; *Latest* filters by publication date. Both modes rank candidates with 11 features and use a trained per-user LightGBM model when eligible, with heuristic fallback.
 - **Multi-Agent Chat** — SSE streaming chat with automatic intent routing to five specialized agents. Intent classified in three stages: keyword rules → embedding cosine similarity → GPT-4o-mini.
 - **Paper Deep Dive** — "Ask Agent" button on any paper card injects the paper's title and abstract as context on the first message so agents can give grounded, specific answers.
 - **Personal Knowledge Base** — Upload PDF, TXT, DOCX, or Markdown files. Chunks are embedded into ChromaDB and become searchable by all agents in future conversations.
 - **User Fact Memory** — GPT-4o-mini extracts facts about you after each turn (interests, expertise, goals) and stores them in Redis for 30 days. These are prepended to agent system prompts to personalize every response.
-- **Adaptive Ranking** — Per-user LightGBM model auto-trains after 50 interactions (saved+viewed+dismissed). Falls back to heuristic scoring before enough data exists.
+- **Adaptive Ranking** — Per-user LightGBM model trains after 50 distinct, labeled paper interactions (saved, viewed, or dismissed). Training uses historical feedback rather than the five current Feed rows. The model status reports sample and label counts; each Feed reports whether ML scoring actually ran and why it fell back when it did.
 - **LLM-as-Judge Evaluation** — Batch eval endpoint scores agent replies on groundedness, completeness, and clarity using CriticAgent (gpt-4o-mini). Also used inline by ReflectionAgent for quality control.
 - **Prometheus Metrics** — Request counts, latency histograms, tool usage, and eval scores exposed at `/metrics`.
 
@@ -50,7 +50,7 @@ All `research_qa` messages go through intent recognition; the router then picks 
 | LLM | OpenAI API (gpt-4o / gpt-4o-mini) | All agent reasoning, summarization, evaluation |
 | Embeddings | sentence-transformers/all-MiniLM-L6-v2 | 384-dim vectors for ChromaDB and intent classification |
 | Vector DB | ChromaDB (embedded, persistent) | Paper and document semantic search |
-| Ranking | LightGBM LambdaRank · scikit-learn | Per-user learning-to-rank (13 features) |
+| Ranking | LightGBM LambdaRank · scikit-learn | Per-user learning-to-rank (11 features) |
 | Database | PostgreSQL (prod) · SQLite (dev) | Users, papers, articles, interactions, model state |
 | Cache | Redis *(optional)* | Session memory, fact memory, feed job status, tool traces |
 | Web search | Tavily *(optional)* | Article discovery, agent `search_web` tool |
@@ -142,16 +142,16 @@ All `/api/v1/` routes except `/auth/register` and `/auth/login` require `Authori
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/feed/generate` | Start background feed generation job. Returns `job_id`. |
-| `GET` | `/api/v1/feed/status/{job_id}` | Poll job status (`pending` → `running` → `completed`). |
+| `GET` | `/api/v1/feed/status/{job_id}` | Poll the current user's job (`generating` → `collecting` → `ranking` → `done`, or `error`). |
 | `GET` | `/api/v1/feed/papers` | Paginated recommended papers for current user. |
-| `GET` | `/api/v1/feed/articles` | Paginated recommended articles. |
+| `GET` | `/api/v1/feed/coldstart` | Papers for new users to rate. |
+| `POST` | `/api/v1/feed/refine` | Refine the current paper feed. |
 | `GET` | `/api/v1/feed/saved` | All saved papers and articles. |
 
 ### Chat (agent)
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/chat/stream` | SSE streaming. Yields `intent`, `agent`, `plan`, `task_*`, `token`, `done` events. |
-| `POST` | `/api/v1/chat/` | Non-streaming chat. Set `enable_eval: true` for LLM-as-Judge scores. |
 | `GET` | `/api/v1/chat/history/{session_id}` | Retrieve conversation history. |
 | `DELETE` | `/api/v1/chat/history/{session_id}` | Clear a session. |
 | `GET` | `/api/v1/chat/trace/{session_id}` | Tool-call trace (tool, args, result preview, latency). Expires after 1 hour. |
@@ -168,7 +168,8 @@ All `/api/v1/` routes except `/auth/register` and `/auth/login` require `Authori
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/interactions` | Record viewed / saved / dismissed on a paper or article. |
-| `GET` | `/api/v1/interactions/stats` | Interaction counts and model training status. |
+| `GET` | `/api/v1/interactions/stats` | Interaction counts and paper-feedback training readiness. |
+| `GET` | `/api/v1/interactions/model/status` | Trained sample count, label distribution, and train/validation metrics. |
 | `POST` | `/api/v1/interactions/model/retrain` | Manually trigger per-user model retraining. |
 
 ### Observability
@@ -248,7 +249,7 @@ researchmate/
 
 ```
 Ingestion:   ArXiv RSS → NightlyIndexer (06:00 UTC) → PostgreSQL → ChromaDB
-Articles:    WebArticleAgent (Tavily) → PostgreSQL → LightGBM LTR
+Feedback:    Viewed / saved / dismissed paper → interaction history → per-user LightGBM
 
 Request:     HTTP / SSE → IntentRecognizer → AgentRouter → Agent → Stream
 Agents:      Research · DeepResearch · PlanSolve · Reflection · Document · Rec · General
@@ -257,7 +258,3 @@ Eval:        CriticAgent (inline) · LLMJudge (batch) · Prometheus metrics
 ```
 
 ---
-
-## License
-
-MIT

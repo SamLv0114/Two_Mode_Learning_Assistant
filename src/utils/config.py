@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     RAW_DATA_DIR: Path = DATA_DIR / "raw"
     PROCESSED_DATA_DIR: Path = DATA_DIR / "processed"
     VECTOR_DB_DIR: Path = DATA_DIR / "vector_db"
+    SEMANTIC_CACHE_ENABLED: bool = False
+    ANSWER_CACHE_ENABLED: bool = False
+    RAG_SEMANTIC_CHUNKING_ENABLED: bool = False
+    RAG_TABLE_EXTRACTION_ENABLED: bool = False
+    RESEARCH_EARLY_STOP_ENABLED: bool = False
+    RESEARCH_MAX_SECONDS: int = 180
     MODELS_DIR: Path = PROJECT_ROOT / "models"
 
     # API Keys

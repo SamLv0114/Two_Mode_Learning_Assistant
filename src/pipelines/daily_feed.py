@@ -22,7 +22,7 @@ RETRIEVAL
 RANKING  (_score_and_rank — the single heuristic implementation)
       score = w_sem*semantic + w_cit*citation + w_rec*recency
       score *= (1 - 0.30 * familiarity)    similar to papers already saved
-      score *= (1 - 0.20 * dislike)        similar to a stated dismiss reason
+      score *= (1 - 0.08 * dislike)        similar to a dismissed paper
 
   Weights come from one continuous dial, not discrete modes. Semantic similarity
   is fixed at 0.55 because it is the point of personalisation; the remaining 0.45
@@ -34,14 +34,13 @@ RANKING  (_score_and_rank — the single heuristic implementation)
   Latest work: inside a 7-day window no paper has citations yet, so that term
   would otherwise hold weight while contributing nothing.
 
-  Past 50 interactions, LightGBM replaces this scoring entirely
-  (_rank_and_select); the heuristic path is what runs before there is enough
-  data to train on.
+  Once enough distinct paper feedback exists, a trained LightGBM model can
+  replace this score in _rank_and_select. Prediction failures fall back to it.
 
 FEEDBACK
-  Saves, views and dismissals all land in UserInteraction. Dismissals also go to
-  an LLM that records *why*, and those reasons come back as the dislike penalty
-  above. New users are offered a diverse set of papers to rate up front
+  Saves, views and dismissals all land in UserInteraction. A dismissal is only
+  a weak topic signal; the system does not invent a reason for it. New users
+  are offered a diverse set of papers to rate up front
   (get_coldstart_seeds) rather than waiting for this to accumulate.
 
 Community trending content is deliberately NOT here — see What's Hot
@@ -64,7 +63,7 @@ from src.models import EmbeddingManager, FeatureExtractor
 from src.models.user_recommender import UserRecommender
 from src.models.user_trainer import UserModelTrainer
 from src.rag import Generator
-from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction, UserPaperRecommendation, UserArticleRecommendation, UserPaperImpression
+from src.database.models import Paper, Article, SessionLocal, init_db, UserInteraction, UserModelState, UserPaperRecommendation, UserArticleRecommendation, UserPaperImpression
 from src.utils.config import settings
 
 logging.basicConfig(level=logging.INFO)
@@ -89,19 +88,14 @@ TRADEOFF_BUDGET = 0.45  # split between citation and recency by the novelty dial
 # Interactions needed before the trained ranker replaces heuristic scoring.
 # Named because it gates four separate branches; a literal in each was how one of
 # them (the impact-score fallback) ended up never checking it at all.
-LIGHTGBM_MIN_INTERACTIONS = 50
+LIGHTGBM_MIN_INTERACTIONS = settings.MIN_INTERACTIONS_FOR_TRAINING
 
 FAMILIAR_PENALTY_STRENGTH = 0.30   # similar to something already saved
 
-# Deliberately weaker than the familiar penalty despite representing a stronger
-# preference, because the measurement behind it is the shakier of the two.
-# Dismiss reasons describe a *property* ("too theoretical", "no code examples"),
-# but cosine similarity against a title+abstract matches on *topic*. A paper whose
-# abstract merely mentions theory can score close to "too theoretical", and
-# embeddings handle negation poorly, so "no code examples" is not reliably
-# anti-correlated with papers that do ship code. Until there is real dismiss data
-# to check this against, it stays a nudge rather than a strong signal.
-DISLIKE_PENALTY_STRENGTH = 0.20
+# A dismiss only says the user rejected one paper; it does not reveal why.
+# Similarity to that paper's title and abstract is therefore a weak topic hint,
+# rather than a strong negative preference for every paper on that topic.
+DISLIKE_PENALTY_STRENGTH = 0.08  # one dismiss does not establish a firm preference
 
 # Calibrated selection (Steck, "Calibrated Recommendations", RecSys 2018): the
 # final top-K should reflect the user's own category mix, not just whichever
@@ -219,6 +213,9 @@ class DailyFeedPipeline:
         self._novelty_preference: Optional[float] = None
         self._disliked_embs_cached: bool = False
         self._disliked_embs: Optional[np.ndarray] = None
+        self._ranking_source = "heuristic"
+        self._ranking_fallback_reason: Optional[str] = None
+        self._allow_ml = True
     
     def run(
         self,
@@ -227,6 +224,7 @@ class DailyFeedPipeline:
         user_interests: List[str] = None,
         mode: str = "recommended",
         force_refresh: bool = False,
+        use_ml: bool = True,
     ):
         """
         Build today's feed.
@@ -246,6 +244,7 @@ class DailyFeedPipeline:
         signal, and silently ignoring it (returning a Recommended-mode feed after
         the user switched to Latest, say) is worse than spending the regeneration.
         """
+        self._allow_ml = use_ml
         if not force_refresh:
             existing = self._todays_feed()
             if existing:
@@ -255,15 +254,12 @@ class DailyFeedPipeline:
                     mode != "latest"
                     or existing.get("time_window_days") == time_window_days
                 )
-                if mode_matches and window_matches:
+                ranking_matches = use_ml or existing.get("ranking_source") != "ml"
+                if mode_matches and window_matches and ranking_matches:
                     logger.info(
                         f"Feed already generated today ({len(existing['papers'])} papers) "
                         f"— returning it unchanged. Use force_refresh for a new batch."
                     )
-                    # Still check training. Interactions accrue between clicks — a user
-                    # who finishes onboarding after generating would otherwise wait
-                    # until tomorrow for the model to see any of it.
-                    self._maybe_retrain()
                     return existing
                 logger.info(
                     f"Today's feed was generated as mode={existing_mode!r}/"
@@ -273,6 +269,11 @@ class DailyFeedPipeline:
                 )
 
         logger.info(f"Starting daily feed pipeline (mode={mode}, force_refresh={force_refresh})...")
+
+        # Train before ranking so the newly trained model serves this batch.
+        # A reused batch does not retrain or block on model work.
+        if use_ml:
+            self._maybe_retrain()
 
         selected_interests = focus_areas if focus_areas else settings.USER_INTERESTS
         self._user_interests = _expand_focus_areas(focus_areas) if focus_areas else (user_interests or selected_interests)
@@ -305,9 +306,6 @@ class DailyFeedPipeline:
         # Persist feed context in Redis for IterativeRefinementAgent
         self._store_feed_ctx(output, mode)
 
-        # Step 5: Retrain if enough interactions
-        self._maybe_retrain()
-
         logger.info("Daily feed pipeline completed!")
         return output
 
@@ -315,20 +313,68 @@ class DailyFeedPipeline:
         """
         Retrain the ranker when enough interactions have accumulated.
 
-        Called from both the generate path and the idempotent early return, so
-        training keeps up with feedback regardless of which one a click takes.
+        Called when a new batch is generated. Returning an existing batch does
+        not block on model training.
         Failures are logged, never raised — a training problem should not fail
         the request that happened to trigger it.
         """
         try:
             interaction_count = self.trainer.get_interaction_count()
             if interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
+                state = self.db.query(UserModelState).filter(UserModelState.user_id == self.user_id).first()
+                now = datetime.now(timezone.utc)
+
+                def latest_feedback_at():
+                    latest = (self.db.query(UserInteraction.timestamp)
+                              .join(Paper, Paper.id == UserInteraction.item_id)
+                              .filter(UserInteraction.user_id == self.user_id,
+                                      UserInteraction.item_type == "paper",
+                                      UserInteraction.interaction_type.in_(("saved", "viewed", "dismissed")))
+                              .order_by(UserInteraction.timestamp.desc()).first())
+                    if not latest or latest[0] is None:
+                        return None
+                    return latest[0].replace(tzinfo=timezone.utc) if latest[0].tzinfo is None else latest[0]
+
+                # Do not retry a failed fit on the exact same feedback at
+                # every Feed request. New or changed labels permit a retry.
+                if state and state.last_training_attempt_at:
+                    attempt = state.last_training_attempt_at
+                    if attempt.tzinfo is None:
+                        attempt = attempt.replace(tzinfo=timezone.utc)
+                    if (now - attempt < timedelta(hours=settings.AUTO_RETRAIN_INTERVAL_HOURS)
+                            and interaction_count <= (state.interaction_count_at_attempt or 0)):
+                        latest = latest_feedback_at()
+                        if latest is None or latest <= attempt:
+                            return
+
+                if (state and self.recommender.is_trained and state.is_trained and
+                        (state.training_sample_count or 0) >= LIGHTGBM_MIN_INTERACTIONS and
+                        state.last_trained_at):
+                    last = state.last_trained_at
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if interaction_count <= (state.interaction_count_at_training or 0):
+                        latest = latest_feedback_at()
+                        if latest is None:
+                            return
+                        if latest <= last:
+                            return
+                    if now - last < timedelta(hours=settings.AUTO_RETRAIN_INTERVAL_HOURS):
+                        return
+                if state is None:
+                    state = UserModelState(user_id=self.user_id)
+                    self.db.add(state)
+                state.last_training_attempt_at = now
+                state.interaction_count_at_attempt = interaction_count
+                self.db.commit()
                 logger.info(f"Retraining model with {interaction_count} interactions...")
-                self.trainer.retrain_model(
+                trained = self.trainer.retrain_model(
                     self.recommender,
                     min_interactions=LIGHTGBM_MIN_INTERACTIONS,
                     use_validation=True,
                 )
+                if not trained:
+                    logger.warning("User %s: Training did not produce a model from %s labels", self.user_id, interaction_count)
             else:
                 logger.info(
                     f"Skipping retrain "
@@ -385,6 +431,9 @@ class DailyFeedPipeline:
                 ],
                 "articles": [],
                 "reused": True,  # lets callers distinguish a cache hit from a fresh run
+                "used_ml_ranking": _first_rec.ranking_source == "ml",
+                "ranking_source": _first_rec.ranking_source or "heuristic",
+                "ranking_fallback_reason": _first_rec.ranking_fallback_reason,
             }
         except Exception as e:
             # A lookup failure should never block generation — fall through and
@@ -576,7 +625,7 @@ class DailyFeedPipeline:
 
         # ── Re-rank: semantic similarity + citation influence ──────────────────
         interaction_count = self.trainer.get_interaction_count()
-        if interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
+        if self._allow_ml and interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
             # LightGBM knows citation counts via feature extractor — just pass candidates
             logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
             papers = [self._db_paper_to_paperdata(p) for p in db_papers]
@@ -798,7 +847,7 @@ class DailyFeedPipeline:
         papers = [self._db_paper_to_paperdata(p) for p in db_papers]
 
         interaction_count = self.trainer.get_interaction_count()
-        if interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
+        if self._allow_ml and interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
             logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
             return self._rank_and_select(
                 papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
@@ -834,7 +883,7 @@ class DailyFeedPipeline:
         papers = [self._db_paper_to_paperdata(p) for p in db_papers]
 
         interaction_count = self.trainer.get_interaction_count()
-        if interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
+        if self._allow_ml and interaction_count >= LIGHTGBM_MIN_INTERACTIONS:
             logger.info(f"LightGBM re-ranking ({interaction_count} interactions)")
             return self._rank_and_select(
                 papers, settings.TOP_PAPERS_COUNT, "paper", selected_interests, use_ml=True
@@ -1136,19 +1185,12 @@ class DailyFeedPipeline:
         sims = saved_embs @ paper_emb
         return float(np.max(sims))
 
-    # ── Dislike penalty (closes the dismiss-reflexion loop) ───────────────────
+    # ── Weak dismissal-topic penalty ──────────────────────────────────────────
 
     def _get_disliked_embeddings(self) -> Optional[np.ndarray]:
         """
-        Embed the reasons this user has dismissed papers, from UserFactMemory.
-
-        Dismiss reflexion already asks an LLM why a paper was rejected and stores
-        the answer as a negative fact, but nothing on the ranking side ever read
-        those facts back — the loop was written but never closed. This is the read
-        end of it.
-
-        Memoised per run: this hits Redis and embeds up to ten strings, and several
-        ranking paths can reach it within one generation.
+        Embed recently dismissed papers as a weak topic signal. A click says
+        nothing about *why* the paper was dismissed.
 
         Returns normalised embeddings, or None when there is nothing to avoid.
         """
@@ -1161,24 +1203,22 @@ class DailyFeedPipeline:
     def _compute_disliked_embeddings(self) -> Optional[np.ndarray]:
         """Uncached — see _get_disliked_embeddings."""
         try:
-            from src.agents.memory import UserFactMemory
-
-            facts = UserFactMemory()._load(self.user_id, self._get_redis())
-            reasons = [
-                # Strip the "user disliked: " prefix — embedding the bare reason
-                # keeps the vector on the topic rather than on the phrasing.
-                f["fact"].split("user disliked:", 1)[-1].strip()
-                for f in facts
-                if f.get("negative") and f.get("fact")
-            ]
-            reasons = [r for r in reasons if r][:10]
-            if not reasons:
+            papers = (
+                self.db.query(Paper)
+                .join(UserInteraction, UserInteraction.item_id == Paper.id)
+                .filter(UserInteraction.user_id == self.user_id,
+                        UserInteraction.item_type == "paper",
+                        UserInteraction.interaction_type == "dismissed")
+                .order_by(UserInteraction.timestamp.desc())
+                .limit(10).all()
+            )
+            if not papers:
                 return None
-
-            embs = np.array(self.embedding_manager.generate_embeddings(reasons))
+            texts = [f"{p.title} {(p.abstract or '')[:300]}" for p in papers]
+            embs = np.array(self.embedding_manager.generate_embeddings(texts))
             norms = np.linalg.norm(embs, axis=1, keepdims=True)
             norms[norms == 0] = 1.0
-            logger.info(f"Dislike penalty active: {len(reasons)} negative fact(s)")
+            logger.info("Weak dismiss-topic signal active: %s paper(s)", len(texts))
             return embs / norms
         except Exception as e:
             logger.debug(f"_get_disliked_embeddings skipped: {e}")
@@ -1186,7 +1226,7 @@ class DailyFeedPipeline:
 
     def _dislike_penalty(self, paper_emb: np.ndarray, disliked_embs: Optional[np.ndarray]) -> float:
         """
-        Similarity of a candidate paper to reasons this user has rejected papers.
+        Similarity of a candidate paper to papers this user dismissed.
         Returns a value in [0, 1]; higher means closer to something they disliked.
         """
         if disliked_embs is None or len(disliked_embs) == 0:
@@ -1261,7 +1301,11 @@ class DailyFeedPipeline:
             for p in db_papers
         ]
         try:
-            diverse = self._apply_mmr(scored, top_k=n, item_type="paper")
+            # _apply_mmr returns (paper, score) pairs for ranking callers.
+            # Cold-start's response below needs Paper objects, not pairs.
+            diverse = [paper for paper, _score in self._apply_mmr(
+                scored, top_k=n, item_type="paper"
+            )]
         except Exception as e:
             logger.warning(f"MMR failed for cold-start seeds ({e}) — using impact order")
             diverse = [p for p, _ in scored[:n]]
@@ -1306,7 +1350,7 @@ class DailyFeedPipeline:
         applying uniformly rather than only on whichever path was edited last.
 
         score = w_sem*semantic + w_cit*citation + w_rec*recency
-                then demoted by familiarity and by stated dislikes
+                then weakly demoted by familiarity and similar dismissed papers
 
         Weights come from the caller (see _blend_weights); signals that cannot
         separate the candidates in hand are dropped and their weight redistributed.
@@ -1434,8 +1478,7 @@ class DailyFeedPipeline:
                     familiar = self._familiar_penalty(emb, saved_embs)
                     base_score *= (1.0 - FAMILIAR_PENALTY_STRENGTH * familiar)
 
-                # Explicitly rejected ground: demote harder, since this is a
-                # stated preference rather than an inference about coverage.
+                # A dismissal has an unknown reason, so use a modest demotion.
                 if disliked_embs is not None:
                     disliked = self._dislike_penalty(emb, disliked_embs)
                     base_score *= (1.0 - DISLIKE_PENALTY_STRENGTH * disliked)
@@ -1693,6 +1736,8 @@ class DailyFeedPipeline:
         if use_ml:
             # Use ML recommender
             ranked = self.recommender.rank_items(items, features)
+            self._ranking_source = getattr(self.recommender, "last_ranking_source", "heuristic")
+            self._ranking_fallback_reason = getattr(self.recommender, "last_ranking_fallback_reason", None)
         else:
             # Heuristic-only scoring (pre-training)
             scored = []
@@ -1715,7 +1760,7 @@ class DailyFeedPipeline:
 
         # Store relevance scores
         for item, score in selected:
-            item.relevance_score = score
+            item.relevance_score = float(score)
 
         return [item for item, score in selected]
 
@@ -1906,10 +1951,13 @@ class DailyFeedPipeline:
                     paper_id=paper.id,
                     recommended_date=now,
                     personalized_summary=paper_data.personalized_summary,
-                    relevance_score=paper_data.relevance_score,
+                    relevance_score=(float(paper_data.relevance_score)
+                                     if paper_data.relevance_score is not None else None),
                     rank=rank,
                     feed_mode=mode,
                     feed_time_window_days=time_window_days,
+                    ranking_source=getattr(self, "_ranking_source", "heuristic"),
+                    ranking_fallback_reason=getattr(self, "_ranking_fallback_reason", None),
                 ))
 
                 # Append-only impression record — never deleted, this is what
@@ -1944,7 +1992,8 @@ class DailyFeedPipeline:
                     article_id=article.id,
                     recommended_date=now,
                     personalized_summary=article_data.personalized_summary,
-                    relevance_score=article_data.relevance_score,
+                    relevance_score=(float(article_data.relevance_score)
+                                     if article_data.relevance_score is not None else None),
                     rank=rank,
                 ))
 
@@ -1997,7 +2046,10 @@ class DailyFeedPipeline:
         output = {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "papers": [],
-            "articles": []
+            "articles": [],
+            "used_ml_ranking": self._ranking_source == "ml",
+            "ranking_source": self._ranking_source,
+            "ranking_fallback_reason": self._ranking_fallback_reason,
         }
         
         for i, paper in enumerate(papers, 1):

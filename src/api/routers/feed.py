@@ -4,16 +4,15 @@ Daily feed endpoints
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
+import time
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from src.database.models import User, Paper, UserInteraction, UserPaperRecommendation
+from src.database.models import User, Paper, UserInteraction, UserPaperRecommendation, count_labeled_paper_interactions
 from src.api.deps import get_db_session, get_current_user, get_embedding_manager
 from src.schemas.feed import (
     FeedRequest,
-    FeedResponse,
     PaperResponse,
 )
 from src.utils.config import settings
@@ -40,27 +39,42 @@ def _get_redis():
         return None
 
 
-def _set_status(job_id: str, data: dict) -> None:
+def _status_key(user_id: int, job_id: str) -> str:
+    return f"feed_job:{user_id}:{job_id}"
+
+
+def _set_status(user_id: int, job_id: str, data: dict) -> None:
+    key = _status_key(user_id, job_id)
     rc = _get_redis()
     if rc:
         try:
-            rc.setex(f"feed_job:{job_id}", _JOB_TTL, json.dumps(data))
+            rc.setex(key, _JOB_TTL, json.dumps(data))
             return
         except Exception:
             pass
-    _job_store[job_id] = data
+    _job_store[key] = (time.monotonic() + _JOB_TTL, data)
+    if len(_job_store) > 1000:
+        now = time.monotonic()
+        for stale_key, (expires, _) in list(_job_store.items()):
+            if expires <= now:
+                _job_store.pop(stale_key, None)
 
 
-def _get_status(job_id: str) -> dict:
+def _get_status(user_id: int, job_id: str) -> dict:
+    key = _status_key(user_id, job_id)
     rc = _get_redis()
     if rc:
         try:
-            raw = rc.get(f"feed_job:{job_id}")
+            raw = rc.get(key)
             if raw:
                 return json.loads(raw)
         except Exception:
             pass
-    return _job_store.get(job_id, {"status": "not_found"})
+    entry = _job_store.get(key)
+    if entry and entry[0] > time.monotonic():
+        return entry[1]
+    _job_store.pop(key, None)
+    return {"status": "not_found"}
 
 
 # ── Background pipeline runner ────────────────────────────────────────────────
@@ -73,19 +87,20 @@ def _run_pipeline_background(
     user_interests: List[str],
     mode: str = "recommended",
     force_refresh: bool = False,
+    use_ml: bool = True,
 ) -> None:
     """Runs the full feed pipeline in a background thread with its own DB session."""
-    from src.database.models import SessionLocal, User as UserModel
+    from src.database.models import SessionLocal
     from src.api.deps import get_embedding_manager
 
     try:
-        _set_status(job_id, {"status": "collecting", "message": "Collecting papers and articles..."})
+        _set_status(user_id, job_id, {"status": "collecting", "message": "Collecting papers..."})
 
         db = SessionLocal()
         try:
             embedding_manager = get_embedding_manager()
 
-            _set_status(job_id, {"status": "ranking", "message": "Ranking and summarizing content..."})
+            _set_status(user_id, job_id, {"status": "ranking", "message": "Ranking and summarizing content..."})
 
             pipeline = DailyFeedPipeline(
                 user_id=user_id,
@@ -98,15 +113,18 @@ def _run_pipeline_background(
                 user_interests=user_interests,
                 mode=mode,
                 force_refresh=force_refresh,
+                use_ml=use_ml,
             )
 
-            _set_status(job_id, {
+            _set_status(user_id, job_id, {
                 "status": "done",
                 "message": "Showing today's feed" if result.get("reused") else "Feed ready",
                 "reused": bool(result.get("reused")),
                 "papers_count": len(result.get("papers", [])),
                 "articles_count": len(result.get("articles", [])),
                 "used_ml_ranking": result.get("used_ml_ranking", False),
+                "ranking_source": result.get("ranking_source", "heuristic"),
+                "ranking_fallback_reason": result.get("ranking_fallback_reason"),
             })
             logger.info(f"Feed job {job_id} completed for user {user_id}")
         finally:
@@ -114,7 +132,7 @@ def _run_pipeline_background(
 
     except Exception as e:
         logger.error(f"Feed job {job_id} failed: {e}")
-        _set_status(job_id, {"status": "error", "message": str(e)})
+        _set_status(user_id, job_id, {"status": "error", "message": "Feed generation failed. Please retry."})
 
 
 @router.post("/generate")
@@ -129,7 +147,7 @@ async def generate_feed(
     Start personalized feed generation in the background.
 
     Returns a job_id immediately. Poll GET /feed/status/{job_id} to track
-    progress, then fetch results from GET /feed/papers and GET /feed/articles.
+    progress, then fetch results from GET /feed/papers.
 
     Generation is idempotent per day: calling this again returns the feed already
     built today instead of replacing it. Pass force_refresh to deliberately draw a
@@ -146,7 +164,7 @@ async def generate_feed(
     focus_areas = request.focus_areas or current_user.get_focus_areas_list()
 
     job_id = str(uuid.uuid4())
-    _set_status(job_id, {"status": "generating", "message": "Starting feed generation..."})
+    _set_status(current_user.id, job_id, {"status": "generating", "message": "Starting feed generation..."})
 
     background_tasks.add_task(
         _run_pipeline_background,
@@ -157,6 +175,7 @@ async def generate_feed(
         user_interests=user_interests,
         mode=request.mode,
         force_refresh=request.force_refresh,
+        use_ml=request.use_ml,
     )
 
     return {"job_id": job_id, "status": "generating", "message": "Feed generation started"}
@@ -172,13 +191,13 @@ async def feed_status(
 
     Status values:
     - **generating** — pipeline is starting up
-    - **collecting** — fetching papers and articles
+    - **collecting** — fetching papers
     - **ranking**    — ML ranking and LLM summarization in progress
     - **done**       — complete, fetch results from /feed/papers
-    - **error**      — pipeline failed (message contains reason)
+    - **error**      — pipeline failed (generic message; details in server logs)
     - **not_found**  — job_id unknown or expired (TTL: 1 hour)
     """
-    return _get_status(job_id)
+    return _get_status(current_user.id, job_id)
 
 
 @router.get("/coldstart")
@@ -197,14 +216,7 @@ async def get_coldstart_seeds(
     LightGBM. `interactions_recorded` lets the client decide whether onboarding
     is still warranted.
     """
-    recorded = (
-        db.query(UserInteraction)
-        .filter(
-            UserInteraction.user_id == current_user.id,
-            UserInteraction.item_type == "paper",
-        )
-        .count()
-    )
+    recorded = count_labeled_paper_interactions(db, current_user.id)
 
     pipeline = DailyFeedPipeline(
         user_id=current_user.id,
@@ -260,46 +272,35 @@ async def get_recommended_papers(
     ]
 
 
-# Disabled — Article subsystem retired (superseded by What's Hot), nothing
-# writes new UserArticleRecommendation rows anymore (daily_feed.py's
-# top_articles is hardcoded to []). Left commented rather than deleted;
-# Article/UserArticleRecommendation tables and the ranking/training code
-# that still branches on item_type == "article" are unchanged for now —
-# see the tool_aware_agent-era notes for why this is being done in stages.
-# @router.get("/articles", response_model=List[ArticleResponse])
-# async def get_recommended_articles(
-#     limit: int = settings.TOP_ARTICLES_COUNT,
-#     offset: int = 0,
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db_session)
-# ):
-#     """Get this user's most recently generated article feed, ordered by rank."""
-#     rows = (
-#         db.query(Article, UserArticleRecommendation)
-#         .join(UserArticleRecommendation, Article.id == UserArticleRecommendation.article_id)
-#         .filter(UserArticleRecommendation.user_id == current_user.id)
-#         .order_by(UserArticleRecommendation.rank.asc())
-#         .offset(offset)
-#         .limit(limit)
-#         .all()
-#     )
-#
-#     return [
-#         ArticleResponse(
-#             id=article.id,
-#             rank=rec.rank or (offset + i),
-#             source=article.source,
-#             title=article.title,
-#             url=article.url,
-#             author=article.author,
-#             published_date=article.published_date,
-#             upvotes=article.upvotes,
-#             relevance_score=rec.relevance_score,
-#             summary=rec.personalized_summary,
-#             digest_summary=article.digest_summary,
-#         )
-#         for i, (article, rec) in enumerate(rows, offset + 1)
-#     ]
+def _materialize_refined_papers(db: Session, items: list[dict]) -> list[PaperResponse]:
+    """Restore full paper fields after the optimizer swaps lightweight entries."""
+    paper_by_arxiv = {
+        paper.arxiv_id: paper for paper in db.query(Paper).filter(
+            Paper.arxiv_id.in_([item["arxiv_id"] for item in items])
+        ).all()
+    }
+    refined_papers = []
+    for rank, item in enumerate(items, 1):
+        paper = paper_by_arxiv.get(item["arxiv_id"])
+        if paper is None:
+            raise HTTPException(status_code=500, detail="Refined paper is no longer available")
+        refined_papers.append(PaperResponse(
+            id=paper.id,
+            rank=rank,
+            arxiv_id=paper.arxiv_id,
+            title=paper.title,
+            authors=paper.authors,
+            abstract=paper.abstract,
+            categories=paper.categories,
+            published_date=paper.published_date,
+            arxiv_url=paper.arxiv_url,
+            pdf_url=paper.pdf_url,
+            citation_count=paper.citation_count or 0,
+            relevance_score=float(item.get("relevance_score") or 0.0),
+            impact_score=paper.heuristic_impact_score,
+            summary=item.get("summary"),
+        ))
+    return refined_papers
 
 
 @router.post("/refine")
@@ -414,8 +415,12 @@ async def refine_feed(
         candidate_provider=_provide_candidates,
     )
 
+    # The optimizer works with lightweight dictionaries. Restore the same paper
+    # schema as GET /feed/papers so cards remain usable after a replacement.
+    refined_papers = _materialize_refined_papers(db, result["papers"])
+
     return {
-        "papers": result["papers"],
+        "papers": refined_papers,
         "score": result["score"],
         "rounds": result["rounds"],
         "passed": result["passed"],
@@ -474,30 +479,6 @@ async def get_saved_items(
                     impact_score=paper.heuristic_impact_score,
                     summary=rec.personalized_summary if rec else None,
                 ))
-        # Disabled — Article subsystem retired, see the note on the (also
-        # disabled) GET /feed/articles endpoint above. `articles` stays an
-        # empty list rather than being removed from the response, so the
-        # response shape doesn't change for whatever's still reading it.
-        #
-        # else:
-        #     article = db.query(Article).filter(Article.id == interaction.item_id).first()
-        #     if article:
-        #         rec = db.query(UserArticleRecommendation).filter(
-        #             UserArticleRecommendation.user_id == current_user.id,
-        #             UserArticleRecommendation.article_id == article.id,
-        #         ).first()
-        #         articles.append(ArticleResponse(
-        #             id=article.id,
-        #             rank=len(articles) + 1,
-        #             source=article.source,
-        #             title=article.title,
-        #             url=article.url,
-        #             author=article.author,
-        #             published_date=article.published_date,
-        #             upvotes=article.upvotes,
-        #             relevance_score=rec.relevance_score if rec else 0.0,
-        #             summary=rec.personalized_summary if rec else None,
-        #         ))
 
     return {
         "papers": papers,

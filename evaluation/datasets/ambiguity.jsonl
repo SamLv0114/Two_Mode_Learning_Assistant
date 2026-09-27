@@ -1,0 +1,20 @@
+{"id": "am01", "query": "summarize that paper for me", "missing_slot": "which paper"}
+{"id": "am02", "query": "what did that author conclude", "missing_slot": "which author"}
+{"id": "am03", "query": "is this method better than the baseline", "missing_slot": "which method, which baseline"}
+{"id": "am04", "query": "can you explain the results section", "missing_slot": "which paper"}
+{"id": "am05", "query": "how many citations does it have", "missing_slot": "which paper"}
+{"id": "am06", "query": "compare those two papers", "missing_slot": "which two papers"}
+{"id": "am07", "query": "what's the main contribution", "missing_slot": "which paper"}
+{"id": "am08", "query": "did they release the code", "missing_slot": "which paper/authors"}
+{"id": "am09", "query": "what dataset did they evaluate on", "missing_slot": "which paper"}
+{"id": "am10", "query": "give me the key takeaways from it", "missing_slot": "which paper"}
+{"id": "am11", "query": "is that approach still state of the art", "missing_slot": "which approach"}
+{"id": "am12", "query": "what year was it published", "missing_slot": "which paper"}
+{"id": "am13", "query": "who else works on this", "missing_slot": "which topic"}
+{"id": "am14", "query": "summarize the one I saved", "missing_slot": "which saved paper"}
+{"id": "am15", "query": "explain the second one", "missing_slot": "second of what list"}
+{"id": "am16", "query": "what are its limitations", "missing_slot": "which paper/method"}
+{"id": "am17", "query": "how does it compare to the transformer version", "missing_slot": "what is 'it'"}
+{"id": "am18", "query": "can you pull the full text", "missing_slot": "which paper"}
+{"id": "am19", "query": "what did the ablation show", "missing_slot": "which paper"}
+{"id": "am20", "query": "is it worth reading", "missing_slot": "which paper"}

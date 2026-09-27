@@ -1,0 +1,108 @@
+{"id": "rt001", "query": "what is gradient descent", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt002", "query": "explain how transformers work", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt003", "query": "how does backpropagation work", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt004", "query": "define overfitting", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt005", "query": "what is the vanishing gradient problem", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt006", "query": "tell me about diffusion models", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt007", "query": "what does perplexity measure for a language model", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt008", "query": "explain positional encoding in transformers", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt009", "query": "how does beam search decoding work", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt010", "query": "what is contrastive learning", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt011", "query": "what is catastrophic forgetting", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt012", "query": "explain knowledge distillation", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt013", "query": "what does dropout do during training", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt014", "query": "how does LoRA reduce fine-tuning cost", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt015", "query": "what is RLHF", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt016", "query": "explain mixture of experts routing", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt017", "query": "what is label smoothing", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt018", "query": "how does batch normalization help training", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt019", "query": "what is an autoencoder used for", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt020", "query": "explain byte pair encoding", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt021", "query": "what is gradient clipping used for", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt022", "query": "how does k-means clustering work", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt023", "query": "what does PCA actually do", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt024", "query": "explain the bias-variance tradeoff", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt025", "query": "what is early stopping", "gold_intent": "research_qa", "gold_route": "simple", "slice": "normal"}
+{"id": "rt026", "query": "compare BERT vs GPT in terms of pretraining objective", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt027", "query": "what's the difference between L1 and L2 regularization", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt028", "query": "LSTM vs GRU, which one should I use", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt029", "query": "pros and cons of RAG compared to fine-tuning for domain adaptation", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt030", "query": "what's the tradeoff between LoRA and full fine-tuning", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt031", "query": "compare batch normalization and layer normalization", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt032", "query": "difference between top-k and top-p sampling", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt033", "query": "bagging vs boosting, when would you use each", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt034", "query": "SGD versus Adam for training stability", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt035", "query": "dense retrieval vs BM25 for exact term matching", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt036", "query": "compare post-training quantization and quantization-aware training", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt037", "query": "what's the difference between NDCG and MRR as ranking metrics", "gold_intent": "research_qa", "gold_route": "analytical", "slice": "normal"}
+{"id": "rt038", "query": "I'm trying to understand why my RAG pipeline retrieves irrelevant chunks for short factual questions but works fine for long descriptive questions, and whether switching from pure vector search to a hybrid BM25 plus vector approach would actually fix that, or if the real problem is more likely my chunking strategy", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt039", "query": "can you do a deep dive into how mixture-of-experts routing works, including how load balancing losses are typically implemented and why naive top-1 routing tends to collapse to a few experts", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt040", "query": "I'm trying to decide whether to fine-tune a small model or use a larger model with better prompting for a domain-specific classification task, considering inference cost, latency, and the fact that I only have about 2000 labeled examples", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt041", "query": "walk me through how to design an evaluation pipeline for a retrieval augmented generation system, including what metrics to track at the retrieval stage versus the generation stage, and how to build the evaluation set itself", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt042", "query": "can you do a thorough analysis of why my transformer model's training loss decreases smoothly but validation loss plateaus early, covering possible causes in the data, the architecture, and the optimization setup", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt043", "query": "explain the full landscape of parameter efficient fine tuning methods, how they differ in where they inject trainable parameters, and which ones are appropriate at different model scales", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt044", "query": "I need a comprehensive comparison of vector database options for a production RAG system, covering indexing algorithms, metadata filtering support, and operational complexity in production", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt045", "query": "give me an in-depth explanation of how modern LLM serving systems handle continuous batching and KV cache management, and why those two things dominate throughput", "gold_intent": "research_qa", "gold_route": "complex", "slice": "normal"}
+{"id": "rt046", "query": "recommend some papers on reinforcement learning", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt047", "query": "what should I read today", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt048", "query": "show me the latest papers on transformers", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt049", "query": "generate my personalized feed", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt050", "query": "what's trending in NLP this week", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt051", "query": "any good papers about diffusion models lately", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt052", "query": "find me something on graph neural networks", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt053", "query": "surprise me with something related to my interests", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt054", "query": "anything new in my field since last week", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt055", "query": "I'm bored of my current reading list, got anything new for me", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt056", "query": "top papers on efficient inference", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt057", "query": "suggest some reading for this weekend", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt058", "query": "what are people working on in multimodal learning right now", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt059", "query": "give me papers similar to the one I saved yesterday", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt060", "query": "discover papers about retrieval augmented generation", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt061", "query": "show me popular work on model compression", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt062", "query": "new arxiv papers on agents", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt063", "query": "what should I look at next", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt064", "query": "recommend something lighter to read", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt065", "query": "curate a reading list for me on speech models", "gold_intent": "recommendation", "gold_route": null, "slice": "normal"}
+{"id": "rt066", "query": "what documents do I have uploaded", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt067", "query": "list my files", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt068", "query": "how many documents are in my knowledge base", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt069", "query": "delete the paper I uploaded yesterday", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt070", "query": "did I already upload that PDF about diffusion models", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt071", "query": "where's the file I added last week", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt072", "query": "show me my uploads", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt073", "query": "remove all my documents", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt074", "query": "search my documents for anything about attention", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt075", "query": "do I have anything saved about RLHF", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt076", "query": "what's in my personal library", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt077", "query": "add this document to my knowledge base", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt078", "query": "which files did I add this month", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt079", "query": "clean up my document list", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt080", "query": "can you check if my notes on transformers are still in there", "gold_intent": "document_management", "gold_route": null, "slice": "normal"}
+{"id": "rt081", "query": "hey", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt082", "query": "thanks a lot", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt083", "query": "what can you do", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt084", "query": "how are you", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt085", "query": "yo", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt086", "query": "nice, appreciate it", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt087", "query": "who built you", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt088", "query": "good morning", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt089", "query": "just testing this out", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt090", "query": "can you reply in Chinese from now on", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt091", "query": "that was helpful, thanks", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt092", "query": "bye", "gold_intent": "general_chat", "gold_route": null, "slice": "normal"}
+{"id": "rt093", "query": "how does a feed-forward network work", "gold_intent": "research_qa", "gold_route": "simple", "slice": "adversarial", "trap": "contains 'feed', a recommendation keyword"}
+{"id": "rt094", "query": "compare my uploaded papers to find duplicates", "gold_intent": "document_management", "gold_route": null, "slice": "adversarial", "trap": "'compare' is a research_qa keyword, but 'uploaded' makes this document management"}
+{"id": "rt095", "query": "what are the top papers I should read this week", "gold_intent": "recommendation", "gold_route": null, "slice": "adversarial", "trap": "'what are' is a research_qa keyword, but 'top papers' makes this a recommendation request"}
+{"id": "rt096", "query": "explain what a knowledge base is in RAG systems", "gold_intent": "research_qa", "gold_route": "simple", "slice": "adversarial", "trap": "contains 'knowledge base', a document_management keyword"}
+{"id": "rt097", "query": "help me understand attention mechanisms", "gold_intent": "research_qa", "gold_route": "simple", "slice": "adversarial", "trap": "contains 'help me', a general_chat keyword"}
+{"id": "rt098", "query": "what is trending topic detection in time series analysis", "gold_intent": "research_qa", "gold_route": "simple", "slice": "adversarial", "trap": "contains 'trending', a recommendation keyword"}
+{"id": "rt099", "query": "explain how citation networks are used to find papers that influenced a field", "gold_intent": "research_qa", "gold_route": "simple", "slice": "adversarial", "trap": "contains 'find papers', a recommendation keyword"}
+{"id": "rt100", "query": "summarize what I uploaded last week", "gold_intent": "document_management", "gold_route": null, "slice": "adversarial", "trap": "contains 'summarize', a research_qa keyword, but the object is the user's own uploads"}
+{"id": "rt101", "query": "thanks, can you explain how backpropagation works", "gold_intent": "research_qa", "gold_route": "simple", "slice": "adversarial", "trap": "'thanks' is a general_chat keyword prefacing a real research question"}
+{"id": "rt102", "query": "how many documents describe the transformer architecture", "gold_intent": "document_management", "gold_route": null, "slice": "adversarial", "trap": "'describe' is a research_qa keyword, but the query asks for a document count"}
+{"id": "rt103", "query": "help me find papers on diffusion models", "gold_intent": "recommendation", "gold_route": null, "slice": "adversarial", "trap": "'help me' is a general_chat keyword tied against 'find papers'"}
+{"id": "rt104", "query": "hi there, what's popular in NLP research this month", "gold_intent": "recommendation", "gold_route": null, "slice": "adversarial", "trap": "'hi there' is a general_chat keyword tied against \"what's popular\""}
+{"id": "rt105", "query": "thank you, any new papers to recommend", "gold_intent": "recommendation", "gold_route": null, "slice": "adversarial", "trap": "'thank you' (general_chat) outweighs a single 'recommend' by naive word count"}
+{"id": "rt106", "query": "define what my uploads currently contain", "gold_intent": "document_management", "gold_route": null, "slice": "adversarial", "trap": "'define' is a research_qa keyword, but 'my uploads' makes this document management"}
+{"id": "rt107", "query": "break down how many documents are in my library", "gold_intent": "document_management", "gold_route": null, "slice": "adversarial", "trap": "'break down' is a research_qa keyword, but 'how many documents' should dominate"}
+{"id": "rt108", "query": "goodbye, one more thing, what should i read before i go", "gold_intent": "recommendation", "gold_route": null, "slice": "adversarial", "trap": "'goodbye' (general_chat) should lose decisively to the longer 'what should i read'"}

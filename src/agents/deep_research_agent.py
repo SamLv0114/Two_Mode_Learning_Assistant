@@ -19,13 +19,17 @@ real-time research progress:
 """
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from contextlib import closing
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Generator, List
 
 from openai import OpenAI
 
 from src.agents.base_agent import AgentResult, BaseAgent
+from src.agents.source_safety import SOURCE_POLICY, untrusted_block
+from src.agents.research_run_store import ResearchRunStore
 from src.agents.tools import (
     SEARCH_KNOWLEDGE_BASE,
     SEARCH_WEB,
@@ -39,6 +43,21 @@ PLANNER_MODEL = "gpt-4o"
 SUMMARIZER_MODEL = "gpt-4o-mini"
 WRITER_MODEL = "gpt-4o"
 MAX_TASKS = 5
+
+
+def research_stop_reason(notes_by_id: Dict[int, "ResearchNote"], total_tasks: int,
+                         elapsed_seconds: float, max_seconds: int,
+                         early_stop_enabled: bool = False) -> str | None:
+    """Return an auditable stop decision at a completed-task boundary."""
+    if len(notes_by_id) >= total_tasks:
+        return "plan_complete"
+    if elapsed_seconds >= max_seconds:
+        return "time_budget"
+    if early_stop_enabled and len(notes_by_id) >= 2:
+        sources = {c.get("url") for note in notes_by_id.values() for c in note.citations if c.get("url")}
+        if len(sources) >= 4:
+            return "evidence_sufficient"
+    return None
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -136,6 +155,9 @@ Cite paper titles or URLs inline when relevant. Be specific — avoid filler phr
         self._fire_listener = fire_listener or (lambda *a: None)
 
     def summarize(self, task: TodoItem, context: Dict[str, Any]) -> ResearchNote:
+        cancel = context.get("_cancel_event")
+        if cancel is not None and cancel.is_set():
+            return ResearchNote(task_id=task.id, title=task.title, summary="Cancelled")
         tools_called: List[str] = []
         citations: List[Dict] = []
         search_snippets: List[str] = []
@@ -153,13 +175,15 @@ Cite paper titles or URLs inline when relevant. Be specific — avoid filler phr
                 url = r.get("url", "")
                 content = r.get("content", "")[:400]
                 if title or url:
-                    citations.append({"title": title, "url": url, "type": r.get("type", "unknown")})
+                    citations.append({"title": title, "url": url, "type": r.get("type", "unknown"), "evidence": content})
                 if content:
-                    search_snippets.append(f"[{title}] {content}")
+                    search_snippets.append(untrusted_block(content, title or url or "knowledge_base"))
         except Exception as e:
             logger.warning(f"[TaskSummarizer] KB search failed for task {task.id}: {e}")
 
         # Search 2: web
+        if cancel is not None and cancel.is_set():
+            return ResearchNote(task_id=task.id, title=task.title, summary="Cancelled", citations=citations, tools_called=tools_called)
         try:
             _t0 = _time.time()
             web_result = execute_tool("search_web", {"query": task.query, "max_results": 3}, context)
@@ -171,13 +195,15 @@ Cite paper titles or URLs inline when relevant. Be specific — avoid filler phr
                 url = r.get("url", "")
                 content = r.get("content", "")[:400]
                 if title or url:
-                    citations.append({"title": title, "url": url, "type": "web"})
+                    citations.append({"title": title, "url": url, "type": "web", "evidence": content})
                 if content:
-                    search_snippets.append(f"[{title}] {content}")
+                    search_snippets.append(untrusted_block(content, title or url or "web"))
         except Exception as e:
             logger.warning(f"[TaskSummarizer] Web search failed for task {task.id}: {e}")
 
         # Summarize with gpt-4o-mini
+        if cancel is not None and cancel.is_set():
+            return ResearchNote(task_id=task.id, title=task.title, summary="Cancelled", citations=citations, tools_called=tools_called)
         if not search_snippets:
             summary = f"No relevant results found for: {task.query}"
         else:
@@ -191,7 +217,7 @@ Cite paper titles or URLs inline when relevant. Be specific — avoid filler phr
                 response = self.client.chat.completions.create(
                     model=SUMMARIZER_MODEL,
                     messages=[
-                        {"role": "system", "content": self._SYSTEM},
+                        {"role": "system", "content": self._SYSTEM + "\n\n" + SOURCE_POLICY},
                         {"role": "user", "content": user_msg},
                     ],
                     max_tokens=400,
@@ -230,7 +256,7 @@ a well-structured Markdown report with clear sections. Requirements:
 
     def _build_prompt(self, question: str, notes: List[ResearchNote]) -> str:
         notes_str = "\n\n".join(
-            f"### Sub-task {n.task_id}: {n.title}\n{n.summary}" for n in notes
+            f"### Sub-task {n.task_id}: {n.title}\n{untrusted_block(n.summary, n.title)}" for n in notes
         )
         return (
             f"Original question: {question}\n\n"
@@ -245,7 +271,7 @@ a well-structured Markdown report with clear sections. Requirements:
             response = self.client.chat.completions.create(
                 model=WRITER_MODEL,
                 messages=[
-                    {"role": "system", "content": self._SYSTEM},
+                    {"role": "system", "content": self._SYSTEM + "\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=2048,
@@ -259,11 +285,12 @@ a well-structured Markdown report with clear sections. Requirements:
     def stream(self, question: str, notes: List[ResearchNote]) -> Generator[str, None, None]:
         """Yield tokens from a streaming gpt-4o call."""
         prompt = self._build_prompt(question, notes)
+        stream = None
         try:
             stream = self.client.chat.completions.create(
                 model=WRITER_MODEL,
                 messages=[
-                    {"role": "system", "content": self._SYSTEM},
+                    {"role": "system", "content": self._SYSTEM + "\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=2048,
@@ -279,6 +306,10 @@ a well-structured Markdown report with clear sections. Requirements:
             # Fall back to yielding the non-streamed result
             for token in self.write(question, notes):
                 yield token
+        finally:
+            close = getattr(stream, "close", None)
+            if close:
+                close()
 
 
 # ── DeepResearchAgent ─────────────────────────────────────────────────────────
@@ -314,7 +345,11 @@ class DeepResearchAgent(BaseAgent):
         start = time.time()
 
         # Stage 1: plan
+        if self._cancelled(context):
+            return AgentResult(reply="")
         plan = self.planner.plan(message)
+        if self._cancelled(context):
+            return AgentResult(reply="")
 
         # Stage 2: execute tasks concurrently (V4: ThreadPoolExecutor, max 3 workers)
         notes_by_id: Dict[int, "ResearchNote"] = {}
@@ -325,6 +360,8 @@ class DeepResearchAgent(BaseAgent):
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {executor.submit(_run_task, task): task for task in plan}
             for future in as_completed(futures):
+                if self._cancelled(context):
+                    return AgentResult(reply="")
                 task_id, note = future.result()
                 notes_by_id[task_id] = note
 
@@ -332,6 +369,8 @@ class DeepResearchAgent(BaseAgent):
         notes: List[ResearchNote] = [notes_by_id[t.id] for t in plan if t.id in notes_by_id]
 
         # Stage 3: synthesize report
+        if self._cancelled(context):
+            return AgentResult(reply="")
         report = self.writer.write(message, notes)
 
         all_tools = [t for n in notes for t in n.tools_called]
@@ -364,54 +403,134 @@ class DeepResearchAgent(BaseAgent):
         Frontend can render the plan immediately, then fill in results
         task-by-task, then stream the final report token by token.
         """
-        # Stage 1: plan
-        plan = self.planner.plan(message)
-        yield {
-            "type": "plan",
-            "tasks": [{"id": t.id, "title": t.title, "intent": t.intent} for t in plan],
-        }
+        if self._cancelled(context):
+            yield {"type": "cancelled"}
+            return
+        db, user = context.get("db"), context.get("user")
+        store = ResearchRunStore(db, user.id) if db is not None and user is not None else None
+        resume_id = context.get("resume_run_id")
+        if resume_id:
+            state = store.load(resume_id) if store else None
+            if state is None:
+                yield {"type": "error", "value": "Research run not found for this user"}
+                return
+            if state["status"] != "completed":
+                expected = {"planner": PLANNER_MODEL, "summarizer": SUMMARIZER_MODEL,
+                            "writer": WRITER_MODEL, "schema": 1}
+                if state.get("model_versions") != expected:
+                    yield {"type": "error", "value": "Research run model version changed; restart this run"}
+                    return
+                claimed = store.claim(resume_id)
+                if claimed is None:
+                    yield {"type": "error", "value": "Research run is already active"}
+                    return
+                state = claimed
+            message = state["question"]
+            plan = [TodoItem(**item) for item in state["plan"]]
+        else:
+            plan = self.planner.plan(message)
+            if self._cancelled(context):
+                yield {"type": "cancelled"}
+                return
+            versions = {"planner": PLANNER_MODEL, "summarizer": SUMMARIZER_MODEL, "writer": WRITER_MODEL, "schema": 1}
+            state = store.create(message, [asdict(item) for item in plan], versions) if store else {
+                "run_id": None, "question": message, "plan": [asdict(item) for item in plan],
+                "notes": {}, "status": "running", "stop_reason": None, "model_versions": versions,
+            }
 
-        # Stage 2: execute tasks concurrently (V4)
-        # Emit all task_started events upfront so the UI shows the full plan immediately
-        for task in plan:
-            yield {"type": "task_started", "id": task.id, "title": task.title}
+        completed = False
+        try:
+            if state["run_id"]:
+                yield {"type": "run", "run_id": state["run_id"]}
+            yield {"type": "plan", "tasks": [
+                {"id": t.id, "title": t.title, "intent": t.intent} for t in plan
+            ]}
+            if state["status"] == "completed":
+                yield {"type": "token", "value": state.get("report", "")}
+                yield {"type": "done", "tools_called": state.get("tools", []), "citations": state.get("citations", [])}
+                completed = True
+                return
 
-        all_tools: List[str] = []
-        all_citations: List[Dict] = []
-        notes_by_id: Dict[int, "ResearchNote"] = {}
-        done_events = []
+            notes_by_id = {int(task_id): ResearchNote(**note) for task_id, note in state["notes"].items()}
+            for task in plan:
+                if task.id in notes_by_id:
+                    yield {"type": "task_done", "id": task.id, "citations": len(notes_by_id[task.id].citations)}
+                else:
+                    yield {"type": "task_started", "id": task.id, "title": task.title}
 
-        def _run_task(task):
-            return task.id, self.summarizer.summarize(task, context)
+            def _run_task(task):
+                return task.id, self.summarizer.summarize(task, context)
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(_run_task, task): task for task in plan}
-            for future in as_completed(futures):
-                task_id, note = future.result()
-                notes_by_id[task_id] = note
-                all_tools.extend(note.tools_called)
-                all_citations.extend(note.citations)
-                done_events.append({"type": "task_done", "id": task_id, "citations": len(note.citations)})
+            started_at = time.monotonic()
+            stop_reason = None
+            executor = ThreadPoolExecutor(max_workers=2)
+            try:
+                remaining = [task for task in plan if task.id not in notes_by_id]
+                while remaining:
+                    stop_reason = research_stop_reason(
+                        notes_by_id, len(plan), time.monotonic() - started_at,
+                        settings.RESEARCH_MAX_SECONDS, settings.RESEARCH_EARLY_STOP_ENABLED,
+                    )
+                    if stop_reason:
+                        break
+                    batch, remaining = remaining[:2], remaining[2:]
+                    pending = {executor.submit(_run_task, task) for task in batch}
+                    while pending:
+                        if self._cancelled(context):
+                            yield {"type": "cancelled"}
+                            return
+                        finished, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                        for future in finished:
+                            task_id, note = future.result()
+                            notes_by_id[task_id] = note
+                            state["notes"][str(task_id)] = asdict(note)
+                            if store:
+                                store.save(state)
+                            yield {"type": "task_done", "id": task_id, "citations": len(note.citations)}
+            finally:
+                executor.shutdown(wait=not self._cancelled(context), cancel_futures=True)
 
-        for evt in done_events:
-            yield evt
+            stop_reason = stop_reason or research_stop_reason(
+                notes_by_id, len(plan), time.monotonic() - started_at,
+                settings.RESEARCH_MAX_SECONDS, settings.RESEARCH_EARLY_STOP_ENABLED,
+            ) or "plan_complete"
 
-        # Preserve original task order for the report
-        notes = [notes_by_id[t.id] for t in plan if t.id in notes_by_id]
+            notes = [notes_by_id[t.id] for t in plan if t.id in notes_by_id]
+            all_tools = [tool for note in notes for tool in note.tools_called]
+            seen_urls = set()
+            citations = []
+            for citation in (c for note in notes for c in note.citations):
+                key = citation.get("url") or citation.get("title", "")
+                if key and key not in seen_urls:
+                    seen_urls.add(key)
+                    citations.append(citation)
 
-        # Stage 3: stream the report
-        yield {"type": "generating"}
-
-        for token in self.writer.stream(message, notes):
-            yield {"type": "token", "value": token}
-
-        # Deduplicate citations
-        seen_urls: set = set()
-        unique_citations: List[Dict] = []
-        for c in all_citations:
-            key = c.get("url") or c.get("title", "")
-            if key and key not in seen_urls:
-                seen_urls.add(key)
-                unique_citations.append(c)
-
-        yield {"type": "done", "tools_called": all_tools, "citations": unique_citations}
+            yield {"type": "generating"}
+            parts = []
+            with closing(self.writer.stream(message, notes)) as tokens:
+                for token in tokens:
+                    if self._cancelled(context):
+                        yield {"type": "cancelled"}
+                        return
+                    parts.append(token)
+                    yield {"type": "token", "value": token}
+            unfinished = [t.title for t in plan if t.id not in notes_by_id]
+            if unfinished:
+                suffix = "\n\n## Unfinished research tasks\n" + "\n".join(f"- {title}" for title in unfinished)
+                suffix += f"\n\nStopped because: {stop_reason}."
+                parts.append(suffix)
+                yield {"type": "token", "value": suffix}
+            resumable = stop_reason == "time_budget" and bool(unfinished)
+            state.update(status="paused" if resumable else "completed",
+                         stop_reason=stop_reason, report="".join(parts),
+                         tools=all_tools, citations=citations)
+            if store:
+                store.save(state)
+            completed = True
+            yield {"type": "done", "tools_called": all_tools, "citations": citations,
+                   "stop_reason": stop_reason, "run_id": state["run_id"],
+                   "resumable": resumable}
+        finally:
+            if store and not completed and state["status"] != "completed":
+                state.update(status="paused", stop_reason="cancelled" if self._cancelled(context) else "interrupted")
+                store.save(state)

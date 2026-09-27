@@ -49,6 +49,8 @@ class UserRecommender:
         self.model_type = None
         self.heuristic_weights = None
         self.is_trained = False
+        self.last_ranking_source = "heuristic"
+        self.last_ranking_fallback_reason = None
         self.feature_names = list(self.FEATURE_NAMES)
 
         self._load_state()
@@ -64,7 +66,11 @@ class UserRecommender:
             if state.model_blob:
                 try:
                     self.model = pickle.loads(state.model_blob)
-                    self.is_trained = state.is_trained
+                    # Legacy models were marked trained after 50 clicks even
+                    # when only the latest five recommendations were sampled.
+                    # Do not serve one until its real sample count is recorded.
+                    self.is_trained = bool(state.is_trained and
+                                           (state.training_sample_count or 0) >= settings.MIN_INTERACTIONS_FOR_TRAINING)
                     self.model_type = state.model_type
                     logger.debug(f"Loaded model for user {self.user_id}")
                 except Exception as e:
@@ -165,6 +171,8 @@ class UserRecommender:
 
         if not self.is_trained:
             # Use heuristic scoring
+            self.last_ranking_source = "heuristic"
+            self.last_ranking_fallback_reason = "model_not_trained"
             logger.debug("Model not trained, using heuristic scoring")
             scores = np.array([
                 self.calculate_weighted_heuristic_score(f)
@@ -174,8 +182,14 @@ class UserRecommender:
             # Use ML model
             try:
                 scores = self.model.predict(X)
+                if len(scores) != len(items) or not np.all(np.isfinite(scores)):
+                    raise ValueError("model returned missing or non-finite scores")
+                self.last_ranking_source = "ml"
+                self.last_ranking_fallback_reason = None
             except Exception as e:
                 logger.warning(f"ML prediction failed, falling back to heuristics: {e}")
+                self.last_ranking_source = "heuristic"
+                self.last_ranking_fallback_reason = f"prediction_failed: {type(e).__name__}"
                 scores = np.array([
                     self.calculate_weighted_heuristic_score(f)
                     for f in features

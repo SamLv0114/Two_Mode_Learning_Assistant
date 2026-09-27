@@ -119,7 +119,7 @@ Answer:"""
         
         interests_str = ", ".join(user_interests)
         
-        prompt = f"""Summarize this for a grad student focused on {interests_str}.
+        prompt = f"""Summarize this paper for a reader interested in {interests_str}.
 
 Title: {title}
 Content: {content[:2000]}
@@ -130,7 +130,7 @@ Use EXACTLY this format (keep each section to 1-2 sentences, total under 100 wor
 **Why Care:** <1-2 sentences>
 **Relation to Interests:** <1-2 sentences>
 
-Be concise and actionable. Do not add any other sections or headings."""
+Use the listed interests only to explain a specific connection supported by the paper. Do not assume the reader is a student, researcher, or any other profession. Avoid generic relevance claims. Be concise and actionable. Do not add any other sections or headings."""
         
         return self._generate(prompt, max_tokens=200)
 

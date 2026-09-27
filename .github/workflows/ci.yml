@@ -1,0 +1,39 @@
+name: Deterministic CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - name: Security and evaluation metric regressions
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Import and route smoke tests
+        run: python tests/smoke.py -v
+      - name: Offline context and cache evaluations
+        run: |
+          python evaluation/runners/run_context_budget_eval.py --dry-run
+          python evaluation/runners/run_cache_eval.py
+      - name: Preserve evaluation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-evaluation
+          path: |
+            evaluation/results/*_context_budget_dry.md
+            evaluation/results/*_cache_eval.md
+          if-no-files-found: ignore

@@ -332,7 +332,7 @@ def _exec_search_knowledge_base(args: Dict[str, Any], context: Dict) -> Dict:
         return {
             "results": [
                 {
-                    "content": r.get("document", "")[:600],
+                    "content": (r.get("metadata", {}).get("parent_text") or r.get("document", ""))[:1200],
                     "title": r.get("metadata", {}).get("title", "Unknown"),
                     "type": r.get("metadata", {}).get("type", "unknown"),
                     "url": r.get("metadata", {}).get("url", ""),
@@ -447,7 +447,7 @@ def _exec_search_user_documents(args: Dict[str, Any], context: Dict) -> Dict:
         return {
             "results": [
                 {
-                    "content": r.get("document", "")[:600],
+                    "content": (r.get("metadata", {}).get("parent_text") or r.get("document", ""))[:1200],
                     "title": r.get("metadata", {}).get("title", "Unknown"),
                 }
                 for r in results
@@ -513,7 +513,7 @@ def _exec_fetch_full_paper(args: Dict[str, Any], context: Dict) -> Dict:
         return {
             "results": [
                 {
-                    "content": h.get("document", "")[:800],
+                    "content": (h.get("metadata", {}).get("parent_text") or h.get("document", ""))[:800],
                     "chunk_index": h.get("metadata", {}).get("chunk_index"),
                 }
                 for h in hits

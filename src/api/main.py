@@ -2,7 +2,7 @@
 Main FastAPI application
 """
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
@@ -14,6 +14,7 @@ from src.utils.config import settings
 from src.database.models import init_db
 from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router, whats_hot_router
 from src.api.middleware import RateLimitMiddleware
+from src.api.deps import get_current_superuser
 from src.jobs.nightly_indexer import run_nightly_index
 from src.jobs.citation_refresh import run_citation_refresh
 
@@ -170,7 +171,7 @@ async def metrics():
 
 
 # Manual trigger for the nightly indexer — useful for testing and first-run seeding
-@app.post("/api/v1/admin/index-now", tags=["Admin"])
+@app.post("/api/v1/admin/index-now", tags=["Admin"], dependencies=[Depends(get_current_superuser)])
 async def trigger_index():
     """Run the nightly paper indexer immediately (for testing/manual refresh)."""
     import asyncio
@@ -179,7 +180,7 @@ async def trigger_index():
     return result
 
 
-@app.post("/api/v1/admin/refresh-citations-now", tags=["Admin"])
+@app.post("/api/v1/admin/refresh-citations-now", tags=["Admin"], dependencies=[Depends(get_current_superuser)])
 async def trigger_citation_refresh():
     """
     Run citation_refresh immediately, for backfilling the papers that
