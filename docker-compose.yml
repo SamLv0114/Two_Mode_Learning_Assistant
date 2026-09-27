@@ -36,7 +36,7 @@ services:
       dockerfile: Dockerfile.api
     container_name: learning_assistant_api
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-learning_assistant}:${POSTGRES_PASSWORD:-password123}@db:5432/${POSTGRES_DB:-learning_assistant}
+      - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-learning_assistant}:${POSTGRES_PASSWORD:-password123}@db:5432/${POSTGRES_DB:-learning_assistant}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set for deployment}
       - REDIS_URL=redis://redis:6379
