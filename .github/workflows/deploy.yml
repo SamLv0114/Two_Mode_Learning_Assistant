@@ -94,17 +94,24 @@ jobs:
               docker compose up -d
             fi
 
+            # Nginx resolves static proxy_pass hostnames when it loads config.
+            # Recreated API/frontend containers may have new Docker IPs.
+            docker exec learning_assistant_nginx nginx -t
+            docker exec learning_assistant_nginx nginx -s reload
+
             # ── Health gate ────────────────────────────────────────────────
             # Fail the job on a bad deploy so it surfaces in Actions rather
             # than sitting broken until someone opens the site.
             # The api service publishes no host port (nginx proxies it), so the
             # check runs inside the container.
-            echo "Waiting for API health..."
+            echo "Waiting for API and public routes..."
             for i in $(seq 1 45); do
               if docker exec learning_assistant_api \
                    python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)" \
-                   > /dev/null 2>&1; then
-                echo "API healthy after ${i}s"
+                   > /dev/null 2>&1 \
+                   && curl -fsS --max-time 5 https://api.researchmate.site/health > /dev/null \
+                   && curl -fsS --max-time 5 https://researchmate.site/ > /dev/null; then
+                echo "API and public routes healthy after ${i}s"
                 if [ "$API_REBUILT" = 1 ]; then
                   RUNNING_SHA=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' learning_assistant_api)
                   if [ "$RUNNING_SHA" != "$AFTER" ]; then
@@ -119,6 +126,6 @@ jobs:
               sleep 1
             done
 
-            echo "API failed health check after 45s — recent logs:"
-            docker compose logs --tail=50 api
+            echo "API or public routes failed health check after 45 attempts — recent logs:"
+            docker compose logs --tail=50 api nginx frontend
             exit 1
