@@ -10,6 +10,10 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    # Tests replace every model call with a fake, but constructing an OpenAI client still
+    # requires a key. This placeholder is not a real key; a request sent with it gets a 401.
+    env:
+      OPENAI_API_KEY: sk-placeholder-for-tests
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

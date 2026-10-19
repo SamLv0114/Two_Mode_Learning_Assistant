@@ -20,11 +20,17 @@ jobs:
         # Gate the deploy. Both failures this catches — a stale import and an
         # undeclared dependency — reached production before and stayed there,
         # because the app still started and only failed at request time.
+        env:
+          OPENAI_API_KEY: sk-placeholder-for-tests
         run: |
           pip install -q -r requirements.txt
           python tests/smoke.py -v
 
       - name: Security and behavior regressions
+        # A placeholder, not a real key: tests fake every model call, but building an OpenAI
+        # client requires some key. Only this step sees it, never the deploy step.
+        env:
+          OPENAI_API_KEY: sk-placeholder-for-tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Deploy to server
