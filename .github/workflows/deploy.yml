@@ -43,7 +43,9 @@ jobs:
           # ML-heavy image (torch, transformers, sentence-transformers). Hit
           # this exactly once: build was mid-Step-9/13 when the action killed
           # it at 10m6s.
-          command_timeout: 30m
+          # 30m was not enough either (2026-10-19): rebuilding the API image (new LangGraph
+          # dependencies) and the frontend image in one push ran past it during `next build`.
+          command_timeout: 60m
           script: |
             set -e
             cd ~/learning-assistant

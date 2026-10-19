@@ -292,6 +292,9 @@ python evaluation/runners/run_judge_calibration.py --papers 60 --repeats 2   # �
 - `runners/run_long_abstract_eval.py`：长摘要分段平均嵌入 vs 截断嵌入。对超过 256 token 的摘要，用 gpt-4o-mini
   把开头一句和截断点之后的一句改写成检索问题，在内存索引里比较两种向量的 Recall@k 和 MRR。问题缓存在
   `datasets/long_abstract_questions.jsonl`，重跑免费。
+- `runners/run_embedding_model_eval.py`：向量模型对比，复用上面缓存的问题和同一批 3000 篇论文，全在本地运行、
+  不调用付费接口。2026-10-19 的结果：bge-small-en-v1.5（加查询指令）的 MRR 比现用的 all-MiniLM-L6-v2 高 0.064
+  （配对 bootstrap 95% 区间 [+0.027, +0.101]），代价是建索引慢约 2.3 倍。提升不大，暂不切换。
 - `runners/run_citation_feed_eval.py`：引用代理。测试论文的较早参考文献当作“钉选论文”，发表前 9 个月内引用的
   新论文当作 gold（作者写作期间找到并用上的新工作），比较内容召回、引用图原始顺序、两路合并、模型逐篇判断四个阶段
   的 Top10 命中。用例缓存在 `datasets/citation_feed_cases.jsonl`，重跑只花判断的钱（约 $0.05）。

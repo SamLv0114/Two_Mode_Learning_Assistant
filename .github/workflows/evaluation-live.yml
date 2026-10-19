@@ -1,17 +1,8 @@
 name: Scheduled model evaluation
 
+# Manual only: every run calls paid models (about $0.8 per run with the gpt-4o judge).
+# Start it from the Actions tab ("Run workflow") when a real evaluation is wanted.
 on:
-  push:
-    branches: [master]
-    paths:
-      - 'src/agents/**'
-      - 'src/rag/**'
-      - 'src/models/embeddings.py'
-      - 'src/utils/config.py'
-      - 'evaluation/rubrics/**'
-      - 'evaluation/datasets/**'
-  schedule:
-    - cron: '0 8 * * 1'
   workflow_dispatch:
 
 jobs:

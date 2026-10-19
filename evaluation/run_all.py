@@ -32,6 +32,7 @@ RUNNERS = {
     "method_notes": "runners/run_method_notes_eval.py",
     "method_notes_ab": "runners/run_method_notes_ab.py",
     "long_abstract": "runners/run_long_abstract_eval.py",
+    "embedding_model": "runners/run_embedding_model_eval.py",
     "citation_feed": "runners/run_citation_feed_eval.py",
     "feed_persona_ab": "runners/run_feed_persona_ab.py",
 }
