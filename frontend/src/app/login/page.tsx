@@ -5,12 +5,16 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import toast from 'react-hot-toast';
+import { errorMessage } from '@/lib/api';
+import { usePublicStats } from '@/lib/usePublicStats';
+import { TryDemoButton } from '@/components/landing/TryDemoButton';
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const { login } = useAuth();
+  const stats = usePublicStats();
   const router = useRouter();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -20,8 +24,8 @@ export default function LoginPage() {
       await login(email, password);
       toast.success('Welcome back!');
       router.push('/dashboard');
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Login failed');
+    } catch (error) {
+      toast.error(errorMessage(error, 'Login failed'));
     } finally {
       setIsSubmitting(false);
     }
@@ -142,6 +146,13 @@ export default function LoginPage() {
               )}
             </button>
           </form>
+
+          {stats?.demo_available && (
+            <div className="mt-6 border-t border-gray-100 pt-6 text-center">
+              <p className="text-sm text-gray-500 mb-3">Just looking?</p>
+              <TryDemoButton className="btn-secondary w-full justify-center disabled:opacity-60" />
+            </div>
+          )}
 
           <p className="mt-10 text-center">
             <Link href="/" className="text-sm text-gray-400 hover:text-gray-600 transition-colors">

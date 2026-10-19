@@ -88,7 +88,8 @@ class UsageTracker:
 
 def estimated_cost_usd(snapshot: Dict) -> Optional[float]:
     """Use a versioned price table; unknown models are not priced as zero."""
-    prices = json.loads((EVAL_DIR / "pricing.json").read_text(encoding="utf-8"))["models"]
+    # The same versioned table production uses for its cost metrics (src/utils/llm_usage.py).
+    prices = json.loads((EVAL_DIR.parent / "src" / "utils" / "model_prices.json").read_text(encoding="utf-8"))["models"]
     total = 0.0
     for model, usage in snapshot.get("by_model", {}).items():
         alias = next((name for name in sorted(prices, key=len, reverse=True) if model.startswith(name)), None)

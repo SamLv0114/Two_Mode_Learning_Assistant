@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
-from src.database.models import UserInteraction, UserModelState, Paper, UserPaperRecommendation, upsert_user_interaction, count_labeled_paper_interactions
+from src.database.models import UserInteraction, UserModelState, Paper, UserPaperRecommendation, count_labeled_paper_interactions
 from src.models.feature_extractor import FeatureExtractor
 from src.models.embeddings import EmbeddingManager
 from src.models.evaluator import compute_ndcg, compute_mrr
@@ -44,17 +44,6 @@ class UserModelTrainer:
         self.db = db
         self.embedding_manager = embedding_manager
         self.feature_extractor = FeatureExtractor()
-
-    def record_interaction(self, item_type: str, item_id: int, interaction_type: str):
-        """
-        Record or update a user interaction.
-
-        Args:
-            item_type: "paper" or "article"
-            item_id: Database ID of the item
-            interaction_type: "saved", "viewed", or "dismissed"
-        """
-        upsert_user_interaction(self.db, self.user_id, item_type, item_id, interaction_type)
 
     def get_interaction_count(self) -> int:
         """Count paper feedback eligible for the paper-only ranker."""
@@ -246,6 +235,7 @@ class UserModelTrainer:
                 train_mrr=train_metrics['mrr'],
                 val_ndcg=val_metrics['ndcg'] if val_metrics else None,
                 val_mrr=val_metrics['mrr'] if val_metrics else None,
+                val_baseline_ndcg=val_metrics['baseline_ndcg'] if val_metrics else None,
                 interaction_count=interaction_count
             )
             # Validation scores describe the held-out split. Fit the model
@@ -289,6 +279,16 @@ class UserModelTrainer:
         logger.info(f"User {self.user_id}: Retrained model with {len(X)} examples")
         return True
 
+    # The feed's heuristic score in feature space, at a neutral novelty dial (see
+    # feed/params._blend_weights): the bar a trained model has to clear on held-out feedback.
+    HEURISTIC_FEATURE_WEIGHTS = {"similarity": 0.55, "recency": 0.225, "impact": 0.225}
+
+    def _heuristic_scores(self, X: np.ndarray) -> np.ndarray:
+        scores = np.zeros(len(X))
+        for name, weight in self.HEURISTIC_FEATURE_WEIGHTS.items():
+            scores += weight * np.nan_to_num(X[:, self.FEATURE_NAMES.index(name)])
+        return scores
+
     def _train_with_validation(
         self,
         recommender,
@@ -327,7 +327,8 @@ class UserModelTrainer:
             }
             val_metrics = {
                 'ndcg': compute_ndcg(y_val, val_preds, k=10, group_sizes=val_groups),
-                'mrr': compute_mrr(y_val, val_preds, group_sizes=val_groups)
+                'mrr': compute_mrr(y_val, val_preds, group_sizes=val_groups),
+                'baseline_ndcg': compute_ndcg(y_val, self._heuristic_scores(X_val), k=10, group_sizes=val_groups),
             }
         else:
             split_idx = int(len(X) * 0.8)
@@ -345,7 +346,8 @@ class UserModelTrainer:
             }
             val_metrics = {
                 'ndcg': compute_ndcg(y_val, val_preds, k=10),
-                'mrr': compute_mrr(y_val, val_preds)
+                'mrr': compute_mrr(y_val, val_preds),
+                'baseline_ndcg': compute_ndcg(y_val, self._heuristic_scores(X_val), k=10),
             }
 
         return train_metrics, val_metrics

@@ -19,6 +19,17 @@ class DeploymentDatabaseDriverTests(unittest.TestCase):
         dialect = make_url(f"{match.group(1)}://user:pass@db:5432/test").get_dialect()
         dialect.import_dbapi()
 
+    def test_practice_worker_waits_for_healthy_api_and_is_deployable(self):
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("practice-worker:", compose)
+        self.assertIn('command: ["python", "-m", "src.jobs.practice_worker"]', compose)
+        self.assertRegex(compose, r"(?s)api:.*?healthcheck:.*?practice-worker:")
+        self.assertRegex(compose, r"(?s)practice-worker:.*?depends_on:\s+api:\s+condition: service_healthy")
+
+        deploy = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+        self.assertIn("docker compose build --build-arg GIT_SHA=\"$AFTER\" api practice-worker", deploy)
+        self.assertIn("learning_assistant_practice_worker", deploy)
+
 
 if __name__ == "__main__":
     unittest.main()

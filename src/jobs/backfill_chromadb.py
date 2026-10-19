@@ -12,13 +12,17 @@ from datetime import datetime, timezone
 from src.database.models import SessionLocal, Paper
 from src.models import EmbeddingManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 200
 
 
-def run_backfill() -> dict:
+def run_backfill(reembed: bool = False) -> dict:
+    """
+    Index every Postgres paper missing from ChromaDB. With reembed, also recompute the
+    vectors of papers already there — needed once after a change to how papers are
+    embedded (e.g. EmbeddingManager.embed_papers' long-abstract pooling).
+    """
     start = datetime.now(timezone.utc)
     result = {"total": 0, "indexed": 0, "skipped": 0, "elapsed_s": 0.0, "error": None}
 
@@ -43,7 +47,7 @@ def run_backfill() -> dict:
             existing = em.collection.get(ids=chroma_ids, include=[])
             existing_set = set(existing["ids"])
 
-            to_index = [p for p in papers if f"paper_{p.arxiv_id}" not in existing_set]
+            to_index = papers if reembed else [p for p in papers if f"paper_{p.arxiv_id}" not in existing_set]
             skipped += len(papers) - len(to_index)
 
             if not to_index:
@@ -54,9 +58,7 @@ def run_backfill() -> dict:
 
             # Batch embed (title + abstract)
             texts = [f"{p.title}\n\n{p.abstract or ''}" for p in to_index]
-            embeddings = em.model.encode(
-                texts, show_progress_bar=False, batch_size=32
-            ).tolist()
+            embeddings = em.embed_papers([p.title for p in to_index], [p.abstract or "" for p in to_index])
 
             em.collection.upsert(
                 ids=[f"paper_{p.arxiv_id}" for p in to_index],
@@ -98,4 +100,9 @@ def run_backfill() -> dict:
 
 
 if __name__ == "__main__":
-    run_backfill()
+    import argparse
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Index Postgres papers into ChromaDB")
+    parser.add_argument("--reembed", action="store_true",
+                        help="also recompute vectors of papers already indexed (after an embedding change)")
+    run_backfill(reembed=parser.parse_args().reembed)

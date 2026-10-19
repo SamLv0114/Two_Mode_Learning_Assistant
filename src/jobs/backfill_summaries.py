@@ -24,7 +24,6 @@ from src.database.models import SessionLocal, Paper, User, UserPaperRecommendati
 from src.rag.generator import Generator
 from src.utils.config import settings
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 COMMIT_EVERY = 20
@@ -87,6 +86,7 @@ def run_backfill(user_id: int = None, dry_run: bool = False) -> dict:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--user-id", type=int, default=None, help="Only regenerate for this user")
     parser.add_argument("--dry-run", action="store_true", help="List affected rows without calling the LLM or writing")

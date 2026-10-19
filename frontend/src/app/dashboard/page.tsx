@@ -3,24 +3,26 @@
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
-import {
-  feedApi, interactionsApi, qaApi, authApi, chatApi, whatsHotApi,
-  Paper, Article, FeedResponse, InteractionStats, ModelStatus, FeedJobStatus, AgentEvent,
-  HFPaper, GithubRepo, WhatsHotData,
-  ColdStartSeed, ColdStartResponse,
-  API_BASE_URL,
-} from '@/lib/api';
+import dynamic from 'next/dynamic';
+import type { PracticeContext } from '@/components/PracticeWorkspace';
+import { errorMessage, feedApi, interactionsApi, whatsHotApi, practiceApi, profileApi, FeedResponse, InteractionStats, ModelStatus, FeedJobStatus, WhatsHotData, ColdStartSeed, ColdStartResponse, ResearchProfile } from '@/lib/api';
 import toast from 'react-hot-toast';
-import { BookOpen, FileText, Save, X, RefreshCw, ExternalLink, MessageCircle, Upload, Trash2, Search, Settings, ChevronDown, ChevronUp, Bot, Send, Sparkles, Flame } from 'lucide-react';
-
-const AVAILABLE_AREAS = ['DL', 'LLM', 'Agent', 'ML', 'AI', 'NLP', 'CV'];
-const EXAMPLE_INTERESTS = [
-  'machine learning and deep learning',
-  'natural language processing and transformers',
-  'computer vision and image recognition',
-  'reinforcement learning and agents',
-  'generative AI and large language models',
-];
+import { formatDistanceToNow } from 'date-fns';
+import { BookOpen, RefreshCw, Settings, Bot, Sparkles, Flame, Code2 } from 'lucide-react';
+import { ChatContext, arxivIdFromHotPaper } from '@/components/dashboard/shared';
+import { FeedControls } from '@/components/dashboard/FeedControls';
+import { PaperCard } from '@/components/dashboard/PaperCards';
+import { UserSettings } from '@/components/dashboard/UserSettings';
+import { AgentChat } from '@/components/dashboard/AgentChat';
+import { SavedItems } from '@/components/dashboard/SavedItems';
+import { ColdStartSection } from '@/components/dashboard/ColdStartSection';
+import { WhatsHotSection } from '@/components/dashboard/WhatsHot';
+import { ProfileCard, ProfileOnboarding } from '@/components/dashboard/ResearchProfile';
+import { ReadingPathPanel } from '@/components/dashboard/ReadingPath';
+// Loaded on first visit to the Coding Agent tab: it brings Markdown, KaTeX and Mermaid with it.
+const PracticeWorkspace = dynamic(() => import('@/components/PracticeWorkspace'), {
+  ssr: false, loading: () => <p className="text-sm text-gray-500">Loading Coding Agent…</p>,
+});
 
 export default function DashboardPage() {
   const { user, isAuthenticated, isLoading, fetchProfile, logout } = useAuth();
@@ -41,13 +43,57 @@ export default function DashboardPage() {
   const [feedProgress, setFeedProgress] = useState('');
   const [timeWindow, setTimeWindow] = useState(7);
   const [feedMode, setFeedMode] = useState<'recommended' | 'latest'>('recommended');
-  const [activeTab, setActiveTab] = useState<'feed' | 'hot' | 'saved' | 'chat' | 'settings'>('feed');
-  const [activePaperContext, setActivePaperContext] = useState<{
-    title: string;
-    abstract: string | null;
-    arxivId: string;
-    arxivUrl: string;
-  } | null>(null);
+  const [activeTab, setActiveTab] = useState<'feed' | 'hot' | 'saved' | 'chat' | 'practice' | 'settings'>('feed');
+  const [practiceAlerts, setPracticeAlerts] = useState(0);
+  const [feedEditorSignal, setFeedEditorSignal] = useState(0);
+  // The research profile drives retrieval and the model's judgements. undefined while loading.
+  const [profile, setProfile] = useState<ResearchProfile | null | undefined>(undefined);
+  const [profileEditKey, setProfileEditKey] = useState(0);
+  const profileReady = !!profile?.set_up;
+  const needsOnboarding = profile !== undefined && !profileReady;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const practiceSeen = useRef<Record<string, string>>({});
+
+  // Coding Agent runs take minutes: keep an eye on them from any tab, often only while one is working.
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = async () => {
+      try {
+        const runs = await practiceApi.list();
+        if (stopped) return;
+        for (const item of runs) {
+          const before = practiceSeen.current[item.run_id];
+          if (before && ['queued', 'running'].includes(before) && before !== item.status && activeTabRef.current !== 'practice') {
+            const name = item.title || item.source;
+            if (item.status === 'waiting') toast(`Coding Agent needs your review: ${name}`, { icon: '✋' });
+            else if (item.status === 'completed') toast.success(`Coding Agent finished: ${name}`);
+          }
+          practiceSeen.current[item.run_id] = item.status;
+        }
+        setPracticeAlerts(runs.filter((item) => item.status === 'waiting').length);
+        timer = setTimeout(check, runs.some((item) => ['queued', 'running'].includes(item.status)) ? 10000 : 60000);
+      } catch {
+        if (!stopped) timer = setTimeout(check, 60000);
+      }
+    };
+    check();
+    return () => { stopped = true; if (timer) clearTimeout(timer); };
+  }, []);
+  const [practiceContext, setPracticeContext] = useState<PracticeContext | null>(null);
+  const [chatContext, setChatContext] = useState<ChatContext | null>(null);
+  const openPractice = (context: PracticeContext) => { setPracticeContext(context); setActiveTab('practice'); };
+  const openChat = (context: ChatContext) => {
+    // A new source starts its own conversation so earlier paper/repo context cannot leak into it.
+    localStorage.removeItem('chat_session_id');
+    setChatContext(context);
+    setActiveTab('chat');
+  };
+  // Only papers go to Agent Chat; a repository's questions are answered by the repository agent.
+  const askFromPractice = (context: PracticeContext) => {
+    if (context.kind === 'paper') openChat({ kind: 'paper', title: context.title || context.source, abstract: context.description || null, arxivId: context.source, arxivUrl: context.url || `https://arxiv.org/abs/${context.source}`, origin: 'Coding Agent' });
+  };
   const feedPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const feedPollRunRef = useRef(0);
   const feedGenerationActiveRef = useRef(false);
@@ -60,18 +106,56 @@ export default function DashboardPage() {
     return () => { mounted = false; };
   }, [fetchProfile]);
 
+  // Set when a demo visitor leaves to register, so signing out does not bounce them to /login.
+  const leavingForRegister = useRef(false);
   useEffect(() => {
-    if (authChecked && !isLoading && !isAuthenticated) {
+    if (authChecked && !isLoading && !isAuthenticated && !leavingForRegister.current) {
       router.replace('/login');
     }
   }, [authChecked, isAuthenticated, isLoading, router]);
+  const registerFromDemo = () => {
+    leavingForRegister.current = true;
+    logout();
+    router.push('/register');
+  };
 
   useEffect(() => {
     if (authChecked && isAuthenticated) {
       loadStats();
       loadColdStart();
+      loadCurrentFeed();
     }
   }, [authChecked, isAuthenticated]);
+
+  // Open on the feed the user already has. Someone who has never had one gets their first
+  // generated straight away once there is a profile to build it from; until then the
+  // onboarding card is the first step (it can also skip to a general feed).
+  const loadCurrentFeed = async () => {
+    try {
+      const [current, saved] = await Promise.all([feedApi.getCurrent(), profileApi.get().catch(() => null)]);
+      setProfile(saved);
+      if (!current.generated_at) {
+        if (saved?.set_up || user?.is_demo) generateFeed(false);
+        return;
+      }
+      if (feedGenerationActiveRef.current) return;
+      if (current.feed_mode) setFeedMode(current.feed_mode);
+      if (current.time_window_days) setTimeWindow(current.time_window_days);
+      setFeed({
+        papers: current.papers,
+        generated_at: current.generated_at,
+        time_window_days: current.time_window_days || 7,
+        focus_areas: user?.focus_areas || [],
+        used_ml_ranking: current.ranking_source === 'ml',
+        ranking_source: current.ranking_source,
+        ranking_fallback_reason: current.ranking_fallback_reason,
+        selection: current.selection,
+        total_papers_considered: null,
+      });
+    } catch (error) {
+      console.error('Failed to load the current feed:', error);
+    }
+  };
 
   // What's Hot has its own tab now, so fetch it when that tab is first opened
   // rather than on every dashboard load. Kept in state after the first visit.
@@ -127,7 +211,6 @@ export default function DashboardPage() {
     setRatedSeeds((prev) => ({ ...prev, [seed.db_id]: verdict }));
     try {
       await interactionsApi.create({
-        item_type: 'paper',
         item_id: seed.db_id,
         interaction_type: verdict,
       });
@@ -201,22 +284,22 @@ export default function DashboardPage() {
 
           if (status.status === 'done') {
             feedPollRef.current = null;
-            // Articles retired in V4 — trending content now comes from What's Hot.
             // No count — the server decides how large a feed is, so this does
             // not need updating if that size changes.
-            const papers = await feedApi.getPapers();
+            // getCurrent rather than getPapers: a reused feed keeps its real generation time.
+            const current = await feedApi.getCurrent();
+            const papers = current.papers;
             if (run !== feedPollRunRef.current) return;
             setFeed({
               papers,
-              articles: [],
-              generated_at: new Date().toISOString(),
+              generated_at: current.generated_at || new Date().toISOString(),
               time_window_days: timeWindow,
               focus_areas: user?.focus_areas || [],
               used_ml_ranking: status.used_ml_ranking ?? false,
               ranking_source: status.ranking_source,
               ranking_fallback_reason: status.ranking_fallback_reason,
+              selection: current.selection ?? status.selection,
               total_papers_considered: status.papers_count ?? papers.length,
-              total_articles_considered: 0,
             });
             toast.success(status.reused ? "Showing today's feed" : 'Feed ready!');
             loadStats();
@@ -244,8 +327,8 @@ export default function DashboardPage() {
         }
       };
       feedPollRef.current = setTimeout(poll, 2500);
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Failed to start feed generation');
+    } catch (error) {
+      toast.error(errorMessage(error, 'Failed to start feed generation'));
       setIsGenerating(false);
       feedGenerationActiveRef.current = false;
     }
@@ -267,21 +350,36 @@ export default function DashboardPage() {
       });
       setRefineResult({ score: result.score, rounds: result.rounds, passed: result.passed });
       toast.success(result.message || 'Feed refined!');
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Refinement failed');
+    } catch (error) {
+      toast.error(errorMessage(error, 'Refinement failed'));
     } finally {
       setIsRefining(false);
     }
   };
 
-  const handleInteraction = async (
-    itemType: 'paper' | 'article',
-    itemId: number,
-    interactionType: 'viewed' | 'saved' | 'dismissed'
-  ) => {
+  // A saved or edited profile is a request for a feed built from it; the server rebuilds
+  // today's feed when the profile version differs from the one it was built with.
+  const handleProfileSaved = (saved: ResearchProfile, regenerate = true) => {
+    setProfile(saved);
+    fetchProfile();
+    if (regenerate) generateFeed(false);
+  };
+
+  const handlePaperFeedback = async (text: string, paperId: number) => {
+    try {
+      const result = await profileApi.feedback(text, paperId);
+      setProfile(result.profile);
+      toast.success(`${result.note} Generate Feed to see the change.`);
+      return true;
+    } catch (error) {
+      toast.error(errorMessage(error, 'Could not apply that feedback'));
+      return false;
+    }
+  };
+
+  const handleInteraction = async (itemId: number, interactionType: 'viewed' | 'saved' | 'dismissed') => {
     try {
       await interactionsApi.create({
-        item_type: itemType,
         item_id: itemId,
         interaction_type: interactionType,
       });
@@ -329,9 +427,24 @@ export default function DashboardPage() {
         </div>
       </header>
 
+      {user?.is_demo && (
+        <div className="bg-violet-600 text-white">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2.5 flex flex-wrap items-center justify-between gap-2 text-sm">
+            <p>
+              <span className="font-semibold">You are exploring the shared demo account.</span>{' '}
+              <span className="text-violet-100">AI actions are limited each day, and saves are shared with other visitors.</span>
+            </p>
+            <button type="button" onClick={registerFromDemo}
+              className="rounded-lg bg-white px-3 py-1 text-xs font-semibold text-violet-700 hover:bg-violet-50">
+              Create your own account
+            </button>
+          </div>
+        </div>
+      )}
+
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Stats Bar */}
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+        {/* Stats Bar — feedback counts only mean something next to the feed they train */}
+        {activeTab === 'feed' && <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
             <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-1">Total</p>
             <p className="text-2xl font-bold text-gray-800">{stats?.total || 0}</p>
@@ -362,7 +475,7 @@ export default function DashboardPage() {
               </span>
             )}
           </div>
-        </div>
+        </div>}
 
         {/* Tabs */}
         <div className="flex border-b border-gray-200 mb-6 -mx-0 overflow-x-auto scrollbar-none">
@@ -370,8 +483,9 @@ export default function DashboardPage() {
             [
               { id: 'feed', label: 'Daily Feed' },
               { id: 'hot', label: "What's Hot", Icon: Flame },
-              { id: 'saved', label: 'Saved Items' },
+              { id: 'saved', label: 'Saved' },
               { id: 'chat', label: 'Agent Chat', Icon: Bot },
+              { id: 'practice', label: 'Coding Agent', Icon: Code2 },
               { id: 'settings', label: 'Settings' },
             ] as { id: string; label: string; Icon?: typeof Bot }[]
           ).map(({ id, label, Icon }) => (
@@ -386,6 +500,9 @@ export default function DashboardPage() {
             >
               {Icon && <Icon className="w-4 h-4" />}
               {label}
+              {id === 'practice' && practiceAlerts > 0 && (
+                <span title="Runs waiting for your review" className="ml-1 rounded-full bg-violet-600 px-1.5 text-[10px] font-semibold text-white">{practiceAlerts}</span>
+              )}
               {activeTab === id && (
                 <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary-600 rounded-t-full" />
               )}
@@ -395,6 +512,16 @@ export default function DashboardPage() {
 
         {activeTab === 'feed' && (
           <>
+            {/* The research profile: onboarding first, then an editable card */}
+            {needsOnboarding && (
+              <ProfileOnboarding isDemo={user?.is_demo} onSaved={(saved) => handleProfileSaved(saved)}
+                onSkip={feed || isGenerating ? undefined : () => generateFeed(false)} />
+            )}
+            {profile && profileReady && (
+              <ProfileCard key={profileEditKey} profile={profile} isDemo={user?.is_demo} startEditing={profileEditKey > 0}
+                onSaved={handleProfileSaved} />
+            )}
+
             {/* Personalization + Feed Controls */}
             <FeedControls
               user={user}
@@ -406,10 +533,12 @@ export default function DashboardPage() {
               feedProgress={feedProgress}
               onGenerate={() => generateFeed(false)}
               onProfileUpdate={fetchProfile}
+              openEditorSignal={feedEditorSignal}
+              hasResearchProfile={profileReady}
             />
 
-            {/* Onboarding — only while the profile is still thin */}
-            {coldStart && coldStart.seeds.length > 0 && (
+            {/* Rating seed papers: the older onboarding, kept for users without a research profile */}
+            {!profileReady && coldStart && coldStart.seeds.length > 0 && (
               <ColdStartSection
                 data={coldStart}
                 rated={ratedSeeds}
@@ -477,7 +606,9 @@ export default function DashboardPage() {
                           key={paper.id}
                           paper={paper}
                           onInteraction={handleInteraction}
-                          onAskAgent={(ctx) => { setActivePaperContext(ctx); setActiveTab('chat'); }}
+                          onAskAgent={(ctx) => openChat({ kind: 'paper', ...ctx, origin: 'Daily Feed' })}
+                          onPractice={() => openPractice({ kind: 'paper', source: paper.arxiv_id, title: paper.title, description: paper.abstract, url: paper.arxiv_url, origin: 'Daily Feed' })}
+                          onFeedback={profileReady && !user?.is_demo ? handlePaperFeedback : undefined}
                         />
                       ))}
                     </div>
@@ -489,15 +620,22 @@ export default function DashboardPage() {
                   <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full ${feed.used_ml_ranking ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
                     {feed.ranking_source === 'refined' ? '✨ Refined feed' : feed.used_ml_ranking ? '🧠 Personalized ML ranking' : '📊 Heuristic ranking'}
                   </span>
+                  {feed.selection === 'llm_judge' && feed.ranking_source !== 'refined' && (
+                    <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full bg-indigo-50 text-indigo-700"
+                      title="Each shortlisted paper was judged against your research profile">
+                      🧭 Judged against your profile
+                    </span>
+                  )}
                   {feed.ranking_fallback_reason && <span className="text-xs text-amber-700" title={feed.ranking_fallback_reason}>ML fallback: {feed.ranking_fallback_reason}</span>}
-                  <span className="text-xs text-gray-400">
-                    {feed.total_papers_considered} papers considered
-                  </span>
+                  {feed.total_papers_considered !== null && (
+                    <span className="text-xs text-gray-400">{feed.total_papers_considered} papers considered</span>
+                  )}
+                  <span className="text-xs text-gray-400">Generated {formatDistanceToNow(new Date(feed.generated_at), { addSuffix: true })}</span>
                 </div>
               </div>
             )}
 
-            {!feed && !isGenerating && (
+            {!feed && !isGenerating && !needsOnboarding && (
               <div className="text-center py-10 animate-in">
                 <div className="text-5xl mb-4">🔬</div>
                 <h3 className="text-lg font-semibold text-gray-700 mb-2">Generate your personalized feed</h3>
@@ -515,1711 +653,52 @@ export default function DashboardPage() {
           </>
         )}
 
+        {activeTab === 'feed' && !isGenerating && (
+          <ReadingPathPanel onSave={(id) => handleInteraction(id, 'saved')} />
+        )}
+
         {activeTab === 'hot' && (
           <WhatsHotSection
             data={whatsHot}
             isLoading={isLoadingHot}
             isRefreshing={isRefreshingHot}
             onRefresh={refreshWhatsHot}
+            onAskPaper={(paper) => openChat({ kind: 'paper', title: paper.title, abstract: paper.abstract || null, arxivId: arxivIdFromHotPaper(paper) || '', arxivUrl: paper.arxiv_url || paper.url, origin: "What's Hot" })}
+            onPracticePaper={(paper) => { const id = arxivIdFromHotPaper(paper); if (id) openPractice({ kind: 'paper', source: id, title: paper.title, description: paper.abstract, url: paper.arxiv_url, origin: "What's Hot" }); }}
+            onPracticeRepo={(repo) => openPractice({ kind: 'repo', source: repo.url, title: repo.full_name, description: repo.description, url: repo.url, origin: "What's Hot" })}
           />
         )}
 
-        {activeTab === 'saved' && <SavedItems />}
+        {activeTab === 'saved' && (
+          <SavedItems
+            onGoToFeed={() => setActiveTab('feed')}
+            onAskAgent={(paper) => openChat({ kind: 'paper', title: paper.title, abstract: paper.abstract || null, arxivId: paper.arxiv_id,
+              arxivUrl: paper.arxiv_url || `https://arxiv.org/abs/${paper.arxiv_id}`, origin: 'Saved' })}
+            onPractice={(paper) => openPractice({ kind: 'paper', source: paper.arxiv_id, title: paper.title, description: paper.abstract,
+              url: paper.arxiv_url, origin: 'Saved' })}
+          />
+        )}
 
         {activeTab === 'chat' && (
           <AgentChat
-            paperContext={activePaperContext}
-            onClearPaperContext={() => setActivePaperContext(null)}
+            chatContext={chatContext}
+            onClearContext={() => setChatContext(null)}
+            onPractice={(context) => openPractice({ kind: 'paper', source: context.arxivId, title: context.title,
+              description: context.abstract || undefined, url: context.arxivUrl, origin: context.origin })}
           />
         )}
 
-        {activeTab === 'settings' && <UserSettings user={user} onUpdate={fetchProfile} />}
+        {activeTab === 'practice' && <PracticeWorkspace context={practiceContext} onAskAgent={askFromPractice} />}
+
+        {activeTab === 'settings' && (
+          <UserSettings user={user} onUpdate={fetchProfile}
+            onEditInterests={() => {
+              setActiveTab('feed');
+              if (profileReady) setProfileEditKey((n) => n + 1);
+              else setFeedEditorSignal((n) => n + 1);
+            }} />
+        )}
       </main>
-    </div>
-  );
-}
-
-/* ── Feed Controls with inline personalization ── */
-function FeedControls({
-  user,
-  timeWindow,
-  setTimeWindow,
-  feedMode,
-  setFeedMode,
-  isGenerating,
-  feedProgress,
-  onGenerate,
-  onProfileUpdate,
-}: {
-  user: any;
-  timeWindow: number;
-  setTimeWindow: (v: number) => void;
-  feedMode: 'recommended' | 'latest';
-  setFeedMode: (v: 'recommended' | 'latest') => void;
-  isGenerating: boolean;
-  feedProgress: string;
-  onGenerate: () => void;
-  onProfileUpdate: () => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [focusAreas, setFocusAreas] = useState<string[]>(user?.focus_areas || []);
-  const [selectedExamples, setSelectedExamples] = useState<string[]>(
-    (user?.interests || []).filter((i: string) => EXAMPLE_INTERESTS.includes(i))
-  );
-  const [customInterests, setCustomInterests] = useState(
-    (user?.interests || []).filter((i: string) => !EXAMPLE_INTERESTS.includes(i)).join('\n')
-  );
-  const [isSaving, setIsSaving] = useState(false);
-
-  // Sync state when user prop changes
-  useEffect(() => {
-    if (user) {
-      setFocusAreas(user.focus_areas || []);
-      setSelectedExamples(
-        (user.interests || []).filter((i: string) => EXAMPLE_INTERESTS.includes(i))
-      );
-      setCustomInterests(
-        (user.interests || []).filter((i: string) => !EXAMPLE_INTERESTS.includes(i)).join('\n')
-      );
-    }
-  }, [user]);
-
-  const toggleArea = (area: string) => {
-    setFocusAreas((prev: string[]) =>
-      prev.includes(area) ? prev.filter((a: string) => a !== area) : [...prev, area]
-    );
-  };
-
-  const toggleExample = (interest: string) => {
-    setSelectedExamples((prev: string[]) =>
-      prev.includes(interest) ? prev.filter((i: string) => i !== interest) : [...prev, interest]
-    );
-  };
-
-  const handleSavePreferences = async () => {
-    setIsSaving(true);
-    try {
-      const customLines = customInterests
-        .split('\n')
-        .map((l: string) => l.trim())
-        .filter((l: string) => l.length > 0);
-      const allInterests = Array.from(new Set([...selectedExamples, ...customLines]));
-
-      await authApi.updateProfile({
-        interests: allInterests,
-        focus_areas: focusAreas,
-      });
-      toast.success('Preferences saved!');
-      onProfileUpdate();
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Failed to save preferences');
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  return (
-    <div className="card mb-6">
-      {/* Top row: mode + time window + generate */}
-      <div className="flex flex-wrap items-center gap-4">
-        <div>
-          <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Mode</label>
-          <div className="flex rounded-xl border border-gray-200 overflow-hidden bg-gray-50 p-0.5 gap-0.5">
-            <button
-              onClick={() => setFeedMode('recommended')}
-              className={`px-3 py-1.5 text-sm font-medium transition-all duration-150 rounded-lg ${
-                feedMode === 'recommended'
-                  ? 'bg-white text-primary-600 shadow-sm'
-                  : 'text-gray-500 hover:text-gray-700'
-              }`}
-            >
-              Recommended
-            </button>
-            <button
-              onClick={() => setFeedMode('latest')}
-              className={`px-3 py-1.5 text-sm font-medium transition-all duration-150 rounded-lg ${
-                feedMode === 'latest'
-                  ? 'bg-white text-primary-600 shadow-sm'
-                  : 'text-gray-500 hover:text-gray-700'
-              }`}
-            >
-              Latest
-            </button>
-          </div>
-        </div>
-
-        {feedMode === 'latest' && (
-          <div>
-            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
-              Time window
-            </label>
-            <select
-              value={timeWindow}
-              onChange={(e) => setTimeWindow(Number(e.target.value))}
-              className="input-field w-40"
-            >
-              <option value={1}>1 day</option>
-              <option value={7}>1 week</option>
-              <option value={30}>1 month</option>
-              <option value={365}>1 year</option>
-            </select>
-          </div>
-        )}
-
-        {/* Current focus areas preview */}
-        <div className="flex-1 min-w-0">
-          <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Focus areas</label>
-          <div className="flex flex-wrap gap-1.5">
-            {(user?.focus_areas || []).length > 0 ? (
-              (user.focus_areas as string[]).map((area: string) => (
-                <span key={area} className="px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-700">
-                  {area}
-                </span>
-              ))
-            ) : (
-              <span className="text-xs text-gray-400">None selected</span>
-            )}
-            {(user?.interests || []).length > 0 && (
-              <span className="text-xs text-gray-400 ml-1">
-                + {(user.interests as string[]).length} interest{(user.interests as string[]).length !== 1 ? 's' : ''}
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="flex items-end gap-2">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="btn-secondary text-sm flex items-center gap-1"
-          >
-            <Settings className="w-4 h-4" />
-            {expanded ? 'Hide' : 'Edit'}
-            {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-          </button>
-          <button
-            onClick={onGenerate}
-            disabled={isGenerating}
-            className="btn-primary flex items-center gap-2 disabled:opacity-50"
-          >
-            {isGenerating ? (
-              <>
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                Generating...
-              </>
-            ) : (
-              <>
-                <RefreshCw className="w-4 h-4" />
-                Generate Feed
-              </>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* Feed generation progress */}
-      {isGenerating && feedProgress && (
-        <div className="mt-4 flex items-start gap-3 bg-primary-50 border border-primary-100 rounded-xl px-4 py-3">
-          <RefreshCw className="w-4 h-4 text-primary-600 animate-spin shrink-0 mt-0.5" />
-          <div>
-            <p className="text-sm font-semibold text-primary-800">{feedProgress}</p>
-            <p className="text-xs text-primary-400 mt-0.5">Generation takes 30–90 seconds — this runs in the background</p>
-          </div>
-        </div>
-      )}
-
-      {/* Expandable personalization section */}
-      {expanded && (
-        <div className="mt-6 pt-6 border-t space-y-5">
-          {/* Focus Areas */}
-          <div>
-            <h3 className="text-sm font-semibold text-gray-900 mb-2">Focus Areas</h3>
-            <p className="text-xs text-gray-500 mb-3">Select areas to prioritize in your feed</p>
-            <div className="flex flex-wrap gap-2">
-              {AVAILABLE_AREAS.map((area) => (
-                <button
-                  key={area}
-                  onClick={() => toggleArea(area)}
-                  className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                    focusAreas.includes(area)
-                      ? 'bg-primary-600 text-white'
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  {area}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Research Interests */}
-          <div>
-            <h3 className="text-sm font-semibold text-gray-900 mb-2">Research Interests</h3>
-            <p className="text-xs text-gray-500 mb-3">
-              Used for semantic similarity matching and personalized summaries. Specific phrases work best.
-            </p>
-
-            <div className="flex flex-wrap gap-2 mb-3">
-              {EXAMPLE_INTERESTS.map((interest) => (
-                <button
-                  key={interest}
-                  onClick={() => toggleExample(interest)}
-                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
-                    selectedExamples.includes(interest)
-                      ? 'bg-primary-600 text-white'
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  {interest}
-                </button>
-              ))}
-            </div>
-
-            <textarea
-              value={customInterests}
-              onChange={(e) => setCustomInterests(e.target.value)}
-              rows={2}
-              placeholder="Custom interests (one per line), e.g. graph neural networks"
-              className="input-field w-full text-sm"
-            />
-          </div>
-
-          {/* Save button */}
-          <button
-            onClick={handleSavePreferences}
-            disabled={isSaving}
-            className="btn-primary text-sm flex items-center gap-2 disabled:opacity-50"
-          >
-            {isSaving ? (
-              <>
-                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save className="w-3.5 h-3.5" />
-                Save Preferences
-              </>
-            )}
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── Formatted Summary ── */
-function FormattedSummary({ text }: { text: string }) {
-  // Parse the summary into sections based on common patterns
-  // The LLM returns: **Key Insight:** ..., **Why They Should Care:** ..., **Relation to Their Interests:** ...
-  const sections: { label: string; content: string; color: string }[] = [];
-  let remaining = text;
-
-  const patterns = [
-    { regex: /\*\*Key Insight:\*\*\s*/i, label: 'Key Insight', color: 'text-amber-700 bg-amber-50' },
-    { regex: /\*\*Why (?:They |You )?(Should )?Care:\*\*\s*/i, label: 'Why It Matters', color: 'text-blue-700 bg-blue-50' },
-    { regex: /\*\*(?:Relation to (?:Their |Your )?Interests|How [Ii]t [Rr]elates).*?:\*\*\s*/i, label: 'Relevance to You', color: 'text-green-700 bg-green-50' },
-  ];
-
-  // Try to split into structured sections
-  const allPatternStarts: { idx: number; len: number; patternIdx: number }[] = [];
-  for (let p = 0; p < patterns.length; p++) {
-    const match = patterns[p].regex.exec(remaining);
-    if (match && match.index !== undefined) {
-      allPatternStarts.push({ idx: match.index, len: match[0].length, patternIdx: p });
-    }
-  }
-
-  if (allPatternStarts.length >= 2) {
-    // Sort by position
-    allPatternStarts.sort((a, b) => a.idx - b.idx);
-
-    for (let i = 0; i < allPatternStarts.length; i++) {
-      const start = allPatternStarts[i].idx + allPatternStarts[i].len;
-      const end = i + 1 < allPatternStarts.length ? allPatternStarts[i + 1].idx : remaining.length;
-      const content = remaining.slice(start, end).trim();
-      const pat = patterns[allPatternStarts[i].patternIdx];
-      sections.push({ label: pat.label, content, color: pat.color });
-    }
-  }
-
-  // If we couldn't parse structured sections, show as-is with basic bold rendering
-  if (sections.length === 0) {
-    return (
-      <div className="text-sm text-gray-700 leading-relaxed" dangerouslySetInnerHTML={{
-        __html: text
-          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-          .replace(/\n/g, '<br/>')
-      }} />
-    );
-  }
-
-  return (
-    <div className="space-y-2">
-      {sections.map((section, i) => (
-        <div key={i} className="flex gap-2 items-start">
-          <span className={`shrink-0 text-xs font-semibold px-2 py-0.5 rounded ${section.color}`}>
-            {section.label}
-          </span>
-          <p className="text-sm text-gray-700 leading-relaxed">{section.content}</p>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ── Paper Card ── */
-function PaperCard({
-  paper,
-  onInteraction,
-  onAskAgent,
-}: {
-  paper: Paper;
-  onInteraction: (type: 'paper' | 'article', id: number, interaction: 'viewed' | 'saved' | 'dismissed') => void;
-  onAskAgent: (ctx: { title: string; abstract: string | null; arxivId: string; arxivUrl: string }) => void;
-}) {
-  return (
-    <div
-      className="card-lift animate-in"
-      style={{ borderLeft: '3px solid #0ea5e9' }}
-    >
-      <div className="flex-1">
-        <div className="flex items-start justify-between gap-3 mb-2">
-          <h3 className="font-semibold text-gray-900 leading-snug">
-            <span className="text-gray-400 mr-1.5">#{paper.rank}</span>
-            {paper.title}
-          </h3>
-          {paper.citation_count > 50 && (
-            <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-100">
-              ⭐ {paper.citation_count} citations
-            </span>
-          )}
-        </div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-400 mb-3">
-          <span>arXiv:{paper.arxiv_id}</span>
-          <span className="text-primary-600 font-medium">Score: {paper.relevance_score.toFixed(3)}</span>
-          {paper.impact_score != null && (
-            <span>Impact: {paper.impact_score.toFixed(2)}</span>
-          )}
-        </div>
-        {paper.summary && <FormattedSummary text={paper.summary} />}
-      </div>
-      <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
-        <a
-          href={paper.arxiv_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={() => onInteraction('paper', paper.id, 'viewed')}
-          className="btn-secondary text-sm py-1.5"
-        >
-          <ExternalLink className="w-3.5 h-3.5" />
-          View paper
-        </a>
-        <button
-          onClick={() => onInteraction('paper', paper.id, 'saved')}
-          className="btn-secondary text-sm py-1.5"
-        >
-          <Save className="w-3.5 h-3.5" />
-          Save
-        </button>
-        <button
-          onClick={() => onAskAgent({
-            title: paper.title,
-            abstract: paper.abstract ?? null,
-            arxivId: paper.arxiv_id,
-            arxivUrl: paper.arxiv_url ?? '',
-          })}
-          className="btn-secondary text-sm py-1.5 text-primary-600 border-primary-200 hover:bg-primary-50"
-        >
-          <Bot className="w-3.5 h-3.5" />
-          Ask Agent
-        </button>
-        <button
-          onClick={() => onInteraction('paper', paper.id, 'dismissed')}
-          className="ml-auto text-gray-300 hover:text-rose-400 p-2 rounded-lg hover:bg-rose-50 transition-colors"
-          title="Dismiss"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/* ── Digest Card ("What's Hot in CS") ── */
-function DigestCard({
-  article,
-  onInteraction,
-}: {
-  article: Article;
-  onInteraction: (type: 'paper' | 'article', id: number, interaction: 'viewed' | 'saved' | 'dismissed') => void;
-}) {
-  return (
-    <div
-      className="card-lift animate-in"
-      style={{ borderLeft: '3px solid #f97316' }}
-    >
-      <div className="flex-1">
-        {/* Title + source */}
-        <div className="flex items-start justify-between gap-3 mb-1">
-          <h3 className="font-semibold text-gray-900 leading-snug">
-            <span className="text-gray-400 mr-1.5">#{article.rank}</span>
-            {article.title}
-          </h3>
-        </div>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-gray-400 mb-3">
-          <span className="font-medium text-orange-500">{article.source}</span>
-        </div>
-
-        {/* Digest summary — the main content */}
-        {article.digest_summary ? (
-          <p className="text-sm text-gray-700 leading-relaxed mb-3">
-            {article.digest_summary}
-          </p>
-        ) : article.summary ? (
-          <FormattedSummary text={article.summary} />
-        ) : null}
-
-        {/* Source citation link */}
-        <div className="flex items-center gap-1 text-xs text-gray-400">
-          <span>Source:</span>
-          <a
-            href={article.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={() => onInteraction('article', article.id, 'viewed')}
-            className="text-orange-500 hover:text-orange-600 hover:underline truncate max-w-[300px]"
-          >
-            {article.url.replace(/^https?:\/\/(www\.)?/, '').split('/')[0]}
-          </a>
-        </div>
-      </div>
-
-      <div className="flex items-center gap-2 mt-4 pt-4 border-t border-gray-100">
-        <a
-          href={article.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={() => onInteraction('article', article.id, 'viewed')}
-          className="btn-secondary text-sm py-1.5"
-        >
-          <ExternalLink className="w-3.5 h-3.5" />
-          Read full article
-        </a>
-        <button
-          onClick={() => onInteraction('article', article.id, 'saved')}
-          className="btn-secondary text-sm py-1.5"
-        >
-          <Save className="w-3.5 h-3.5" />
-          Save
-        </button>
-        <button
-          onClick={() => onInteraction('article', article.id, 'dismissed')}
-          className="ml-auto text-gray-300 hover:text-rose-400 p-2 rounded-lg hover:bg-rose-50 transition-colors"
-          title="Dismiss"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/* ── User Settings (profile only) ── */
-function UserSettings({ user, onUpdate }: { user: any; onUpdate: () => void }) {
-  const [focusAreas, setFocusAreas] = useState<string[]>(user?.focus_areas || []);
-  const [selectedExamples, setSelectedExamples] = useState<string[]>(
-    (user?.interests || []).filter((i: string) => EXAMPLE_INTERESTS.includes(i))
-  );
-  const [customInterests, setCustomInterests] = useState(
-    (user?.interests || []).filter((i: string) => !EXAMPLE_INTERESTS.includes(i)).join('\n')
-  );
-  const [fullName, setFullName] = useState(user?.full_name || '');
-  const [isSaving, setIsSaving] = useState(false);
-
-  const toggleArea = (area: string) => {
-    setFocusAreas((prev: string[]) =>
-      prev.includes(area) ? prev.filter((a: string) => a !== area) : [...prev, area]
-    );
-  };
-
-  const toggleExample = (interest: string) => {
-    setSelectedExamples((prev: string[]) =>
-      prev.includes(interest) ? prev.filter((i: string) => i !== interest) : [...prev, interest]
-    );
-  };
-
-  const handleSave = async () => {
-    setIsSaving(true);
-    try {
-      const customLines = customInterests
-        .split('\n')
-        .map((l: string) => l.trim())
-        .filter((l: string) => l.length > 0);
-      const allInterests = Array.from(new Set([...selectedExamples, ...customLines]));
-
-      await authApi.updateProfile({
-        full_name: fullName || undefined,
-        interests: allInterests,
-        focus_areas: focusAreas,
-      });
-      toast.success('Settings saved!');
-      onUpdate();
-    } catch (error: any) {
-      toast.error(error.response?.data?.detail || 'Failed to save settings');
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  return (
-    <div className="space-y-6">
-      {/* Profile */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4 flex items-center gap-2">
-          <Settings className="w-5 h-5" />
-          Profile
-        </h2>
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-            <input
-              type="text"
-              value={user?.email || ''}
-              disabled
-              className="input-field w-full bg-gray-100 cursor-not-allowed"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Full name</label>
-            <input
-              type="text"
-              value={fullName}
-              onChange={(e) => setFullName(e.target.value)}
-              placeholder="Your name"
-              className="input-field w-full"
-            />
-          </div>
-        </div>
-      </div>
-
-      {/* Focus Areas */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-gray-900 mb-2">Focus Areas</h2>
-        <p className="text-sm text-gray-500 mb-4">Select areas to prioritize in your feed</p>
-        <div className="flex flex-wrap gap-2">
-          {AVAILABLE_AREAS.map((area) => (
-            <button
-              key={area}
-              onClick={() => toggleArea(area)}
-              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${
-                focusAreas.includes(area)
-                  ? 'bg-primary-600 text-white'
-                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-              }`}
-            >
-              {area}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Interests */}
-      <div className="card">
-        <h2 className="text-lg font-semibold text-gray-900 mb-2">Research Interests</h2>
-        <p className="text-sm text-gray-500 mb-4">
-          Used to compute semantic similarity for recommendations. Longer, specific phrases work best.
-        </p>
-
-        <h3 className="text-sm font-medium text-gray-700 mb-2">Select from examples</h3>
-        <div className="flex flex-wrap gap-2 mb-4">
-          {EXAMPLE_INTERESTS.map((interest) => (
-            <button
-              key={interest}
-              onClick={() => toggleExample(interest)}
-              className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-                selectedExamples.includes(interest)
-                  ? 'bg-primary-600 text-white'
-                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-              }`}
-            >
-              {interest}
-            </button>
-          ))}
-        </div>
-
-        <h3 className="text-sm font-medium text-gray-700 mb-2">Custom interests (one per line)</h3>
-        <textarea
-          value={customInterests}
-          onChange={(e) => setCustomInterests(e.target.value)}
-          rows={4}
-          placeholder={"e.g.\ngraph neural networks\nfederated learning\nAI for healthcare"}
-          className="input-field w-full"
-        />
-      </div>
-
-      {/* Save Button */}
-      <button
-        onClick={handleSave}
-        disabled={isSaving}
-        className="btn-primary flex items-center gap-2 disabled:opacity-50"
-      >
-        {isSaving ? (
-          <>
-            <RefreshCw className="w-4 h-4 animate-spin" />
-            Saving...
-          </>
-        ) : (
-          <>
-            <Save className="w-4 h-4" />
-            Save Settings
-          </>
-        )}
-      </button>
-    </div>
-  );
-}
-
-// ── Agent Chat constants ──────────────────────────────────────────────────────
-
-const INTENT_COLORS: Record<string, string> = {
-  research_qa: 'bg-blue-100 text-blue-700',
-  recommendation: 'bg-green-100 text-green-700',
-  document_management: 'bg-amber-100 text-amber-700',
-  general_chat: 'bg-gray-100 text-gray-600',
-};
-
-const INTENT_LABELS: Record<string, string> = {
-  research_qa: 'Research Q&A',
-  recommendation: 'Recommendations',
-  document_management: 'Documents',
-  general_chat: 'General Chat',
-};
-
-const TOOL_LABELS: Record<string, string> = {
-  search_knowledge_base: 'Search KB',
-  get_personalized_feed: 'Get Feed',
-  list_user_documents: 'List Docs',
-  search_user_documents: 'Search Docs',
-};
-
-const TOOL_ICONS: Record<string, string> = {
-  search_knowledge_base: '🔍',
-  get_personalized_feed: '📰',
-  list_user_documents: '📁',
-  search_user_documents: '🔎',
-};
-
-interface ResearchTask {
-  id: number;
-  title: string;
-  intent: string;
-  status: 'pending' | 'running' | 'done';
-  citations?: number;
-}
-
-interface ChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  intent?: string;
-  intentMethod?: string;
-  intentConfidence?: number;
-  agentUsed?: string;
-  toolCalls?: { tool: string; count: number }[];
-  citations?: { title: string; url: string; type: string }[];
-  isStreaming?: boolean;
-  researchPlan?: ResearchTask[];
-  researchRunId?: string;
-  researchComplete?: boolean;
-  reflectionStage?: 'critiquing' | 'refining';
-  reflectionScore?: number;
-  isDraft?: boolean;
-}
-
-const CHAT_SESSION_STORAGE_KEY = 'chat_session_id';
-
-/* ── Agent Chat ── */
-function AgentChat({
-  paperContext = null,
-  onClearPaperContext,
-}: {
-  paperContext?: { title: string; abstract: string | null; arxivId: string; arxivUrl: string } | null;
-  onClearPaperContext?: () => void;
-}) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState('');
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(() =>
-    typeof window !== 'undefined' ? localStorage.getItem(CHAT_SESSION_STORAGE_KEY) : null
-  );
-  const [showKB, setShowKB] = useState(false);
-  const [pausedRun, setPausedRun] = useState<{ run_id: string; question: string } | null>(null);
-  const [kbDocs, setKbDocs] = useState<any[]>([]);
-  const [isUploading, setIsUploading] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const paperContextInjected = useRef(false);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  useEffect(() => {
-    loadKbDocs();
-    chatApi.getResearchRuns().then(({ runs }) => {
-      const paused = runs.find(run => run.resumable);
-      if (paused) setPausedRun(paused);
-    }).catch(() => {});
-    return () => {
-      abortRef.current?.abort();
-    };
-  }, []);
-
-  // Restore the previous conversation on mount (page refresh, or switching
-  // back to this tab after AgentChat was unmounted) using whatever
-  // session_id survived in localStorage. The backend keeps history for this
-  // session_id in Redis for 24h regardless of whether the frontend remembers
-  // it — this just gives the frontend a way to ask for it back.
-  useEffect(() => {
-    if (!sessionId) return;
-    chatApi.getHistory(sessionId)
-      .then((data) => {
-        if (!data.messages || data.messages.length === 0) return;
-        setMessages(
-          data.messages.map((m, i) => ({
-            id: `restored-${i}`,
-            role: m.role,
-            content: m.content,
-          }))
-        );
-      })
-      .catch(() => {
-        // Session expired in Redis (past the 24h TTL) or otherwise
-        // unreachable — nothing to restore, start fresh silently.
-        localStorage.removeItem(CHAT_SESSION_STORAGE_KEY);
-        setSessionId(null);
-      });
-    // Intentionally only on mount — this restores once, not on every
-    // sessionId change (a live chat already has its messages in state).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Keep localStorage in sync whenever the active session changes, so a
-  // page refresh or a return trip to this tab always has the latest id.
-  useEffect(() => {
-    if (sessionId) {
-      localStorage.setItem(CHAT_SESSION_STORAGE_KEY, sessionId);
-    } else {
-      localStorage.removeItem(CHAT_SESSION_STORAGE_KEY);
-    }
-  }, [sessionId]);
-
-  useEffect(() => {
-    paperContextInjected.current = false;
-  }, [paperContext]);
-
-  const loadKbDocs = async () => {
-    try {
-      const data = await qaApi.listDocuments();
-      setKbDocs(data.documents || data || []);
-    } catch {}
-  };
-
-  const handleKbUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    setIsUploading(true);
-    let uploaded = 0;
-    for (let i = 0; i < files.length; i++) {
-      try {
-        await qaApi.uploadDocument(files[i], files[i].name);
-        uploaded++;
-      } catch (err: any) {
-        toast.error(`Failed to upload ${files[i].name}: ${err.response?.data?.detail || 'Unknown error'}`);
-      }
-    }
-    if (uploaded > 0) {
-      toast.success(`Uploaded ${uploaded} document(s) to knowledge base`);
-      loadKbDocs();
-    }
-    setIsUploading(false);
-    e.target.value = '';
-  };
-
-  const handleKbDelete = async (docId: number, title: string) => {
-    try {
-      await qaApi.deleteDocument(docId);
-      toast.success(`Deleted "${title}"`);
-      loadKbDocs();
-    } catch {
-      toast.error('Failed to delete document');
-    }
-  };
-
-  const sendMessage = async (resumeRunId?: string) => {
-    if ((!input.trim() && !resumeRunId) || isStreaming) return;
-
-    const userMsg: ChatMessage = { id: `u-${Date.now()}`, role: 'user', content: resumeRunId ? 'Resume research' : input };
-    const assistantId = `a-${Date.now() + 1}`;
-    const assistantMsg: ChatMessage = {
-      id: assistantId,
-      role: 'assistant',
-      content: '',
-      isStreaming: true,
-      toolCalls: [],
-    };
-
-    setMessages(prev => [...prev, userMsg, assistantMsg]);
-    let text = input;
-    if (paperContext && !paperContextInjected.current) {
-      const abstractPreview = paperContext.abstract
-        ? paperContext.abstract.slice(0, 800)
-        : 'Not available';
-      text = `I want to ask about this research paper:\n\nTitle: ${paperContext.title}\narXiv: ${paperContext.arxivId}\n\nAbstract: ${abstractPreview}\n\n---\n\nMy question: ${input}`;
-      paperContextInjected.current = true;
-    }
-    setInput('');
-    if (resumeRunId) setPausedRun(null);
-    setIsStreaming(true);
-
-    abortRef.current = new AbortController();
-
-    try {
-      const token = chatApi.getAuthToken();
-      const res = await fetch(chatApi.getStreamUrl(), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ message: resumeRunId ? '' : text, session_id: sessionId, resume_run_id: resumeRunId }),
-        signal: abortRef.current.signal,
-      });
-
-      if (!res.ok || !res.body) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-
-      const applyEvent = (event: AgentEvent) => {
-        setMessages(prev =>
-          prev.map(m => {
-            if (m.id !== assistantId) return m;
-            switch (event.type) {
-              case 'session':
-                setSessionId(event.session_id);
-                return m;
-              case 'run':
-                return { ...m, researchRunId: event.run_id };
-              case 'intent':
-                return { ...m, intent: event.value, intentMethod: event.method, intentConfidence: event.confidence };
-              case 'agent':
-                return { ...m, agentUsed: event.value };
-              case 'tool_call':
-                return { ...m, toolCalls: [...(m.toolCalls || []), { tool: event.tool, count: -1 }] };
-              case 'tool_result': {
-                const updated = (m.toolCalls || []).map(tc =>
-                  tc.tool === event.tool && tc.count === -1 ? { ...tc, count: event.count } : tc
-                );
-                return { ...m, toolCalls: updated };
-              }
-              case 'token':
-                return { ...m, content: m.content + event.value };
-              case 'draft_token':
-                return { ...m, content: m.content + event.value, isDraft: true };
-              case 'replace':
-                return { ...m, content: event.value, isDraft: false };
-              case 'done':
-                return { ...m, isStreaming: false, citations: event.citations,
-                  researchComplete: Boolean(m.researchRunId || event.run_id) && !event.resumable, isDraft: false };
-              case 'error':
-                return { ...m, isStreaming: false, content: m.content || `Error: ${event.value}` };
-              case 'cancelled':
-                return { ...m, isStreaming: false, content: `${m.content}\n\n[Generation stopped]`.trim() };
-              case 'plan':
-                return {
-                  ...m,
-                  researchPlan: event.tasks.map(t => ({ ...t, status: 'pending' as const })),
-                };
-              case 'task_started': {
-                const updated = (m.researchPlan || []).map(t =>
-                  t.id === event.id ? { ...t, status: 'running' as const } : t
-                );
-                return { ...m, researchPlan: updated };
-              }
-              case 'task_done': {
-                const updated = (m.researchPlan || []).map(t =>
-                  t.id === event.id ? { ...t, status: 'done' as const, citations: event.citations } : t
-                );
-                return { ...m, researchPlan: updated };
-              }
-              case 'critiquing':
-                return { ...m, reflectionStage: 'critiquing' };
-              case 'critique_result':
-                return { ...m, reflectionScore: event.aggregate };
-              case 'refining':
-                return { ...m, reflectionStage: 'refining' };
-              default:
-                return m;
-            }
-          })
-        );
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = buf.indexOf('\n')) !== -1) {
-          const line = buf.slice(0, idx);
-          buf = buf.slice(idx + 1);
-          if (line.startsWith('data: ')) {
-            try {
-              applyEvent(JSON.parse(line.slice(6)) as AgentEvent);
-            } catch (_) { /* skip malformed */ }
-          }
-        }
-      }
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        setMessages(prev =>
-          prev.map(m =>
-            m.id === assistantId
-              ? { ...m, isStreaming: false, content: m.content || 'Failed to get a response. Please try again.' }
-              : m
-          )
-        );
-      }
-    } finally {
-      setIsStreaming(false);
-      setMessages(prev =>
-        prev.map(m => m.id === assistantId ? { ...m, isStreaming: false } : m)
-      );
-    }
-  };
-
-  const stopGeneration = () => {
-    abortRef.current?.abort();
-    setMessages(prev => prev.map(m =>
-      m.isStreaming ? { ...m, isStreaming: false, content: `${m.content}\n\n[Generation stopped]`.trim() } : m
-    ));
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  };
-
-  const clearChat = () => {
-    abortRef.current?.abort();
-    setMessages([]);
-    setSessionId(null);
-    setIsStreaming(false);
-  };
-
-  return (
-    <div className="flex flex-col" style={{ height: 'calc(100vh - 320px)', minHeight: 480 }}>
-      {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <div>
-          <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
-            <Bot className="w-5 h-5 text-primary-600" />
-            Agent Chat
-          </h2>
-          <p className="text-xs text-gray-400 mt-0.5">
-            Powered by multi-agent routing — ask research questions, get recommendations, or manage documents
-          </p>
-        </div>
-        <button
-          onClick={clearChat}
-          className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1 px-2 py-1 rounded hover:bg-gray-100"
-        >
-          <X className="w-3.5 h-3.5" />
-          New Chat
-        </button>
-      </div>
-
-      {pausedRun && (
-        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs">
-          <span className="truncate text-indigo-800">Unfinished research: {pausedRun.question}</span>
-          <button type="button" disabled={isStreaming} onClick={() => sendMessage(pausedRun.run_id)}
-            className="shrink-0 font-medium text-indigo-700 underline disabled:opacity-50">Resume</button>
-        </div>
-      )}
-
-      {/* Paper Context Banner */}
-      {paperContext && (
-        <div className="shrink-0 mb-3 flex items-start gap-3 bg-sky-50 border border-sky-200 rounded-xl px-4 py-3">
-          <BookOpen className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
-          <div className="flex-1 min-w-0">
-            <p className="text-xs font-semibold text-sky-700 mb-0.5">Discussing paper</p>
-            <p className="text-sm text-sky-900 font-medium leading-snug line-clamp-2">{paperContext.title}</p>
-            {paperContext.arxivUrl && (
-              <a
-                href={paperContext.arxivUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-xs text-sky-600 hover:underline"
-              >
-                arXiv:{paperContext.arxivId} →
-              </a>
-            )}
-          </div>
-          <button
-            onClick={onClearPaperContext}
-            className="text-sky-400 hover:text-sky-600 p-1 shrink-0 transition-colors"
-            title="Clear paper context"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-
-      {/* Knowledge Base Panel */}
-      <div className="shrink-0 mb-3 border border-gray-200 rounded-xl overflow-hidden">
-        <button
-          onClick={() => setShowKB(!showKB)}
-          className="w-full flex items-center justify-between px-4 py-2.5 bg-gray-50 hover:bg-gray-100 text-sm font-medium text-gray-700 transition-colors"
-        >
-          <div className="flex items-center gap-2">
-            <Upload className="w-4 h-4 text-gray-500" />
-            Knowledge Base
-            {kbDocs.length > 0 && (
-              <span className="text-xs bg-primary-100 text-primary-700 px-2 py-0.5 rounded-full font-medium">
-                {kbDocs.length} doc{kbDocs.length !== 1 ? 's' : ''}
-              </span>
-            )}
-          </div>
-          {showKB ? <ChevronUp className="w-4 h-4 text-gray-400" /> : <ChevronDown className="w-4 h-4 text-gray-400" />}
-        </button>
-        {showKB && (
-          <div className="p-4 space-y-3 bg-white">
-            <label className="inline-flex items-center gap-2 btn-secondary text-sm cursor-pointer">
-              <Upload className="w-4 h-4" />
-              {isUploading ? 'Uploading...' : 'Upload Files (.txt, .md, .pdf)'}
-              <input
-                type="file"
-                accept=".txt,.md,.pdf"
-                multiple
-                onChange={handleKbUpload}
-                disabled={isUploading}
-                className="hidden"
-              />
-            </label>
-            {kbDocs.length > 0 ? (
-              <div className="space-y-1.5 max-h-36 overflow-y-auto">
-                {kbDocs.map((doc: any) => (
-                  <div key={doc.id} className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-1.5">
-                    <div className="min-w-0">
-                      <span className="text-sm text-gray-700 truncate block">{doc.title}</span>
-                      {doc.chunk_count > 0 && (
-                        <span className="text-xs text-gray-400">{doc.chunk_count} chunks</span>
-                      )}
-                    </div>
-                    <button
-                      onClick={() => handleKbDelete(doc.id, doc.title)}
-                      className="text-gray-300 hover:text-rose-400 p-1 ml-2 shrink-0 transition-colors"
-                      title="Delete document"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="text-xs text-gray-400">No documents yet. Uploaded files will be searchable in Agent Chat.</p>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto space-y-4 pr-1">
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-center py-12">
-            <Bot className="w-12 h-12 text-gray-200 mb-3" />
-            <p className="text-gray-500 font-medium">Ask me anything</p>
-            <p className="text-sm text-gray-400 mt-1 max-w-sm">
-              Research questions, paper recommendations, or searches across your uploaded documents
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2 justify-center">
-              {(paperContext ? [
-                "What is this paper's main contribution?",
-                "What are this paper's limitations?",
-                'Find related work that cites this paper',
-              ] : [
-                'What are recent advances in transformers?',
-                'Recommend papers on reinforcement learning',
-                'List my uploaded documents',
-              ]).map(ex => (
-                <button
-                  key={ex}
-                  onClick={() => setInput(ex)}
-                  className="text-xs bg-gray-50 border border-gray-200 rounded-full px-3 py-1.5 text-gray-600 hover:bg-primary-50 hover:border-primary-200 hover:text-primary-700 transition-colors"
-                >
-                  {ex}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-        {messages.map(msg => (
-          <ChatBubble key={msg.id} message={msg} onResume={(runId) => sendMessage(runId)} canResume={!isStreaming} />
-        ))}
-        <div ref={bottomRef} />
-      </div>
-
-      {/* Input */}
-      <div className="flex gap-2 mt-4 pt-4 border-t">
-        <input
-          type="text"
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Ask a question..."
-          className="input-field flex-1"
-          disabled={isStreaming}
-        />
-        <button
-          onClick={() => sendMessage()}
-          disabled={isStreaming || !input.trim()}
-          className="btn-primary flex items-center gap-2 disabled:opacity-50 shrink-0"
-        >
-          {isStreaming ? (
-            <RefreshCw className="w-4 h-4 animate-spin" />
-          ) : (
-            <Send className="w-4 h-4" />
-          )}
-          Send
-        </button>
-        {isStreaming && (
-          <button
-            onClick={stopGeneration}
-            className="px-3 py-2 rounded border border-gray-300 text-sm text-gray-700 hover:bg-gray-100"
-            type="button"
-          >
-            Stop
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* ── Chat Bubble ── */
-function ChatBubble({ message, onResume, canResume }: {
-  message: ChatMessage;
-  onResume: (runId: string) => void;
-  canResume: boolean;
-}) {
-  if (message.role === 'user') {
-    return (
-      <div className="flex justify-end">
-        <div className="bg-primary-600 text-white rounded-2xl rounded-tr-sm px-4 py-3 max-w-[80%] text-sm leading-relaxed">
-          {message.content}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex justify-start">
-      <div className="flex-1 max-w-[88%] space-y-2">
-        {/* Intent + agent badges */}
-        {(message.intent || message.agentUsed) && (
-          <div className="flex flex-wrap items-center gap-1.5">
-            {message.intent && (
-              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${INTENT_COLORS[message.intent] || 'bg-gray-100 text-gray-600'}`}>
-                {INTENT_LABELS[message.intent] || message.intent}
-              </span>
-            )}
-            {message.agentUsed && (
-              <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 font-medium">
-                {message.agentUsed}
-              </span>
-            )}
-            {message.reflectionScore !== undefined && (
-              <span
-                className={`text-xs px-2 py-0.5 rounded-full border font-medium ${
-                  message.reflectionScore >= 0.7
-                    ? 'bg-green-50 border-green-200 text-green-700'
-                    : 'bg-amber-50 border-amber-200 text-amber-700'
-                }`}
-              >
-                quality {message.reflectionScore.toFixed(2)}
-              </span>
-            )}
-            {message.intentMethod && message.intentConfidence !== undefined && (
-              <span className="text-xs text-gray-400">
-                via {message.intentMethod} · {Math.round(message.intentConfidence * 100)}%
-              </span>
-            )}
-          </div>
-        )}
-
-        {/* Tool calls */}
-        {message.toolCalls && message.toolCalls.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {message.toolCalls.map((tc, i) => (
-              <span
-                key={i}
-                className={`text-xs px-2 py-0.5 rounded-full border font-medium ${
-                  tc.count === -1
-                    ? 'bg-yellow-50 border-yellow-200 text-yellow-700 animate-pulse'
-                    : 'bg-green-50 border-green-200 text-green-700'
-                }`}
-              >
-                {TOOL_ICONS[tc.tool] || '⚙'} {TOOL_LABELS[tc.tool] || tc.tool}
-                {tc.count >= 0 && ` (${tc.count})`}
-              </span>
-            ))}
-          </div>
-        )}
-
-        {/* Deep research plan */}
-        {message.researchPlan && message.researchPlan.length > 0 && (
-          <div className="bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2 space-y-1">
-            <p className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-1.5">Research Plan</p>
-            {message.researchPlan.map(task => (
-              <div key={task.id} className="flex items-center gap-2 text-xs">
-                {task.status === 'done' ? (
-                  <span className="text-green-500">✓</span>
-                ) : task.status === 'running' ? (
-                  <RefreshCw className="w-3 h-3 text-indigo-500 animate-spin shrink-0" />
-                ) : (
-                  <span className="w-3 h-3 rounded-full border border-gray-300 shrink-0 inline-block" />
-                )}
-                <span className={`flex-1 ${task.status === 'done' ? 'text-gray-500 line-through' : task.status === 'running' ? 'text-indigo-700 font-medium' : 'text-gray-500'}`}>
-                  {task.title}
-                </span>
-                {task.status === 'done' && task.citations !== undefined && task.citations > 0 && (
-                  <span className="text-gray-400">{task.citations} src</span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Reply */}
-        <div className="bg-white border border-gray-100 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
-          {message.isDraft && <p className="mb-2 text-xs text-amber-700">Draft answer — checking evidence</p>}
-          {message.content ? (
-            <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">{message.content}</p>
-          ) : (
-            <div className="flex items-center gap-2 text-gray-400 text-sm">
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              {message.reflectionStage === 'critiquing'
-                ? 'Checking answer quality...'
-                : message.reflectionStage === 'refining'
-                ? 'Refining the answer...'
-                : 'Thinking...'}
-            </div>
-          )}
-          {message.isStreaming && message.content && (
-            <span className="inline-block w-0.5 h-4 bg-gray-400 animate-pulse align-middle ml-0.5" />
-          )}
-        </div>
-
-        {message.researchRunId && !message.researchComplete && !message.isStreaming && (
-          <button type="button" disabled={!canResume}
-            onClick={() => onResume(message.researchRunId!)}
-            className="text-xs text-indigo-700 underline disabled:opacity-50">
-            Resume research
-          </button>
-        )}
-
-        {/* Citations */}
-        {message.citations && message.citations.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {message.citations.map((c, i) => (
-              <a
-                key={i}
-                href={c.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-xs px-2 py-0.5 rounded bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-100 max-w-[200px] truncate"
-              >
-                {c.title || 'Source'} &rarr;
-              </a>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* ── Saved Items ── */
-function SavedItems() {
-  const [saved, setSaved] = useState<{ papers: Paper[]; articles: Article[] } | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    loadSaved();
-  }, []);
-
-  const loadSaved = async () => {
-    try {
-      const data = await feedApi.getSaved();
-      setSaved(data);
-    } catch (error) {
-      console.error('Failed to load saved items:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  if (isLoading) {
-    return (
-      <div className="text-center py-12">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600 mx-auto"></div>
-      </div>
-    );
-  }
-
-  if (!saved || (saved.papers.length === 0 && saved.articles.length === 0)) {
-    return (
-      <div className="text-center py-12 text-gray-500">
-        No saved items yet. Save papers and articles from your feed!
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-6">
-      {saved.papers.length > 0 && (
-        <div>
-          <h2 className="text-xl font-semibold text-gray-900 mb-4">
-            Saved Papers ({saved.papers.length})
-          </h2>
-          <div className="space-y-4">
-            {saved.papers.map((paper) => (
-              <div key={paper.id} className="card">
-                <h3 className="font-semibold text-gray-900 mb-1">{paper.title}</h3>
-                <p className="text-sm text-gray-500 mb-2">arXiv:{paper.arxiv_id}</p>
-                <a
-                  href={paper.arxiv_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-primary-600 hover:text-primary-700 text-sm"
-                >
-                  Open paper &rarr;
-                </a>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {saved.articles.length > 0 && (
-        <div>
-          <h2 className="text-xl font-semibold text-gray-900 mb-4">
-            Saved Articles ({saved.articles.length})
-          </h2>
-          <div className="space-y-4">
-            {saved.articles.map((article) => (
-              <div key={article.id} className="card">
-                <h3 className="font-semibold text-gray-900 mb-1">{article.title}</h3>
-                <p className="text-sm text-gray-500 mb-2">{article.source}</p>
-                <a
-                  href={article.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-primary-600 hover:text-primary-700 text-sm"
-                >
-                  Read article &rarr;
-                </a>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ── Cold-start onboarding ── */
-function ColdStartSection({
-  data,
-  rated,
-  onRate,
-  onDismiss,
-}: {
-  data: ColdStartResponse;
-  rated: Record<number, 'saved' | 'dismissed'>;
-  onRate: (seed: ColdStartSeed, verdict: 'saved' | 'dismissed') => void;
-  onDismiss: () => void;
-}) {
-  // Progress counts ratings already on the server plus the ones made in this
-  // session. Counting only this session would restart the bar at zero for a user
-  // who already has interactions, showing a target they have partly met.
-  const target = 5;
-  const ratedCount = Math.min(
-    target,
-    data.interactions_recorded + Object.keys(rated).length
-  );
-  const remaining = Math.max(0, target - ratedCount);
-  const pct = Math.min(100, (ratedCount / target) * 100);
-
-  // Rated cards drop out so what remains is always what still needs a decision.
-  const pending = data.seeds.filter((s) => !(s.db_id in rated));
-
-  return (
-    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 mb-6">
-      <div className="flex items-start justify-between gap-3 mb-1">
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-xl bg-violet-100 flex items-center justify-center text-lg">
-            🎯
-          </div>
-          <h2 className="text-base font-bold text-gray-900">Teach your feed</h2>
-        </div>
-        <button
-          onClick={onDismiss}
-          className="text-xs text-gray-400 hover:text-gray-600 px-2 py-1 rounded-lg hover:bg-gray-100 transition-colors"
-        >
-          Skip
-        </button>
-      </div>
-
-      <p className="text-sm text-gray-500 mb-4 max-w-2xl leading-relaxed">
-        {remaining > 0 ? (
-          <>
-            Rate <strong>{remaining} more</strong> {remaining === 1 ? 'paper' : 'papers'} to
-            bootstrap your profile. Saves and dismissals both help &mdash; a dismissal tells
-            the ranker what to avoid just as clearly as a save tells it what to find.
-          </>
-        ) : (
-          <>Enough signal to personalize. Generate a feed to see it applied.</>
-        )}
-      </p>
-
-      <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden mb-4">
-        <div
-          className="h-full bg-violet-500 rounded-full transition-all duration-300"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-
-      {pending.length > 0 ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {pending.slice(0, 6).map((seed) => (
-            <div
-              key={seed.db_id}
-              className="border border-gray-100 rounded-xl p-3.5 hover:border-violet-200 transition-colors flex flex-col"
-            >
-              <a
-                href={seed.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-sm font-semibold text-gray-900 hover:text-violet-600 leading-snug mb-1.5 transition-colors"
-              >
-                {seed.title}
-              </a>
-              <p className="text-xs text-gray-500 leading-relaxed mb-3 line-clamp-3 flex-1">
-                {seed.abstract}
-              </p>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => onRate(seed, 'saved')}
-                  className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-emerald-200 text-emerald-700 hover:bg-emerald-50 transition-colors"
-                >
-                  <Save className="w-3.5 h-3.5" /> Interested
-                </button>
-                <button
-                  onClick={() => onRate(seed, 'dismissed')}
-                  className="flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
-                >
-                  <X className="w-3.5 h-3.5" /> Not for me
-                </button>
-                {seed.citation_count ? (
-                  <span className="ml-auto text-xs text-gray-400">
-                    ⭐ {seed.citation_count}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="text-sm text-gray-400 py-2">
-          All set — that&apos;s everything from this batch.
-        </p>
-      )}
-    </div>
-  );
-}
-
-/* ── What's Hot Section ── */
-function WhatsHotSection({
-  data,
-  isLoading,
-  isRefreshing,
-  onRefresh,
-}: {
-  data: WhatsHotData | null;
-  isLoading: boolean;
-  isRefreshing: boolean;
-  onRefresh: () => void;
-}) {
-  return (
-    <div className="animate-in">
-      {/* Page header — states plainly that this surface is not personalized,
-          which is the whole reason it lives apart from Daily Feed. */}
-      <div className="flex items-start justify-between gap-4 mb-5">
-        <div className="flex items-start gap-3">
-          <div className="w-10 h-10 rounded-xl bg-orange-100 flex items-center justify-center text-xl flex-shrink-0">
-            🔥
-          </div>
-          <div>
-            <h2 className="text-lg font-bold text-gray-900 leading-tight">What&apos;s Hot</h2>
-            <p className="text-sm text-gray-500 mt-0.5">
-              What the ML community is reading and building right now — the same for
-              everyone, not tailored to you.
-              {data && (
-                <span className="text-gray-400">
-                  {' '}Tools from the last{' '}
-                  {data.github_window === 'daily' ? 'day' : 'week'}.
-                </span>
-              )}
-            </p>
-          </div>
-        </div>
-        <button
-          onClick={onRefresh}
-          disabled={isRefreshing}
-          title="Refresh What's Hot"
-          className="p-2 rounded-lg text-gray-400 hover:text-orange-500 hover:bg-orange-50 transition-colors disabled:opacity-40 flex-shrink-0"
-        >
-          <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-        </button>
-      </div>
-
-      {/* Loading skeleton */}
-      {isLoading && !data && (
-        <div className="space-y-3">
-          {[...Array(3)].map((_, i) => (
-            <div key={i} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 animate-pulse">
-              <div className="h-4 bg-gray-100 rounded w-3/4 mb-2" />
-              <div className="h-3 bg-gray-100 rounded w-full mb-1" />
-              <div className="h-3 bg-gray-100 rounded w-5/6" />
-            </div>
-          ))}
-        </div>
-      )}
-
-      {data && (
-        <div className="space-y-6">
-          {/* HuggingFace Trending Papers */}
-          {data.hf_papers.length > 0 && (
-            <div>
-              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
-                <span>🤗</span> Trending Papers
-              </h3>
-              <div className="space-y-3">
-                {data.hf_papers.map((paper) => (
-                  <HFPaperCard key={paper.id} paper={paper} />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* GitHub Trending Repos */}
-          {data.github_repos.length > 0 && (
-            <div>
-              <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
-                <span>🛠️</span> Trending Tools
-              </h3>
-              <div className="space-y-3">
-                {data.github_repos.map((repo) => (
-                  <GithubRepoCard key={repo.full_name} repo={repo} />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function HFPaperCard({ paper }: { paper: HFPaper }) {
-  return (
-    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 hover:border-orange-200 transition-colors">
-      <div className="flex items-start justify-between gap-3 mb-2">
-        <h4 className="text-sm font-semibold text-gray-900 leading-snug flex-1">{paper.title}</h4>
-        {paper.upvotes > 0 && (
-          <span className="flex-shrink-0 flex items-center gap-1 text-xs font-medium text-orange-600 bg-orange-50 px-2 py-0.5 rounded-full">
-            ▲ {paper.upvotes}
-          </span>
-        )}
-      </div>
-      {paper.digest && (
-        <p className="text-sm text-gray-500 leading-relaxed mb-3">{paper.digest}</p>
-      )}
-      <div className="flex items-center gap-3 text-xs text-gray-400">
-        <span className="font-medium text-gray-500">HuggingFace</span>
-        <a
-          href={paper.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-0.5 hover:text-orange-500 transition-colors"
-        >
-          HF <ExternalLink className="w-3 h-3" />
-        </a>
-        {paper.arxiv_url && (
-          <a
-            href={paper.arxiv_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-0.5 hover:text-orange-500 transition-colors"
-          >
-            arXiv <ExternalLink className="w-3 h-3" />
-          </a>
-        )}
-        {paper.authors.length > 0 && (
-          <span className="truncate max-w-[200px]">{paper.authors.slice(0, 2).join(', ')}</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function GithubRepoCard({ repo }: { repo: GithubRepo }) {
-  return (
-    <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 hover:border-orange-200 transition-colors">
-      <div className="flex items-start justify-between gap-3 mb-2">
-        <div className="flex-1 min-w-0">
-          <a
-            href={repo.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-sm font-semibold text-gray-900 hover:text-orange-600 transition-colors flex items-center gap-1"
-          >
-            {repo.name}
-            <ExternalLink className="w-3 h-3 flex-shrink-0" />
-          </a>
-          <span className="text-xs text-gray-400">{repo.full_name.split('/')[0]}</span>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          {repo.language && (
-            <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-sky-50 text-sky-600">
-              {repo.language}
-            </span>
-          )}
-          <span className="flex items-center gap-1 text-xs text-yellow-600 font-medium">
-            ★ {repo.stars >= 1000 ? `${(repo.stars / 1000).toFixed(1)}k` : repo.stars}
-          </span>
-        </div>
-      </div>
-      {repo.description && (
-        <p className="text-sm text-gray-500 leading-relaxed">{repo.description}</p>
-      )}
     </div>
   );
 }

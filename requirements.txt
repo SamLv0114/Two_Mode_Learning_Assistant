@@ -26,9 +26,14 @@ chromadb>=0.4.0
 rank-bm25>=0.2.2  # lexical half of RAG's hybrid retriever (src/rag/retriever.py)
 
 # LLM
-openai>=1.0.0,<2.0.0
+openai>=1.50.0,<2.0.0
 tiktoken>=0.7.0
 mcp==2.2.0
+langgraph>=1.2,<2.0
+langgraph-checkpoint-sqlite>=3.0,<4.0
+langgraph-checkpoint-postgres>=3.1,<4.0
+langsmith>=0.4,<1.0
+psycopg[binary]>=3.2,<4.0
 
 # Observability
 prometheus-client>=0.19.0
@@ -38,7 +43,6 @@ prometheus-client>=0.19.0
 redis>=5.0.0
 
 # Data Collection
-arxiv>=2.0.0
 feedparser>=6.0.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0

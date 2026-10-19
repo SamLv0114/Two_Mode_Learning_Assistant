@@ -17,6 +17,8 @@ interface AuthState {
 
   // Actions
   login: (email: string, password: string) => Promise<void>;
+  /** Sign in to the shared demo account (only offered when the server has it enabled). */
+  loginAsDemo: () => Promise<void>;
   register: (data: {
     email: string;
     password: string;
@@ -36,7 +38,14 @@ interface AuthState {
 
 export const useAuth = create<AuthState>()(
   persist(
-    (set, get) => ({
+    (set, get) => {
+      const startSession = (tokens: { access_token: string; refresh_token: string }) => {
+        sessionVersion += 1;
+        localStorage.setItem('access_token', tokens.access_token);
+        localStorage.setItem('refresh_token', tokens.refresh_token);
+        set({ token: tokens.access_token, isAuthenticated: true });
+      };
+      return {
       user: null,
       token: null,
       isLoading: false,
@@ -45,15 +54,17 @@ export const useAuth = create<AuthState>()(
       login: async (email: string, password: string) => {
         set({ isLoading: true });
         try {
-          const response = await authApi.login(email, password);
-          sessionVersion += 1;
-          localStorage.setItem('access_token', response.access_token);
-          localStorage.setItem('refresh_token', response.refresh_token);
-          set({
-            token: response.access_token,
-            isAuthenticated: true,
-          });
-          // Fetch user profile after login
+          startSession(await authApi.login(email, password));
+          await get().fetchProfile();
+        } finally {
+          set({ isLoading: false });
+        }
+      },
+
+      loginAsDemo: async () => {
+        set({ isLoading: true });
+        try {
+          startSession(await authApi.demo());
           await get().fetchProfile();
         } finally {
           set({ isLoading: false });
@@ -136,7 +147,8 @@ export const useAuth = create<AuthState>()(
           set({ isLoading: false });
         }
       },
-    }),
+      };
+    },
     {
       name: 'auth-storage',
       partialize: (state) => ({

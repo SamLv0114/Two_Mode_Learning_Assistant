@@ -19,16 +19,11 @@ from typing import Optional
 
 import requests
 
-from src.collectors.arxiv_collector import PaperData
+from src.collectors.paper_data import PaperData
 from src.database.models import SessionLocal, Paper
 from src.models import EmbeddingManager
 from src.utils.config import settings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 _S2_BASE = "https://api.semanticscholar.org"
@@ -181,7 +176,7 @@ def fetch_from_semantic_scholar(
         if item.get("publicationDate"):
             try:
                 pub_date = datetime.strptime(item["publicationDate"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         if pub_date is None and item.get("year"):
             pub_date = datetime(item["year"], 1, 1, tzinfo=timezone.utc)
@@ -367,6 +362,11 @@ def run_bulk_import(
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
     parser = argparse.ArgumentParser(description="Bulk historical paper import via Semantic Scholar")
     parser.add_argument("--min-citations", type=int, default=50,
                         help="Minimum citation count to include a paper (default: 50)")

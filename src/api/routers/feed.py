@@ -4,11 +4,12 @@ Daily feed endpoints
 import json
 import uuid
 import logging
-import time
+from datetime import timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from src.api.demo import charge_demo, demo_quota
 from src.database.models import User, Paper, UserInteraction, UserPaperRecommendation, count_labeled_paper_interactions
 from src.api.deps import get_db_session, get_current_user, get_embedding_manager
 from src.schemas.feed import (
@@ -17,64 +18,25 @@ from src.schemas.feed import (
 )
 from src.utils.config import settings
 from src.models.embeddings import EmbeddingManager
-from src.pipelines.daily_feed import DailyFeedPipeline, _describe_novelty
+from src.pipelines.daily_feed import DailyFeedPipeline
+from src.pipelines.feed.output import feed_selection, load_reasons
+from src.pipelines.feed.params import _describe_novelty
+from src.utils.redis_client import JsonCache, get_redis
 
 router = APIRouter(prefix="/feed", tags=["Daily Feed"])
 logger = logging.getLogger(__name__)
 
-# ── Job status store (Redis-backed, in-memory fallback) ───────────────────────
-_job_store: dict = {}
-_JOB_TTL = 3600  # 1 hour
-
-
-def _get_redis():
-    if not settings.REDIS_URL:
-        return None
-    try:
-        import redis
-        client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-        client.ping()
-        return client
-    except Exception:
-        return None
-
-
-def _status_key(user_id: int, job_id: str) -> str:
-    return f"feed_job:{user_id}:{job_id}"
+# ── Job status store (Redis, else this process; expires after an hour) ────────
+_jobs = JsonCache("feed_job", ttl_seconds=3600)
 
 
 def _set_status(user_id: int, job_id: str, data: dict) -> None:
-    key = _status_key(user_id, job_id)
-    rc = _get_redis()
-    if rc:
-        try:
-            rc.setex(key, _JOB_TTL, json.dumps(data))
-            return
-        except Exception:
-            pass
-    _job_store[key] = (time.monotonic() + _JOB_TTL, data)
-    if len(_job_store) > 1000:
-        now = time.monotonic()
-        for stale_key, (expires, _) in list(_job_store.items()):
-            if expires <= now:
-                _job_store.pop(stale_key, None)
+    _jobs.set(f"{user_id}:{job_id}", data)
 
 
 def _get_status(user_id: int, job_id: str) -> dict:
-    key = _status_key(user_id, job_id)
-    rc = _get_redis()
-    if rc:
-        try:
-            raw = rc.get(key)
-            if raw:
-                return json.loads(raw)
-        except Exception:
-            pass
-    entry = _job_store.get(key)
-    if entry and entry[0] > time.monotonic():
-        return entry[1]
-    _job_store.pop(key, None)
-    return {"status": "not_found"}
+    """Keyed by user as well as job, so one user cannot poll another's job."""
+    return _jobs.get(f"{user_id}:{job_id}") or {"status": "not_found"}
 
 
 # ── Background pipeline runner ────────────────────────────────────────────────
@@ -121,10 +83,10 @@ def _run_pipeline_background(
                 "message": "Showing today's feed" if result.get("reused") else "Feed ready",
                 "reused": bool(result.get("reused")),
                 "papers_count": len(result.get("papers", [])),
-                "articles_count": len(result.get("articles", [])),
                 "used_ml_ranking": result.get("used_ml_ranking", False),
                 "ranking_source": result.get("ranking_source", "heuristic"),
                 "ranking_fallback_reason": result.get("ranking_fallback_reason"),
+                "selection": result.get("selection"),
             })
             logger.info(f"Feed job {job_id} completed for user {user_id}")
         finally:
@@ -138,6 +100,7 @@ def _run_pipeline_background(
 @router.post("/generate")
 async def generate_feed(
     request: FeedRequest,
+    http_request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session),
@@ -158,6 +121,8 @@ async def generate_feed(
     - **custom_interests**: Optional additional interest keywords
     - **force_refresh**: Draw a new batch instead of reusing today's
     """
+    if request.force_refresh:  # a new batch is a full run; reusing today's feed costs nothing
+        charge_demo(http_request, current_user)
     user_interests = current_user.get_interests_list()
     if request.custom_interests:
         user_interests = user_interests + request.custom_interests
@@ -241,35 +206,65 @@ async def get_recommended_papers(
     db: Session = Depends(get_db_session)
 ):
     """Get this user's most recently generated paper feed, ordered by rank."""
-    rows = (
+    rows = _feed_rows(db, current_user.id).offset(offset).limit(limit).all()
+    return [_feed_paper(paper, rec, i) for i, (paper, rec) in enumerate(rows, offset + 1)]
+
+
+@router.get("/current")
+async def get_current_feed(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    """
+    The feed last generated for this user, with how and when it was built, so the
+    dashboard can show it on load instead of an empty page. generated_at is None
+    when the user has never generated one.
+    """
+    rows = _feed_rows(db, current_user.id).limit(settings.TOP_PAPERS_COUNT).all()
+    if not rows:
+        return {"papers": [], "generated_at": None}
+    first = rows[0][1]
+    generated = first.recommended_date
+    if generated is not None and generated.tzinfo is None:
+        generated = generated.replace(tzinfo=timezone.utc)  # stored as naive UTC
+    papers = [_feed_paper(paper, rec, i) for i, (paper, rec) in enumerate(rows, 1)]
+    return {
+        "papers": papers,
+        "generated_at": generated.isoformat() if generated else None,
+        "feed_mode": first.feed_mode,
+        "time_window_days": first.feed_time_window_days,
+        "ranking_source": first.ranking_source or "heuristic",
+        "ranking_fallback_reason": first.ranking_fallback_reason,
+        "selection": feed_selection([p.reasons for p in papers]),
+    }
+
+
+def _feed_rows(db: Session, user_id: int):
+    return (
         db.query(Paper, UserPaperRecommendation)
         .join(UserPaperRecommendation, Paper.id == UserPaperRecommendation.paper_id)
-        .filter(UserPaperRecommendation.user_id == current_user.id)
+        .filter(UserPaperRecommendation.user_id == user_id)
         .order_by(UserPaperRecommendation.rank.asc())
-        .offset(offset)
-        .limit(limit)
-        .all()
     )
 
-    return [
-        PaperResponse(
-            id=paper.id,
-            rank=rec.rank or (offset + i),
-            arxiv_id=paper.arxiv_id,
-            title=paper.title,
-            authors=paper.authors,
-            abstract=paper.abstract,
-            categories=paper.categories,
-            published_date=paper.published_date,
-            arxiv_url=paper.arxiv_url,
-            pdf_url=paper.pdf_url,
-            citation_count=paper.citation_count,
-            relevance_score=rec.relevance_score,
-            impact_score=paper.heuristic_impact_score,
-            summary=rec.personalized_summary,
-        )
-        for i, (paper, rec) in enumerate(rows, offset + 1)
-    ]
+
+def _paper_response(paper: Paper, rank: int, relevance: Optional[float] = None, summary: Optional[str] = None,
+                    reasons: Optional[dict] = None) -> PaperResponse:
+    """Every paper the feed API returns. Nullable columns become the numbers the schema requires,
+    so a row stored without a score cannot turn a whole response into a 500."""
+    return PaperResponse(
+        id=paper.id, rank=rank, arxiv_id=paper.arxiv_id, title=paper.title, authors=paper.authors,
+        abstract=paper.abstract, categories=paper.categories, published_date=paper.published_date,
+        arxiv_url=paper.arxiv_url, pdf_url=paper.pdf_url, citation_count=paper.citation_count or 0,
+        relevance_score=float(relevance or 0.0), impact_score=paper.heuristic_impact_score,
+        summary=summary, reasons=reasons,
+    )
+
+
+def _feed_paper(paper: Paper, rec: UserPaperRecommendation, position: int) -> PaperResponse:
+    """A paper of the stored feed, with its summary, score and reasons."""
+    return _paper_response(paper, rec.rank or position, rec.relevance_score, rec.personalized_summary,
+                           load_reasons(rec.reasons_json))
 
 
 def _materialize_refined_papers(db: Session, items: list[dict]) -> list[PaperResponse]:
@@ -284,28 +279,13 @@ def _materialize_refined_papers(db: Session, items: list[dict]) -> list[PaperRes
         paper = paper_by_arxiv.get(item["arxiv_id"])
         if paper is None:
             raise HTTPException(status_code=500, detail="Refined paper is no longer available")
-        refined_papers.append(PaperResponse(
-            id=paper.id,
-            rank=rank,
-            arxiv_id=paper.arxiv_id,
-            title=paper.title,
-            authors=paper.authors,
-            abstract=paper.abstract,
-            categories=paper.categories,
-            published_date=paper.published_date,
-            arxiv_url=paper.arxiv_url,
-            pdf_url=paper.pdf_url,
-            citation_count=paper.citation_count or 0,
-            relevance_score=float(item.get("relevance_score") or 0.0),
-            impact_score=paper.heuristic_impact_score,
-            summary=item.get("summary"),
-        ))
+        refined_papers.append(_paper_response(paper, rank, item.get("relevance_score"), item.get("summary")))
     return refined_papers
 
 
 @router.post("/refine")
 async def refine_feed(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(demo_quota),
     db: Session = Depends(get_db_session),
     embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
 ):
@@ -350,14 +330,14 @@ async def refine_feed(
     DEFAULT_PROFILE = "balances established literature and recent work"
     user_mode = None
 
-    rc = _get_redis()
+    rc = get_redis()
     if rc:
         try:
             ctx_raw = rc.get(f"feed_ctx:{current_user.id}")
             if ctx_raw:
                 user_mode = json.loads(ctx_raw).get("reading_profile")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Could not read feed context for refine: %s", exc)
 
     if not user_mode:
         try:
@@ -439,49 +419,18 @@ async def get_saved_items(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
 ):
-    """
-    Get items the user has saved
-    """
-    total_saved = db.query(UserInteraction).filter(
-        UserInteraction.user_id == current_user.id,
-        UserInteraction.interaction_type == "saved"
-    ).count()
-
-    saved_interactions = db.query(UserInteraction).filter(
-        UserInteraction.user_id == current_user.id,
-        UserInteraction.interaction_type == "saved"
-    ).order_by(UserInteraction.timestamp.desc()).offset(offset).limit(limit).all()
-
-    papers = []
-    articles = []
-
-    for interaction in saved_interactions:
-        if interaction.item_type == "paper":
-            paper = db.query(Paper).filter(Paper.id == interaction.item_id).first()
-            if paper:
-                rec = db.query(UserPaperRecommendation).filter(
-                    UserPaperRecommendation.user_id == current_user.id,
-                    UserPaperRecommendation.paper_id == paper.id,
-                ).first()
-                papers.append(PaperResponse(
-                    id=paper.id,
-                    rank=len(papers) + 1,
-                    arxiv_id=paper.arxiv_id,
-                    title=paper.title,
-                    authors=paper.authors,
-                    abstract=paper.abstract,
-                    categories=paper.categories,
-                    published_date=paper.published_date,
-                    arxiv_url=paper.arxiv_url,
-                    pdf_url=paper.pdf_url,
-                    citation_count=paper.citation_count,
-                    relevance_score=rec.relevance_score if rec else 0.0,
-                    impact_score=paper.heuristic_impact_score,
-                    summary=rec.personalized_summary if rec else None,
-                ))
-
+    """The papers the user has saved, most recent first, with their feed summary when they have one."""
+    saved = (db.query(Paper)
+             .join(UserInteraction, UserInteraction.item_id == Paper.id)
+             .filter(UserInteraction.user_id == current_user.id, UserInteraction.item_type == "paper",
+                     UserInteraction.interaction_type == "saved"))
+    papers = saved.order_by(UserInteraction.timestamp.desc()).offset(offset).limit(limit).all()
+    recs = {r.paper_id: r for r in db.query(UserPaperRecommendation).filter(
+        UserPaperRecommendation.user_id == current_user.id,
+        UserPaperRecommendation.paper_id.in_([p.id for p in papers]))} if papers else {}
     return {
-        "papers": papers,
-        "articles": articles,
-        "total_saved": total_saved
+        "papers": [_paper_response(p, rank, recs[p.id].relevance_score if p.id in recs else None,
+                                   recs[p.id].personalized_summary if p.id in recs else None)
+                   for rank, p in enumerate(papers, 1)],
+        "total_saved": saved.count(),
     }

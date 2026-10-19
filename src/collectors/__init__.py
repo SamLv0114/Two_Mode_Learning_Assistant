@@ -1,5 +1,5 @@
 """Data collectors"""
-from .arxiv_collector import ArxivCollector, PaperData
 from .arxiv_rss_collector import ArxivRSSCollector
+from .paper_data import PaperData
 
-__all__ = ["ArxivCollector", "PaperData", "ArxivRSSCollector"]
+__all__ = ["PaperData", "ArxivRSSCollector"]

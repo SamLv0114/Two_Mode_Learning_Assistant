@@ -41,7 +41,7 @@ class SemanticRetrievalCache:
 
     @staticmethod
     def eligible(filter_type: Optional[str]) -> bool:
-        return filter_type in ("paper", "article")
+        return filter_type == "paper"
 
     @staticmethod
     def scope_key(config: Dict) -> str:

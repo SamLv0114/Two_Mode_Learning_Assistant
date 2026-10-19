@@ -10,13 +10,15 @@ POST /whats_hot/refresh
   Admin/manual cache bust — re-fetches immediately.
 """
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from src.api.demo import forbid_demo
 from src.api.deps import get_current_user, get_db_session
 from src.database.models import User, UserInteraction
+from src.utils.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
@@ -28,19 +30,6 @@ router = APIRouter(prefix="/whats_hot", tags=["What's Hot"])
 # returns whatever is currently cached instead of busting + re-fetching.
 REFRESH_COOLDOWN_KEY = "whats_hot:refresh_cooldown"
 REFRESH_COOLDOWN_SECONDS = 300  # 5 minutes
-
-
-def _get_redis():
-    from src.utils.config import settings
-    if not settings.REDIS_URL:
-        return None
-    try:
-        import redis
-        rc = redis.from_url(settings.REDIS_URL, decode_responses=True)
-        rc.ping()
-        return rc
-    except Exception:
-        return None
 
 
 def _infer_last_visit_days(user_id: int, db: Session) -> int:
@@ -71,7 +60,7 @@ async def get_whats_hot(
     - GitHub: trending ML repositories this week (or day if visited recently)
     - Cached 6h in Redis, shared across all users
     """
-    rc = _get_redis()
+    rc = get_redis()
     last_visit_days = _infer_last_visit_days(current_user.id, db)
 
     from src.agents.hot_news_collector import HotNewsCollector
@@ -84,7 +73,7 @@ async def get_whats_hot(
 
 @router.post("/refresh")
 async def refresh_whats_hot(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session),
 ):
     """
@@ -98,10 +87,10 @@ async def refresh_whats_hot(
     cooldown a handful of eager clicks could burn through the external API
     quota for everyone.
     """
-    rc = _get_redis()
+    rc = get_redis()
     last_visit_days = _infer_last_visit_days(current_user.id, db)
 
-    from src.agents.hot_news_collector import HotNewsCollector
+    from src.agents.hot_news_collector import CACHE_KEY, HotNewsCollector
 
     if rc:
         try:
@@ -112,8 +101,8 @@ async def refresh_whats_hot(
                     user_last_visit_days=last_visit_days,
                     redis_client=rc,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Refresh cooldown check failed: %s", exc)
 
     # Clear today's cache entries, keyed by date AND github_window (see
     # HotNewsCollector), so both possible windows must be busted. Leaving
@@ -122,10 +111,10 @@ async def refresh_whats_hot(
     if rc:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         try:
-            rc.delete(f"whats_hot:{today}:daily", f"whats_hot:{today}:weekly")
+            rc.delete(*(CACHE_KEY.format(date=today, window=w) for w in ("daily", "weekly")))
             rc.setex(REFRESH_COOLDOWN_KEY, REFRESH_COOLDOWN_SECONDS, "1")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("What's Hot cache bust failed: %s", exc)
 
     result = HotNewsCollector().collect(
         user_last_visit_days=last_visit_days,

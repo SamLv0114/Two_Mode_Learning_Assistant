@@ -46,6 +46,8 @@ IMPORT_NAMES = {
     "python-dotenv": "dotenv",
     "pydantic-settings": "pydantic_settings",
     "psycopg2-binary": "psycopg2",
+    "langgraph-checkpoint-postgres": "langgraph.checkpoint.postgres",
+    "langgraph-checkpoint-sqlite": "langgraph.checkpoint.sqlite",
     "python-multipart": "multipart",
     "python-jose": "jose",
     "scikit-learn": "sklearn",
@@ -222,7 +224,7 @@ def _():
 
 @check("ranking weights always sum to 1 and clamp out-of-range input")
 def _():
-    from src.pipelines.daily_feed import _blend_weights
+    from src.pipelines.feed.params import _blend_weights
 
     for novelty in [-5, 0.0, 0.25, 0.5, 0.75, 1.0, 99]:
         w = _blend_weights(novelty)
@@ -240,7 +242,8 @@ def _():
     from unittest.mock import MagicMock
 
     from src.collectors import PaperData
-    from src.pipelines.daily_feed import DailyFeedPipeline, _blend_weights
+    from src.pipelines.daily_feed import DailyFeedPipeline
+    from src.pipelines.feed.params import _blend_weights
 
     now = datetime.now(timezone.utc)
 
@@ -320,14 +323,16 @@ def _():
 def _():
     import ast
 
-    src = (REPO_ROOT / "src/pipelines/daily_feed.py").read_text()
-    tree = ast.parse(src)
-    doc = ast.get_docstring(tree) or ""
-
-    defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            defined |= {m.name for m in node.body if isinstance(m, ast.FunctionDef)}
+    # The docstring describes the whole pipeline, whose methods are spread
+    # over daily_feed.py and the src/pipelines/feed/ modules it is built from.
+    doc = ast.get_docstring(ast.parse((REPO_ROOT / "src/pipelines/daily_feed.py").read_text())) or ""
+    defined = set()
+    for path in [REPO_ROOT / "src/pipelines/daily_feed.py", *(REPO_ROOT / "src/pipelines/feed").glob("*.py")]:
+        tree = ast.parse(path.read_text())
+        defined |= {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                defined |= {m.name for m in node.body if isinstance(m, ast.FunctionDef)}
 
     referenced = {
         m for m in re.findall(r"\b(_[a-z][a-z_]{3,}|get_coldstart_seeds)\b", doc)

@@ -19,13 +19,14 @@ is acceptable here; the goal is bounding abuse, not precise metering.
 import logging
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.utils.config import settings
+from src.utils.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,19 @@ class _MemoryWindow:
         return len(hits)
 
 
+
+def client_ip(request: Request) -> str:
+    """
+    The caller's address as nginx saw it. nginx overwrites X-Real-IP with the
+    connecting address, so a client cannot choose it; the first hop of
+    X-Forwarded-For is whatever the client sent and must not be trusted
+    (a fresh value per request would get a fresh rate-limit bucket).
+    """
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    return request.client.host if request.client else "unknown"
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Bounds requests per client per minute, keyed by client IP."""
 
@@ -81,26 +95,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not settings.REDIS_URL:
             logger.info("Rate limiting: REDIS_URL unset — using in-process counters")
             return None
-        try:
-            import redis
-            client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-            client.ping()
-            self._redis = client
+        self._redis = get_redis()
+        if self._redis is not None:
             logger.info("Rate limiting: using Redis backend")
-        except Exception as e:
-            logger.warning(f"Rate limiting: Redis unavailable ({e}) — using in-process counters")
+        else:
+            logger.warning("Rate limiting: Redis unavailable — using in-process counters")
         return self._redis
 
-    @staticmethod
-    def _client_key(request: Request) -> str:
-        """
-        Identify the caller. X-Forwarded-For wins when present so a reverse proxy
-        does not collapse every client onto one bucket; its first hop is the client.
-        """
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-        return request.client.host if request.client else "unknown"
 
     def _count(self, key: str) -> int:
         """Return this client's hit count in the current window."""
@@ -127,7 +128,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith(EXEMPT_PREFIXES):
             return await call_next(request)
 
-        key = self._client_key(request)
+        key = client_ip(request)
         count = self._count(key)
         remaining = max(0, self.limit - count)
 

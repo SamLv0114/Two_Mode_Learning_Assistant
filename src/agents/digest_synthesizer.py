@@ -7,9 +7,10 @@ Parallel batch synthesis via ThreadPoolExecutor.
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from src.utils.config import settings
+from src.utils.tracing import openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,7 @@ class DigestSynthesizer:
     def __init__(self):
         self._client = None
         if settings.OPENAI_API_KEY:
-            from openai import OpenAI
-            self._client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            self._client = openai_client()
 
     def synthesize_batch(self, items: List[Dict]) -> List[Dict]:
         """

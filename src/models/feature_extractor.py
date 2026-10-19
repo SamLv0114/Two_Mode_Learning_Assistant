@@ -1,9 +1,5 @@
 """
-Feature extraction for ranking models.
-
-Papers only — the Article subsystem is retired (superseded by What's Hot),
-nothing produces new UserArticleRecommendation rows anymore, so this no
-longer needs to branch on item_type.
+Feature extraction for the paper ranking models.
 """
 from typing import List, Dict, Optional
 from datetime import datetime, timezone

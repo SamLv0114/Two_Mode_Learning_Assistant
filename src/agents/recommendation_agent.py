@@ -1,5 +1,5 @@
 """
-RecommendationAgent: fetches and presents personalized paper/article recommendations.
+RecommendationAgent: fetches and presents personalized paper recommendations.
 """
 from src.agents.base_agent import BaseAgent
 from src.agents.tools import GET_PERSONALIZED_FEED, SEARCH_KNOWLEDGE_BASE
@@ -11,7 +11,7 @@ class RecommendationAgent(BaseAgent):
     system_prompt = """\
 You are a personalized research discovery assistant for a researcher focused on deep learning, LLMs, and AI agents.
 
-Your role: Help the user find papers and articles worth reading.
+Your role: Help the user find papers worth reading.
 You have access to their personalized feed and the knowledge base search.
 
 Guidelines:

@@ -5,7 +5,6 @@ Stage 1 (keyword): fast, deterministic, handles obvious cases
 Stage 2 (embedding): semantic cosine similarity against labeled examples
 Stage 3 (LLM): GPT-4o-mini classification for ambiguous messages
 """
-import json
 import logging
 import re
 from enum import Enum
@@ -13,7 +12,12 @@ from typing import Tuple, List, Dict, Optional
 
 import numpy as np
 
+from pydantic import BaseModel, field_validator
+
+from src.agents.core.structured import structured_call
 from src.utils.config import settings
+from src.utils.llm_usage import model_for
+from src.utils.tracing import openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +102,17 @@ INTENT_EXAMPLES: Dict[str, List[str]] = {
 }
 
 
+class IntentClassification(BaseModel):
+    """Stage 3's reply. The enum keeps the model to the four intents the router knows."""
+    intent: Intent
+    confidence: float
+
+    @field_validator("confidence")
+    @classmethod
+    def _clamp(cls, value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+
 class IntentRecognizer:
     """
     Three-stage hybrid intent classifier.
@@ -109,8 +124,7 @@ class IntentRecognizer:
         self._example_embeddings: Optional[Dict[str, np.ndarray]] = None
         self._openai_client = None
         if settings.OPENAI_API_KEY:
-            import openai
-            self._openai_client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+            self._openai_client = openai_client()
 
     # ── Model access ──────────────────────────────────────────────────────────
 
@@ -216,23 +230,16 @@ class IntentRecognizer:
             '- document_management: asking about uploaded documents\n'
             '- general_chat: greetings, meta-questions, off-topic\n\n'
             f'Message: "{text}"\n\n'
-            'Reply with JSON only: {"intent": "<category>", "confidence": <0.0-1.0>}'
+            'Give the intent and your confidence from 0.0 to 1.0.'
         )
         try:
-            resp = self._openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+            result = structured_call(
+                self._openai_client, IntentClassification, task="intent",
+                model=model_for("intent"), max_tokens=60,
                 messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=60,
-                response_format={"type": "json_object"},
             )
-            data = json.loads(resp.choices[0].message.content)
-            intent = data.get("intent", Intent.GENERAL_CHAT)
-            confidence = float(data.get("confidence", 0.5))
-            valid = {i.value for i in Intent}
-            if intent not in valid:
-                intent = Intent.GENERAL_CHAT
-            return intent, confidence
-        except Exception as e:
+            return result.intent.value, result.confidence
+        except Exception as e:  # invalid after repair, API error, or budget spent
             logger.warning(f"LLM intent classification failed: {e}")
             return Intent.GENERAL_CHAT, 0.5
 

@@ -14,16 +14,17 @@ Usage:
     agent = ResearchAgent()
     aware = ToolAwareAgent(agent, user_id=user_id, session_id=session_id, redis_client=redis)
     result = aware.run(message, history, context)
-    trace = aware.get_trace()   # list of ToolTraceEntry dicts
+    trace = ToolAwareAgent.load_trace(user_id, session_id, redis)   # list of ToolTraceEntry dicts
 """
 import json
 import logging
 import time
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List
 
 from src.agents.base_agent import AgentResult, BaseAgent
+from src.utils.tracing import annotate, stream_summary, traceable
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ class ToolTraceEntry:
     duration_ms: int
     timestamp: float = field(default_factory=time.time)
 
+
+
+def _turn_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Trace the question and how much history was sent, never the request context (DB session, user)."""
+    return {"message": inputs.get("message"), "history_messages": len(inputs.get("conversation_history") or [])}
 
 class ToolAwareAgent:
     """
@@ -60,7 +66,6 @@ class ToolAwareAgent:
         self.user_id = user_id
         self.session_id = session_id
         self.redis = redis_client
-        self._trace: List[ToolTraceEntry] = []
 
         # Expose inner agent's name for router compatibility
         self.name = agent.name
@@ -93,7 +98,6 @@ class ToolAwareAgent:
             result_preview=json.dumps(result)[:250],
             duration_ms=duration_ms,
         )
-        self._trace.append(entry)
         self._persist(entry)
         logger.debug(
             f"[ToolAwareAgent] {self._inner.name}.{tool_name} "
@@ -118,20 +122,29 @@ class ToolAwareAgent:
 
     # ── Delegation ────────────────────────────────────────────────────────────
 
+    def _annotate(self, context: Dict[str, Any]) -> None:
+        annotate(name=f"agent_chat:{getattr(self._inner, 'name', type(self._inner).__name__)}",
+                 tags=["agent-chat"], user_id=self.user_id, session_id=self.session_id,
+                 resumed=bool(context.get("resume_run_id")) or None)
+
+    @traceable(run_type="chain", name="agent_chat", process_inputs=_turn_inputs)
     def run(
         self,
         message: str,
         conversation_history: List[Dict],
         context: Dict[str, Any],
     ) -> AgentResult:
+        self._annotate(context)
         return self._inner.run(message, conversation_history, self._request_context(context))
 
+    @traceable(run_type="chain", name="agent_chat", process_inputs=_turn_inputs, reduce_fn=stream_summary)
     def stream(
         self,
         message: str,
         conversation_history: List[Dict],
         context: Dict[str, Any],
     ) -> Generator:
+        self._annotate(context)
         request_context = self._request_context(context)
         with closing(self._inner.stream(message, conversation_history, request_context)) as events:
             for event in events:
@@ -142,10 +155,6 @@ class ToolAwareAgent:
                 yield event
 
     # ── Trace access ──────────────────────────────────────────────────────────
-
-    def get_trace(self) -> List[Dict]:
-        """Return in-memory trace as plain dicts."""
-        return [asdict(e) for e in self._trace]
 
     @staticmethod
     def load_trace(user_id: int, session_id: str, redis_client) -> List[Dict]:

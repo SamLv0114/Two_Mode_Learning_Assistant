@@ -11,9 +11,7 @@ from src.schemas.user import (
 )
 from src.schemas.feed import (
     FeedRequest,
-    FeedResponse,
     PaperResponse,
-    ArticleResponse,
 )
 from src.schemas.interaction import (
     InteractionCreate,
@@ -29,9 +27,7 @@ __all__ = [
     "Token",
     "TokenPayload",
     "FeedRequest",
-    "FeedResponse",
     "PaperResponse",
-    "ArticleResponse",
     "InteractionCreate",
     "InteractionResponse",
     "InteractionStats",

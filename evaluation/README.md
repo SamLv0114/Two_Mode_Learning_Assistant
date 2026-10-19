@@ -241,3 +241,62 @@ judge 的人工一致性抽样可放在
 还需维护者提供名为 `eval-corpus-v1` 的 GitHub Release，其中
 `chroma-snapshot.tar.zst` 解压后直接包含 Chroma 数据库及索引文件，才会运行
 生成与轨迹全量评测。没有密钥、快照或人工标注时，相应指标必须标为未测。
+
+---
+
+## 7. LLM 裁判校准（judge_calibration）
+
+`runners/run_judge_calibration.py` 检验 CriticAgent 的 groundedness 分数是否与确定性基准一致。
+ReflectionAgent 依据这个分数决定是否重答，LLMJudge 也用它报告答案质量，所以它本身必须先被验证。
+
+用例从真实论文摘要构造，金标准由构造方式决定，不经过任何模型：
+
+| 构造方式 | 做法 | 金标准 |
+|---|---|---|
+| 原句 | 从裁判可见的证据窗口（前 700 字符）里取一个完整句子 | 有依据 |
+| 改数字 | 把这句话中的一个数字改成 3x+7 | 无依据 |
+| 加否定 | 在第一个助动词后插入 not | 无依据 |
+| 他文句子 | 换成另一篇论文摘要里的句子 | 无依据 |
+
+指标：准确率、Cohen's kappa、误放率（无依据被判为有依据，按构造方式分开）、误杀率、
+阈值扫描，以及同一用例重复打分的前后一致率（裁判自身的稳定性）。
+
+```bash
+python evaluation/runners/run_judge_calibration.py --papers 60 --repeats 2   # 约 $0.04，gpt-4o-mini
+```
+
+用例构造和指标计算是纯函数，`tests/test_judge_calibration.py` 用假裁判离线测试。
+
+---
+
+## 8. Coding Agent 方法知识库（method_notes、method_notes_ab）
+
+`src/agents/method_notes/` 为 11 类常见方法（LoRA、注意力、扩散模型、策略梯度强化学习、偏好优化、对比学习、
+知识蒸馏、VAE、混合专家、量化、图神经网络）各写了一份实现要点：论文常没写清的选择、常见实现错误、可做的自检。
+按论文标题、方法名和学习目标做关键词匹配，确定性地选出最多 2 类，分别注入方法评估、代码生成和代码审查的 prompt。
+
+- `runners/run_method_notes_eval.py`：选择准确率，不调用模型、零成本，在默认套件里，也是
+  `tests/test_method_notes.py` 的回归门禁（精确率不低于 0.90，召回率不低于 0.80）。评测集
+  `datasets/method_notes_selection.jsonl` 共 75 篇真实论文，标注在看过选择器输出后写成，**待人工复核**。
+- `runners/run_method_notes_ab.py`：加 / 不加知识，对真实论文走一遍评估、生成、审查和修订，保存程序供人工阅读，
+  约 $0.03，不在默认套件里。结论见 `results/2026-10-16_method_notes_ab.md`：知识库稳定改善了向学习者确认方案的
+  问题，但没有可靠地提高代码正确性。
+
+
+---
+
+## 9. 推荐系统（long_abstract、citation_feed、feed_persona_ab）
+
+都不需要用户数据，都不在默认套件里（会调用模型或外部接口）。
+
+- `runners/run_long_abstract_eval.py`：长摘要分段平均嵌入 vs 截断嵌入。对超过 256 token 的摘要，用 gpt-4o-mini
+  把开头一句和截断点之后的一句改写成检索问题，在内存索引里比较两种向量的 Recall@k 和 MRR。问题缓存在
+  `datasets/long_abstract_questions.jsonl`，重跑免费。
+- `runners/run_citation_feed_eval.py`：引用代理。测试论文的较早参考文献当作“钉选论文”，发表前 9 个月内引用的
+  新论文当作 gold（作者写作期间找到并用上的新工作），比较内容召回、引用图原始顺序、两路合并、模型逐篇判断四个阶段
+  的 Top10 命中。用例缓存在 `datasets/citation_feed_cases.jsonl`，重跑只花判断的钱（约 $0.05）。
+  第一版用全部参考文献作 gold，结果全为 0：引用图推荐只返回新论文，而参考文献大多是旧论文，方向相反。
+  按年龄切分后仍然很稀疏（各候选池只覆盖 1–4% 的 gold），只能作方向性参考。
+- `runners/run_feed_persona_ab.py`：10 个研究者画像（`datasets/feed_personas.json`），分别用旧路径（拿到相同的
+  兴趣文本）和画像路径各生成 5 篇，gpt-4o-mini 盲评：只看标题和摘要，逐篇判断是否值得读，再选更好的一份；
+  每对按两种顺序各评一次，结论一致才算胜。评审模型与画像路径内部的判断是同一个模型，可能偏向后者。

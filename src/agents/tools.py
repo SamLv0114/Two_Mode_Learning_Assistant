@@ -17,47 +17,20 @@ Feed access:
   re-rank — the pipeline is the single authority on what a user should read, so
   the chat answer and the Daily Feed tab always show the same thing.
 """
-import json
 import logging
 from typing import Dict, Any, List
+
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 
 # ── Multi-query expansion helper ──────────────────────────────────────────────
 
-# Forced function call, not a prompt instruction — a soft "Return ONLY JSON"
-# ask occasionally comes back with a markdown fence or a leading sentence,
-# which broke json.loads() silently (caught below, degrading to [query] with
-# no visible error). Named required fields also remove the need to guess
-# whether the model returned 2 items, 1, or a dict. This schema is private to
-# this function — not registered in build_default_registry() — because
-# nothing ever chooses whether to call it; it isn't an agent-invokable action,
-# just a formatting constraint on this one call.
-_EXPAND_QUERY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "provide_query_variants",
-        "description": (
-            "Provide 2 short, semantically diverse search query variants, each "
-            "approaching the topic from a different angle (different keywords, "
-            "synonyms, or narrower scope)."
-        ),
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "variant_1": {"type": "string", "description": "First alternate phrasing"},
-                "variant_2": {
-                    "type": "string",
-                    "description": "Second alternate phrasing, from a different angle than variant_1",
-                },
-            },
-            "required": ["variant_1", "variant_2"],
-            "additionalProperties": False,
-        },
-    },
-}
+class QueryVariants(BaseModel):
+    """Two rephrasings for multi-query retrieval; schema-checked so a fenced or chatty reply cannot slip through."""
+    variant_1: str = Field(description="First alternate phrasing")
+    variant_2: str = Field(description="Second alternate phrasing, from a different angle than variant_1")
 
 
 def _expand_query(query: str) -> List[str]:
@@ -66,22 +39,19 @@ def _expand_query(query: str) -> List[str]:
     Returns [original, variant1, variant2] — falls back to [original] on failure.
     """
     try:
-        from openai import OpenAI
-        from src.utils.config import settings
+        from src.agents.core.structured import structured_call
+        from src.utils.llm_usage import model_for
+        from src.utils.tracing import openai_client
 
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"Query: {query}"}],
-            max_tokens=128,
-            temperature=0.4,
-            tools=[_EXPAND_QUERY_TOOL],
-            tool_choice={"type": "function", "function": {"name": "provide_query_variants"}},
+        variants = structured_call(
+            openai_client(), QueryVariants, task="query_expansion", model=model_for("query_expansion"),
+            max_tokens=128, temperature=0.4,
+            messages=[{"role": "system", "content": "Provide 2 short, semantically diverse search query variants, "
+                                                    "each approaching the topic from a different angle (different "
+                                                    "keywords, synonyms, or narrower scope)."},
+                      {"role": "user", "content": f"Query: {query}"}],
         )
-        call = resp.choices[0].message.tool_calls[0]
-        args = json.loads(call.function.arguments)
-        variants = [args["variant_1"], args["variant_2"]]
-        return [query] + variants
+        return [query, variants.variant_1, variants.variant_2]
     except Exception as e:
         logger.debug(f"_expand_query failed: {e}")
     return [query]
@@ -94,8 +64,8 @@ SEARCH_KNOWLEDGE_BASE = {
     "function": {
         "name": "search_knowledge_base",
         "description": (
-            "Search the user's knowledge base (research papers, tech articles, "
-            "and uploaded documents) using semantic vector search. "
+            "Search the user's knowledge base (research papers and uploaded documents) "
+            "using semantic vector search. "
             "Use this whenever the user asks about a concept, paper, or topic."
         ),
         "parameters": {
@@ -112,7 +82,7 @@ SEARCH_KNOWLEDGE_BASE = {
                 },
                 "filter_type": {
                     "type": "string",
-                    "enum": ["paper", "article", "user_doc"],
+                    "enum": ["paper", "user_doc"],
                     "description": "Optional: restrict to a specific content type",
                 },
             },
@@ -335,6 +305,7 @@ def _exec_search_knowledge_base(args: Dict[str, Any], context: Dict) -> Dict:
                     "content": (r.get("metadata", {}).get("parent_text") or r.get("document", ""))[:1200],
                     "title": r.get("metadata", {}).get("title", "Unknown"),
                     "type": r.get("metadata", {}).get("type", "unknown"),
+                    "arxiv_id": r.get("metadata", {}).get("paper_id", ""),
                     "url": r.get("metadata", {}).get("url", ""),
                 }
                 for r in top
@@ -488,9 +459,10 @@ def _exec_fetch_full_paper(args: Dict[str, Any], context: Dict) -> Dict:
         arxiv_id = args["arxiv_id"].strip()
         query = args["query"]
         n_results = min(args.get("n_results", 5), 10)
+        max_chars = max(100, min(int(args.get("max_chars", 800)), 1600))
 
-        paper = db.query(Paper).filter(Paper.arxiv_id == arxiv_id).first()
-        title = paper.title if paper else arxiv_id
+        paper = db.query(Paper).filter(Paper.arxiv_id == arxiv_id).first() if db is not None else None
+        title = paper.title if paper else context.get("paper_title") or arxiv_id
         pdf_url = (paper.pdf_url if paper else None) or f"https://arxiv.org/pdf/{arxiv_id}"
 
         if not embedding_manager.has_paper_fulltext(arxiv_id):
@@ -513,7 +485,7 @@ def _exec_fetch_full_paper(args: Dict[str, Any], context: Dict) -> Dict:
         return {
             "results": [
                 {
-                    "content": (h.get("metadata", {}).get("parent_text") or h.get("document", ""))[:800],
+                    "content": (h.get("metadata", {}).get("parent_text") or h.get("document", ""))[:max_chars],
                     "chunk_index": h.get("metadata", {}).get("chunk_index"),
                 }
                 for h in hits

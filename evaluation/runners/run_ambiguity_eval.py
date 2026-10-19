@@ -117,7 +117,7 @@ def main() -> None:
         "dataset": f"ambiguity.jsonl ({n} underspecified queries)",
         "corpus_snapshot": "prod 2026-09-19",
         "labelling": "gpt-4o-mini, 原始回答全文见附录",
-        "pricing": "evaluation/pricing.json (2026-09-26 snapshot; estimated, not invoice)",
+        "pricing": "src/utils/model_prices.json (2026-09-26 snapshot; estimated, not invoice)",
     })]
 
     parts.append(f"""

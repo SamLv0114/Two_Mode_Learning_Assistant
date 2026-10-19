@@ -5,9 +5,8 @@ from typing import Generator, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-from jose import JWTError
 
-from src.database.models import get_db, User, UserInteraction
+from src.database.models import get_db, User
 from src.api.security import decode_token
 from src.models.embeddings import EmbeddingManager
 
@@ -86,38 +85,6 @@ async def get_current_user(
     return user
 
 
-async def get_current_user_optional(
-    token: Optional[str] = Depends(oauth2_scheme),
-    db: Session = Depends(get_db_session)
-) -> Optional[User]:
-    """
-    Get the current user if authenticated, otherwise return None
-
-    Useful for endpoints that work with or without authentication.
-    """
-    if not token:
-        return None
-
-    payload = decode_token(token)
-    if payload is None or payload.get("type") != "access":
-        return None
-
-    user_id_str = payload.get("sub")
-    if user_id_str is None:
-        return None
-
-    try:
-        user_id = int(user_id_str)
-    except (TypeError, ValueError):
-        return None
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None or not user.is_active:
-        return None
-
-    return user
-
-
 async def get_current_superuser(
     current_user: User = Depends(get_current_user)
 ) -> User:
@@ -146,19 +113,3 @@ def get_embedding_manager() -> EmbeddingManager:
     if _embedding_manager is None:
         _embedding_manager = EmbeddingManager()
     return _embedding_manager
-
-
-def get_user_interaction_count(user_id: int, db: Session) -> int:
-    """
-    Get the total number of interactions for a user
-
-    Args:
-        user_id: User ID
-        db: Database session
-
-    Returns:
-        Number of interactions
-    """
-    return db.query(UserInteraction).filter(
-        UserInteraction.user_id == user_id
-    ).count()

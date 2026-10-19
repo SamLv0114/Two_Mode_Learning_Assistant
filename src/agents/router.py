@@ -88,6 +88,12 @@ def _is_complex_query(message: str) -> bool:
     """
     if _contains_phrase(message, _COMPLEX_KEYWORDS):
         return True
+    # A paper title may contain "and", and instructions to cite a source can
+    # make a one-fact lookup long. Neither makes it a multi-part research task.
+    if (re.search(r"\b(?:arxiv:)?\d{4}\.\d{4,5}(?:v\d+)?\b", message, re.I)
+            and re.search(r"\b(?:submission|submitted|publication|published)\s+date\b", message, re.I)
+            and message.count("?") <= 1 and ";" not in message):
+        return False
     # Long *and* multi-clause: several sentences or an explicit conjunction of asks.
     if len(message) >= _COMPLEX_LENGTH:
         clause_markers = message.count("?") + message.count(";") + message.count(" and ")
@@ -103,7 +109,7 @@ class GeneralAgent(BaseAgent):
 You are a helpful assistant for a platform focused on deep learning, LLMs, and AI agents.
 
 This platform helps researchers and engineers working in this space:
-- Discover personalized paper and article recommendations
+- Discover personalized paper recommendations
 - Ask questions about DL/LLM/agent concepts (RAG-powered Q&A)
 - Manage an uploaded document knowledge base
 

@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import toast from 'react-hot-toast';
+import { errorMessage } from '@/lib/api';
 
 const FOCUS_OPTIONS = ['DL', 'LLM', 'Agent', 'ML', 'AI', 'NLP', 'CV'];
 // Kept in sync with the backend fallback in settings.USER_INTERESTS
@@ -70,8 +71,8 @@ export default function RegisterPage() {
       });
       toast.success('Account created! Welcome to ResearchMate.');
       router.push('/dashboard');
-    } catch (error: any) {
-      setErrorMsg(error.response?.data?.detail || 'Registration failed');
+    } catch (error) {
+      setErrorMsg(errorMessage(error, 'Registration failed'));
     } finally {
       setIsSubmitting(false);
     }

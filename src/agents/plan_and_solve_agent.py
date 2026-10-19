@@ -20,21 +20,32 @@ Two phases:
 The streaming path emits the same plan/task_started/task_done/token/done
 events as DeepResearchAgent, so the frontend renders both identically.
 """
-import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Generator, List
 
+from pydantic import BaseModel, Field
+
 from src.agents.base_agent import AgentResult, BaseAgent
+from src.agents.core.structured import structured_call
 from src.agents.source_safety import SOURCE_POLICY, untrusted_block
-from src.agents.tools import SEARCH_KNOWLEDGE_BASE, SEARCH_WEB, execute_tool
-from src.utils.config import settings
+from src.agents.tools import execute_tool
+from src.utils.llm_usage import model_for
 
 logger = logging.getLogger(__name__)
 
 PLANNER_MODEL = "gpt-4o"
 SOLVER_MODEL = "gpt-4o-mini"
+
+
+class PlannedStep(BaseModel):
+    step: str = Field(description="What to analyse in this step")
+    focus: str = Field(description="Analytical lens, e.g. performance, cost, use-case, trade-offs")
+
+
+class AnalysisPlan(BaseModel):
+    steps: List[PlannedStep]
 
 
 @dataclass
@@ -64,15 +75,7 @@ Each step should be a specific analytical action: define, compare, evaluate, ana
 
 Question: {question}
 
-Return ONLY a JSON array (no markdown):
-[
-  {{
-    "number": 1,
-    "step": "<what to analyse in this step>",
-    "focus": "<analytical lens — e.g. performance, cost, use-case, trade-offs>"
-  }},
-  ...
-]"""
+For each step give what to analyse and its analytical lens (e.g. performance, cost, use-case, trade-offs)."""
 
     _SOLVE_PROMPT = """\
 You are executing step {step_num} of {total} in a structured analysis.
@@ -115,21 +118,16 @@ Be precise and directly answer the original question."""
     def _generate_plan(self, question: str) -> List[AnalysisStep]:
         prompt = self._PLAN_PROMPT.format(question=question[:800])
         try:
-            resp = self.client.chat.completions.create(
-                model=PLANNER_MODEL,
+            # Was "Return ONLY a JSON array" plus json.loads: a fenced or chatty reply fell back silently.
+            plan = structured_call(
+                self.client, AnalysisPlan, task="plan_and_solve_plan",
+                model=model_for("plan_and_solve_planner", PLANNER_MODEL), max_tokens=512, temperature=0.2,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=512,
-                temperature=0.2,
             )
-            raw = resp.choices[0].message.content.strip()
-            data = json.loads(raw)
-            steps = []
-            for item in data[:5]:
-                steps.append(AnalysisStep(
-                    number=int(item.get("number", len(steps) + 1)),
-                    step=str(item.get("step", "")),
-                    focus=str(item.get("focus", "")),
-                ))
+            steps = [AnalysisStep(number=i, step=item.step, focus=item.focus)
+                     for i, item in enumerate(plan.steps[:5], 1) if item.step.strip()]
+            if not steps:
+                raise ValueError("empty plan")
             logger.info(f"[PlanAndSolveAgent] {len(steps)}-step plan for: {question[:60]}...")
             return steps
         except Exception as e:
@@ -178,7 +176,7 @@ Be precise and directly answer the original question."""
 
         try:
             resp = self.client.chat.completions.create(
-                model=SOLVER_MODEL,
+                model=model_for("plan_and_solve_solver", SOLVER_MODEL),
                 messages=[
                     {"role": "system", "content": self.system_prompt + "\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": prompt},
@@ -199,7 +197,7 @@ Be precise and directly answer the original question."""
         )
         try:
             resp = self.client.chat.completions.create(
-                model=PLANNER_MODEL,
+                model=model_for("plan_and_solve_planner", PLANNER_MODEL),
                 messages=[
                     {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents.\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": self._SYNTHESIZE_PROMPT.format(
@@ -283,7 +281,7 @@ Be precise and directly answer the original question."""
         )
         try:
             stream = self.client.chat.completions.create(
-                model=PLANNER_MODEL,
+                model=model_for("plan_and_solve_planner", PLANNER_MODEL),
                 messages=[
                     {"role": "system", "content": "You are a senior research writer covering deep learning, LLMs, and AI agents.\n\n" + SOURCE_POLICY},
                     {"role": "user", "content": self._SYNTHESIZE_PROMPT.format(

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi import Depends, FastAPI, Header
+from fastapi import FastAPI, Header
 from fastapi.testclient import TestClient
 
 from src.agents.base_agent import AgentResult, BaseAgent
@@ -111,7 +111,7 @@ class TraceIsolationTests(unittest.TestCase):
 
         app.dependency_overrides[get_current_user] = user
         app.include_router(chat.router)
-        with patch.object(chat, "_get_redis", return_value=redis), TestClient(app) as client:
+        with patch.object(chat, "get_redis", return_value=redis), TestClient(app) as client:
             owner = client.get("/chat/trace/known", headers={"x-test-user": "1"}).json()
             other = client.get("/chat/trace/known", headers={"x-test-user": "2"}).json()
         self.assertEqual(owner["count"], 1)

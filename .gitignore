@@ -83,6 +83,16 @@ plan.txt
 chroma_db/
 *.chroma
 
+# Local recovery and personal preparation material
+recovered-vscode-chat/
+interview_prep/
+
+# Interrupted model-evaluation checkpoints
+*.partial.jsonl
+
 # Local project context for Claude Code — stays out of the public repo,
 # still loads fine every session since it's kept at the project root.
 CLAUDE.md
+
+# Internal notes and design docs: kept locally, not published
+docs/

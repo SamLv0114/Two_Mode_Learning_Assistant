@@ -8,7 +8,7 @@ from datetime import datetime
 
 class InteractionCreate(BaseModel):
     """Schema for creating a user interaction"""
-    item_type: Literal["paper", "article"]
+    item_type: Literal["paper"] = "paper"
     item_id: int = Field(..., gt=0)
     interaction_type: Literal["viewed", "saved", "dismissed"]
 

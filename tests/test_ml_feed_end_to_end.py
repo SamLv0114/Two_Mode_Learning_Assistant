@@ -108,23 +108,21 @@ class MLFeedEndToEndTests(unittest.TestCase):
         pipeline.trainer = trainer
         pipeline.feature_extractor = SimpleNamespace(extract_features=self._features)
         pipeline.embedding_manager = SimpleNamespace(add_paper=lambda *_args: None)
-        pipeline._get_recent_item_texts = lambda _kind: []
+        pipeline._get_recent_item_texts = lambda: []
         pipeline._ranking_source = "heuristic"
         pipeline._ranking_fallback_reason = None
         candidates = [pipeline._db_paper_to_paperdata(p) for p in self.papers[50:55]]
-        selected = pipeline._rank_and_select(candidates, 5, "paper", [], use_ml=True)
+        selected = pipeline._rank_and_select(candidates, 5, [], use_ml=True)
         self.assertEqual(pipeline._ranking_source, "ml")
-        pipeline._store_results(selected, [], mode="latest")
-        output = pipeline._format_output(selected, [])
-        self.assertTrue(output["used_ml_ranking"])
-        self.assertTrue(pipeline._todays_feed()["used_ml_ranking"])
+        pipeline._store_results(selected, mode="latest")
+        self.assertTrue(pipeline._stored_feed()["used_ml_ranking"])
 
         class BrokenModel:
             def predict(self, _features):
                 raise RuntimeError("predict unavailable")
 
         recommender.model = BrokenModel()
-        pipeline._rank_and_select(candidates, 5, "paper", [], use_ml=True)
+        pipeline._rank_and_select(candidates, 5, [], use_ml=True)
         self.assertEqual(pipeline._ranking_source, "heuristic")
         self.assertIn("prediction_failed", pipeline._ranking_fallback_reason)
 
@@ -210,12 +208,14 @@ class MLFeedEndToEndTests(unittest.TestCase):
         trainer = UserModelTrainer(self.user_id, self.db, SimpleNamespace())
         trainer._get_recent_texts = lambda: []
         trainer.feature_extractor = SimpleNamespace(extract_features=self._features)
+        _, _, temporal_groups = trainer.generate_ranking_data(min_interactions=50)
+        expected_training_size = sum(temporal_groups[:max(1, int(len(temporal_groups) * 0.8))])
         recommender = UserRecommender(self.user_id, self.db)
         ranker = TrackingRanker()
         recommender.model = ranker
         recommender.model_type = "ltr"
         self.assertTrue(trainer.retrain_model(recommender, min_interactions=50))
-        self.assertEqual(ranker.fit_sizes, [50, 100])
+        self.assertEqual(ranker.fit_sizes, [expected_training_size, 100])
         self.assertEqual(ranker.sample_count, 100)
         state = self.db.query(UserModelState).filter_by(user_id=self.user_id).one()
         self.assertEqual(state.training_sample_count, 100)

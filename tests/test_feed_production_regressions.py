@@ -64,9 +64,9 @@ class FeedProductionRegressionTests(unittest.TestCase):
         pipeline.feature_extractor = SimpleNamespace(extract_features=lambda *args, **kwargs: {})
         pipeline.embedding_manager = object()
         pipeline.recommender = SimpleNamespace(rank_items=lambda items, features: [(item, np.float64(0.42))])
-        pipeline._get_recent_item_texts = lambda item_type: []
+        pipeline._get_recent_item_texts = lambda: []
 
-        selected = pipeline._rank_and_select([item], 1, "paper", [], use_ml=True)
+        selected = pipeline._rank_and_select([item], 1, [], use_ml=True)
 
         self.assertEqual(selected, [item])
         self.assertIs(type(item.relevance_score), float)
@@ -90,7 +90,7 @@ class FeedProductionRegressionTests(unittest.TestCase):
             citation_count=10, personalized_summary="summary", relevance_score=np.float64(0.42),
         )
 
-        pipeline._store_results([item], [], mode="recommended", time_window_days=7)
+        pipeline._store_results([item], mode="recommended", time_window_days=7)
 
         recommendation = next(row for row in added if isinstance(row, UserPaperRecommendation))
         self.assertIs(type(recommendation.relevance_score), float)
@@ -106,7 +106,7 @@ class FeedProductionRegressionTests(unittest.TestCase):
         pipeline = DailyFeedPipeline.__new__(DailyFeedPipeline)
         pipeline.db = SimpleNamespace(query=lambda *args: next(queries))
         pipeline.user_id = 1
-        pipeline._apply_mmr = lambda scored, top_k, item_type: scored[:top_k]
+        pipeline._apply_mmr = lambda scored, top_k: scored[:top_k]
 
         seeds = pipeline.get_coldstart_seeds(n=1)
 

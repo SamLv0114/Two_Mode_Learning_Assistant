@@ -1,5 +1,5 @@
 """
-Database models for storing papers, articles, users, and interactions
+Database models for papers, users, their interactions and per-user recommendation state
 """
 import logging
 from sqlalchemy import (
@@ -9,7 +9,6 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, timezone
-from typing import Optional
 from src.utils.config import settings
 
 logger = logging.getLogger(__name__)
@@ -82,6 +81,82 @@ class ResearchRun(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
+class PracticeRun(Base):
+    """Owner and lifecycle metadata; LangGraph owns node state."""
+    __tablename__ = "practice_runs"
+
+    run_id = Column(String(36), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind = Column(String(20), nullable=False)
+    source = Column(String(500), nullable=False)
+    request_json = Column(Text, nullable=True)
+    status = Column(String(24), nullable=False, default="queued")
+    stage = Column(String(80), nullable=False, default="queued")
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    error = Column(String(500), nullable=True)
+    resume_json = Column(Text, nullable=True)   # the learner's plan decision for a run waiting at its interrupt
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class PracticeEvent(Base):
+    """Progress events a Coding Agent run emits, for the live activity feed and its history."""
+    __tablename__ = "code_lab_events"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(36), ForeignKey("practice_runs.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    kind = Column(String(40), nullable=False)
+    payload_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class PracticeExecution(Base):
+    """User-edited paper code execution, separate from the generated graph state."""
+    __tablename__ = "practice_executions"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(36), ForeignKey("practice_runs.run_id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    idempotency_key = Column(String(80), nullable=False)
+    code = Column(Text, nullable=False)
+    status = Column(String(24), nullable=False, default="running")
+    result_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (Index("ix_practice_execution_dedupe", "run_id", "idempotency_key", unique=True),)
+
+
+class PracticeMessage(Base):
+    """User-owned discussion turn grounded in one paper or repository run."""
+    __tablename__ = "code_lab_messages"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(String(36), ForeignKey("practice_runs.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    idempotency_key = Column(String(80), nullable=False)
+    prompt = Column(Text, nullable=False)
+    response = Column(Text, nullable=True)
+    guided_question = Column(Text, nullable=True)
+    trace_json = Column(Text, nullable=True)       # repository answers: tool calls the agent made
+    citations_json = Column(Text, nullable=True)   # repository answers: checked [path:start-end] references
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (Index("ix_code_lab_message_dedupe", "run_id", "idempotency_key", unique=True),)
+
+
+class PracticeComparison(Base):
+    """One owner-scoped comparison for a pinned repository snapshot."""
+    __tablename__ = "code_lab_comparisons"
+
+    run_id = Column(String(36), ForeignKey("practice_runs.run_id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    result_json = Column(Text, nullable=True)
+    status = Column(String(24), nullable=False, default="queued")
+    error = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class UserModelState(Base):
     """Store per-user ML model and heuristic weights"""
     __tablename__ = "user_model_states"
@@ -108,6 +183,8 @@ class UserModelState(Base):
     train_mrr = Column(Float, nullable=True)
     val_ndcg = Column(Float, nullable=True)
     val_mrr = Column(Float, nullable=True)
+    # The heuristic's NDCG@10 on the same held-out split; the model serves feeds only above it.
+    val_baseline_ndcg = Column(Float, nullable=True)
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -151,38 +228,13 @@ class Paper(Base):
         return f"<Paper(arxiv_id='{self.arxiv_id}', title='{self.title[:50]}...')>"
 
 
-class Article(Base):
-    """Tech article model"""
-    __tablename__ = "articles"
-
-    id = Column(Integer, primary_key=True, index=True)
-    source = Column(String(50), index=True)  # hackernews, devto, medium, etc.
-    source_id = Column(String(100), index=True)
-    title = Column(String(500), index=True)
-    url = Column(String(1000), unique=True)
-    content = Column(Text)
-    author = Column(String(255), nullable=True)
-    published_date = Column(DateTime, nullable=True)
-    upvotes = Column(Integer, default=0)
-    engagement_score = Column(Float, default=0.0)
-    relevance_score = Column(Float, default=0.0)
-    personalized_summary = Column(Text, nullable=True)
-    digest_summary = Column(Text, nullable=True)  # LLM-synthesized community digest
-    collected_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    recommended = Column(Boolean, default=False)
-    recommended_date = Column(DateTime, nullable=True)
-
-    def __repr__(self):
-        return f"<Article(source='{self.source}', title='{self.title[:50]}...')>"
-
-
 class UserInteraction(Base):
     """Track user interactions for personalization"""
     __tablename__ = "user_interactions"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    item_type = Column(String(20), nullable=False)  # "paper" or "article"
+    item_type = Column(String(20), nullable=False)  # "paper" (older rows may say "article", now retired)
     item_id = Column(Integer, nullable=False)
     interaction_type = Column(String(20), nullable=False)  # "viewed", "saved", "dismissed"
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -251,10 +303,42 @@ class UserPaperRecommendation(Base):
     feed_time_window_days = Column(Integer, nullable=True)
     ranking_source = Column(String(32), nullable=True)
     ranking_fallback_reason = Column(Text, nullable=True)
+    # JSON list of "why this paper for you" lines, built from the evidence the ranking used
+    reasons_json = Column(Text, nullable=True)
 
     __table_args__ = (
         Index('ix_user_paper_rec', 'user_id', 'paper_id', unique=True),
     )
+
+
+class UserResearchProfile(Base):
+    """
+    What the system knows about a user's research, in a form they can read and edit:
+    goal, level, what they already know, interests, preferences and seed papers, plus a
+    short natural-language summary that recommendation retrieves with. Learning progress
+    (papers implemented in the Coding Agent) and plain-language feedback update it.
+
+    List fields are JSON arrays. seed_papers_json holds {"id", "title", "year"} objects;
+    id is an arXiv id or a Semantic Scholar id, so classics outside the corpus can be seeds.
+    """
+    __tablename__ = "user_research_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    goal = Column(Text, nullable=True)
+    level = Column(String(20), nullable=True)            # beginner | intermediate | advanced
+    known_json = Column(Text, nullable=True)
+    interests_json = Column(Text, nullable=True)
+    preferences_json = Column(Text, nullable=True)       # free-text preferences, e.g. "papers with code"
+    avoid_types_json = Column(Text, nullable=True)       # paper types to demote: theory, survey, ...
+    seed_papers_json = Column(Text, nullable=True)
+    studied_json = Column(Text, nullable=True)           # papers implemented in the Coding Agent
+    feedback_json = Column(Text, nullable=True)          # recent plain-language feedback and what it changed
+    summary = Column(Text, nullable=True)
+    version = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
 
 class UserPaperImpression(Base):
@@ -279,21 +363,8 @@ class UserPaperImpression(Base):
     )
 
 
-class UserArticleRecommendation(Base):
-    """Per-user recommended articles with personalized summaries"""
-    __tablename__ = "user_article_recommendations"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    article_id = Column(Integer, ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
-    recommended_date = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
-    personalized_summary = Column(Text, nullable=True)
-    relevance_score = Column(Float, nullable=True)
-    rank = Column(Integer, nullable=True)
-
-    __table_args__ = (
-        Index('ix_user_article_rec', 'user_id', 'article_id', unique=True),
-    )
+# Retired: the Article subsystem (tables `articles`, `user_article_recommendations`), superseded by
+# What's Hot. Databases created before keep those tables unused; nothing reads or writes them.
 
 
 class UserDocument(Base):

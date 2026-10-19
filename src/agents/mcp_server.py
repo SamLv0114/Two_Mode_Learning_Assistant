@@ -49,7 +49,7 @@ def create_mcp_server(token: str, context_factory: Callable[[str], Dict] = authe
 
     @server.tool()
     def search_knowledge_base(query: str, n_results: int = 5) -> Dict:
-        """Search papers and articles visible to the authenticated user."""
+        """Search papers and the authenticated user's uploaded documents."""
         if not query.strip() or len(query) > 500:
             raise ToolError("query must contain 1–500 characters")
         context = context_factory(token)

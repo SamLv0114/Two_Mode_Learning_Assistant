@@ -2,7 +2,6 @@
 Data preprocessing utilities
 """
 from typing import List, Dict
-import io
 import re
 from bs4 import BeautifulSoup
 

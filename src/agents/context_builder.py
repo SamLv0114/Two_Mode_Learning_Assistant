@@ -16,7 +16,7 @@ Falls back to recency-based selection (last k messages) when no embedding model
 is available.
 """
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 

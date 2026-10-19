@@ -18,9 +18,10 @@ from types import SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-import openai
 
 from src.utils.config import settings
+from src.utils.llm_usage import budget_allows
+from src.utils.tracing import openai_client
 from src.agents.tools import build_default_registry
 from src.agents.context_budget import ContextBudget, OUTPUT_RESERVE
 from src.agents.source_safety import SOURCE_POLICY, untrusted_block
@@ -57,7 +58,7 @@ class BaseAgent:
     def __init__(self):
         if not settings.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY is not configured")
-        self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = openai_client()
         self.tool_call_listener: Optional[Callable] = None
         # V4: shared typed dispatch registry (stateless, built once per process)
         self.registry = build_default_registry()
@@ -80,12 +81,6 @@ class BaseAgent:
     def _cancelled(context: Dict[str, Any]) -> bool:
         event = context.get("_cancel_event")
         return event is not None and event.is_set()
-
-    def _build_system(self, context: Dict[str, Any]) -> str:
-        """Prepend UserFactMemory personalisation context if available."""
-        base = self.system_prompt
-        facts = context.get("user_facts_context", "")
-        return base + facts if facts else base
 
     def _fire_listener(
         self,
@@ -151,20 +146,27 @@ class BaseAgent:
         so the caller can emit whatever progress events it needs.
         """
         fn_name = tc.function.name
+        malformed = None
         try:
             fn_args = json.loads(tc.function.arguments)
+            if not isinstance(fn_args, dict):
+                raise TypeError("arguments must be a JSON object")
         except (json.JSONDecodeError, TypeError) as e:
+            # Not run with empty arguments: the error goes back to the model, which can call
+            # again with valid ones within the loop's iteration cap.
             logger.warning(f"[{self.name}] malformed tool arguments for {fn_name}: {e}")
-            fn_args = {}
+            fn_args, malformed = {}, str(e)
 
         tools_called.append(fn_name)
 
         t0 = time.time()
         allowed = {schema.get("function", {}).get("name") for schema in self.tool_schemas}
-        result = (
-            self.registry.execute(fn_name, fn_args, context)
-            if fn_name in allowed else {"error": f"Tool {fn_name} is not allowed for this agent"}
-        )
+        if malformed:
+            result = {"error": f"Arguments were not valid JSON ({malformed}). Call {fn_name} again with valid arguments."}
+        elif fn_name in allowed:
+            result = self.registry.execute(fn_name, fn_args, context)
+        else:
+            result = {"error": f"Tool {fn_name} is not allowed for this agent"}
         self._fire_listener(fn_name, fn_args, result, int((time.time() - t0) * 1000), context)
 
         if fn_name in self._CITING_TOOLS:
@@ -189,6 +191,22 @@ class BaseAgent:
             ),
         })
         return result
+
+    def _answer_now_if_budget_low(self, call_kwargs: Dict[str, Any], messages: List) -> None:
+        """
+        When the request's token budget only covers one more answer, take the tools away so the
+        next call answers from what the tools already returned instead of searching further.
+        """
+        if "tools" not in call_kwargs:
+            return
+        reserve = self.context_budget.count_messages(messages) + OUTPUT_RESERVE
+        if budget_allows(reserve):
+            return
+        call_kwargs.pop("tools", None)
+        call_kwargs.pop("tool_choice", None)
+        messages.append({"role": "system", "content": "The token budget for this request is nearly used up. "
+                                                      "Answer now from the tool results above; do not call tools."})
+        logger.info(f"[{self.name}] token budget low; answering without further tool calls")
 
     def run(
         self,
@@ -240,6 +258,7 @@ class BaseAgent:
                     processing_time_ms=int((time.time() - start) * 1000),
                 )
 
+            self._answer_now_if_budget_low(call_kwargs, messages)
             call_kwargs["messages"] = messages
 
         return AgentResult(
@@ -332,6 +351,7 @@ class BaseAgent:
                 yield {"type": "done", "tools_called": tools_called, "citations": citations,
                        "stop_reason": "context_budget"}
                 return
+            self._answer_now_if_budget_low(call_kwargs, messages)
             call_kwargs["messages"] = messages
 
         yield {"type": "token", "value": self._partial_reply(citations, tools_called)}

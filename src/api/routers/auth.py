@@ -1,12 +1,12 @@
 """
 Authentication endpoints
 """
-import json
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
+from src.api.demo import forbid_demo, get_demo_user, is_demo_user
 from src.database.models import User, UserInteraction, UserModelState
 from src.api.deps import get_db_session, get_current_user
 from src.api.security import (
@@ -27,24 +27,13 @@ from src.schemas.user import (
     RefreshRequest
 )
 from src.utils.config import settings
+from src.utils.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 REFRESH_JTI_PREFIX = "refresh_jti:"
-
-
-def _get_redis():
-    if not settings.REDIS_URL:
-        return None
-    try:
-        import redis
-        client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-        client.ping()
-        return client
-    except Exception:
-        return None
 
 
 def _issue_tokens(user: User, redis_client) -> tuple[str, str]:
@@ -77,7 +66,7 @@ def _issue_tokens(user: User, redis_client) -> tuple[str, str]:
 async def register(
     user_data: UserCreate,
     db: Session = Depends(get_db_session),
-    redis_client=Depends(_get_redis)
+    redis_client=Depends(get_redis)
 ):
     """
     Register a new user account
@@ -140,7 +129,7 @@ async def register(
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db_session),
-    redis_client=Depends(_get_redis)
+    redis_client=Depends(get_redis)
 ):
     """
     Login with email and password to get an access token
@@ -186,7 +175,7 @@ async def login(
 async def login_json(
     credentials: UserLogin,
     db: Session = Depends(get_db_session),
-    redis_client=Depends(_get_redis)
+    redis_client=Depends(get_redis)
 ):
     """
     Login with JSON body (alternative to form-based login)
@@ -229,7 +218,7 @@ async def login_json(
 async def refresh(
     body: RefreshRequest,
     db: Session = Depends(get_db_session),
-    redis_client=Depends(_get_redis)
+    redis_client=Depends(get_redis)
 ):
     """
     Exchange a refresh token for a new access token + refresh token pair.
@@ -325,14 +314,38 @@ async def get_current_user_profile(
         is_active=current_user.is_active,
         created_at=current_user.created_at,
         interaction_count=interaction_count,
-        model_trained=model_trained
+        model_trained=model_trained,
+        is_demo=is_demo_user(current_user),
+    )
+
+
+@router.post("/demo", response_model=Token)
+async def demo_login(
+    db: Session = Depends(get_db_session),
+    redis_client=Depends(get_redis)
+):
+    """
+    Sign in to the shared demo account, for visitors who want to look before registering.
+
+    Only when DEMO_ENABLED is on and the account has been created
+    (python -m src.jobs.seed_demo). What the account may do is limited in src/api/demo.py.
+    """
+    user = get_demo_user(db)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="The demo is not available right now")
+    access_token, refresh_token = _issue_tokens(user, redis_client)
+    return Token(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=get_token_expiry_seconds()
     )
 
 
 @router.put("/me", response_model=UserResponse)
 async def update_current_user_profile(
     user_update: UserUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session)
 ):
     """
@@ -385,7 +398,7 @@ async def update_current_user_profile(
 
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_current_user(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session)
 ):
     """

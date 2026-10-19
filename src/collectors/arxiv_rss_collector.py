@@ -80,6 +80,6 @@ class ArxivRSSCollector:
         if entry.get("published_parsed"):
             try:
                 return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         return None

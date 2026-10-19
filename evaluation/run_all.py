@@ -27,12 +27,19 @@ RUNNERS = {
     "chunking": "runners/run_chunking_eval.py",
     "context_budget": "runners/run_context_budget_eval.py",
     "cache": "runners/run_cache_eval.py",
+    "code_lab": "runners/run_code_lab_eval.py",
+    "judge_calibration": "runners/run_judge_calibration.py",
+    "method_notes": "runners/run_method_notes_eval.py",
+    "method_notes_ab": "runners/run_method_notes_ab.py",
+    "long_abstract": "runners/run_long_abstract_eval.py",
+    "citation_feed": "runners/run_citation_feed_eval.py",
+    "feed_persona_ab": "runners/run_feed_persona_ab.py",
 }
 
 # Generation and trajectory require a 50–100 case human-verified golden set.
 # They are selectable, but must not silently turn pending candidates into
 # published scores when running the existing suites by default.
-DEFAULT_RUNNERS = ["routing", "retrieval", "ambiguity", "fact_dedup", "memory_compression"]
+DEFAULT_RUNNERS = ["routing", "retrieval", "ambiguity", "fact_dedup", "memory_compression", "method_notes"]
 
 EVAL_DIR = Path(__file__).resolve().parent
 

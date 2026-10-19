@@ -11,8 +11,12 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 from openai import OpenAI
+from pydantic import BaseModel, Field
 
+from src.agents.core.structured import structured_call
 from src.utils.config import settings
+from src.utils.llm_usage import model_for
+from src.utils.tracing import openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -78,13 +82,18 @@ class ConversationMemory:
                 self.redis.delete(self._key(session_id))
                 self.redis.delete(f"chat_summary:{self.user_id}:{session_id}")
                 return
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not clear session from Redis: %s", exc)
         self._fallback.pop(self._key(session_id), None)
 
     @staticmethod
     def new_session_id() -> str:
         return str(uuid.uuid4())
+
+
+class ExtractedFacts(BaseModel):
+    facts: List[str] = Field(description="0 to 3 concise facts, each starting with 'user', "
+                                         "e.g. 'user is studying LoRA fine-tuning'; empty if nothing new was revealed")
 
 
 class UserFactMemory:
@@ -124,58 +133,34 @@ Extract 0 to 3 concise facts. Each fact must start with "user"
 (e.g. "user is studying LoRA fine-tuning"). If this exchange reveals nothing
 new and useful about the user, extract no facts."""
 
-    # Forced function call instead of a "Return JSON only" prompt instruction
-    # + json.loads — the prompt-only version silently degraded to "extracted
-    # nothing" whenever the model added a fence or a lead-in sentence, since
-    # json.loads() raised and the except below swallowed it. Private to this
-    # class, not registered as an agent-invokable tool — nothing ever chooses
-    # whether to call it, it only exists to constrain this call's output shape.
-    _EXTRACT_FACTS_TOOL = {
-        "type": "function",
-        "function": {
-            "name": "extract_user_facts",
-            "description": (
-                "Record 0 to 3 concise facts about the user extracted from this "
-                "conversation exchange, for personalizing future responses."
-            ),
-            "strict": True,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "facts": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "description": "A concise fact starting with 'user', e.g. 'user is studying LoRA fine-tuning'",
-                        },
-                        "description": "0 to 3 facts; empty if nothing new and useful was revealed",
-                    },
-                },
-                "required": ["facts"],
-                "additionalProperties": False,
-            },
-        },
-    }
 
     def __init__(self):
         self._client: Optional[OpenAI] = None
         if settings.OPENAI_API_KEY:
-            self._client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            self._client = openai_client()
 
     # ── Storage helpers ───────────────────────────────────────────────────────
 
     def _key(self, user_id: int) -> str:
         return f"user_facts:{user_id}"
 
-    def _load(self, user_id: int, redis_client) -> List[Dict]:
-        """Load facts as List[Dict]; handles backward-compat with old List[str] format."""
+    def _load(self, user_id: int, redis_client, strict: bool = False) -> List[Dict]:
+        """
+        Load facts as List[Dict]; handles backward-compat with old List[str] format.
+
+        A failed read returns [] for readers, but raises when strict: a caller
+        that merges and writes back must not mistake "unreadable" for "no
+        facts", or the write would replace everything stored with one turn's.
+        """
         raw_list = []
         if redis_client:
             try:
                 raw = redis_client.get(self._key(user_id))
                 raw_list = json.loads(raw) if raw else []
-            except Exception:
-                pass
+            except Exception as exc:
+                if strict:
+                    raise
+                logger.warning("Could not read facts for user %s: %s", user_id, exc)
         else:
             raw_list = list(self._fallback.get(user_id, []))
 
@@ -193,8 +178,8 @@ new and useful about the user, extract no facts."""
             try:
                 redis_client.setex(self._key(user_id), FACTS_TTL_SECONDS, json.dumps(facts))
                 return
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not save facts for user %s, keeping them in memory: %s", user_id, exc)
         self._fallback[user_id] = facts
 
     # Common function words stripped before computing word overlap for the
@@ -301,22 +286,12 @@ new and useful about the user, extract no facts."""
             assistant_msg=assistant_response[:800],
         )
         try:
-            response = self._client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=256,
-                temperature=0.0,
-                tools=[self._EXTRACT_FACTS_TOOL],
-                tool_choice={"type": "function", "function": {"name": "extract_user_facts"}},
+            extracted = structured_call(
+                self._client, ExtractedFacts, task="fact_extraction", model=model_for("fact_extraction"),
+                max_tokens=256, messages=[{"role": "user", "content": prompt}],
             )
-            call = response.choices[0].message.tool_calls[0]
-            args = json.loads(call.function.arguments)
-            new_facts = args.get("facts", [])
-            if not isinstance(new_facts, list):
-                return []
-            # Schema can't enforce a string-prefix pattern or a max item count
-            # under strict mode — keep these as a defensive filter, same as before.
-            new_facts = [f for f in new_facts if isinstance(f, str) and f.startswith("user")][:3]
+            # The schema cannot require a prefix or cap the count, so both stay a filter here.
+            new_facts = [f for f in extracted.facts if f.startswith("user")][:3]
         except Exception as e:
             logger.debug(f"UserFactMemory extraction failed: {e}")
             return []
@@ -328,7 +303,7 @@ new and useful about the user, extract no facts."""
         now_str = datetime.now(timezone.utc).isoformat()
         new_fact_dicts = [{"fact": f, "created_at": now_str, "negative": False} for f in new_facts]
 
-        existing = self._load(user_id, redis_client)
+        existing = self._load(user_id, redis_client, strict=True)
         merged = list(existing)
         for fd in new_fact_dicts:
             fact_text = fd["fact"]
@@ -388,6 +363,6 @@ new and useful about the user, extract no facts."""
         if redis_client:
             try:
                 redis_client.delete(self._key(user_id))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not clear facts from Redis: %s", exc)
         self._fallback.pop(user_id, None)

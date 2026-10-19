@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     RAG_TABLE_EXTRACTION_ENABLED: bool = False
     RESEARCH_EARLY_STOP_ENABLED: bool = False
     RESEARCH_MAX_SECONDS: int = 180
+    PRACTICE_ENABLED: bool = False
+    PRACTICE_WORKER_URL: Optional[str] = None
+    PRACTICE_WORKER_TOKEN: Optional[str] = None
+    # Optional read-only token for GitHub's REST API (anonymous use allows 60 requests/hour per IP).
+    GITHUB_TOKEN: Optional[str] = None
+    PRACTICE_TASK_POLL_SECONDS: float = 1.0
+    # Shared demo account behind the landing page's "Try the demo" (see src/api/demo.py).
+    # The account itself is created by `python -m src.jobs.seed_demo`.
+    DEMO_ENABLED: bool = False
+    DEMO_USER_EMAIL: str = "demo@researchmate.site"
+    DEMO_ACTIONS_PER_VISITOR_PER_DAY: int = 8    # model-backed actions per visitor address
+    DEMO_ACTIONS_TOTAL_PER_DAY: int = 150        # across all demo visitors: bounds the daily cost
     MODELS_DIR: Path = PROJECT_ROOT / "models"
 
     # API Keys
@@ -52,6 +64,33 @@ class Settings(BaseSettings):
     # LLM Settings
     LLM_PROVIDER: str = "openai"
     LLM_MODEL: str = "gpt-4o-mini"
+    # Per-task model overrides as JSON, e.g. MODEL_ROUTES={"intent": "gpt-4.1-nano"} (see
+    # llm_usage.model_for). A string, so an empty or malformed value cannot stop the app starting.
+    MODEL_ROUTES: str = ""
+    # Retried once on this model after an outage, rate limit or retired model. Off when unset.
+    LLM_FALLBACK_MODEL: Optional[str] = None
+    # Token ceilings per request; optional steps stop early so the answer still fits.
+    CHAT_TURN_TOKEN_BUDGET: int = 50_000
+    CODING_RUN_TOKEN_BUDGET: int = 150_000
+    FEED_TOKEN_BUDGET: int = 60_000
+    READING_PATH_TOKEN_BUDGET: int = 30_000
+    # Recommendation channels and the model's per-paper judgements (src/pipelines/feed/).
+    # Each one can be switched off on its own; the feed still works on the content channel alone.
+    FEED_GRAPH_CHANNEL_ENABLED: bool = True      # Semantic Scholar recommendations from liked papers
+    FEED_TRENDING_CHANNEL_ENABLED: bool = True   # Hugging Face trending papers close to the profile
+    FEED_LLM_JUDGE_ENABLED: bool = True
+    # Coding Agent preflight, generation, review and repair. Kept on the cheapest
+    # adequate model by default; raise it only after measuring a quality gap.
+    CODING_AGENT_MODEL: str = "gpt-4o-mini"
+
+    # Optional LangSmith tracing of agent runs (see src/utils/tracing.py). Off by default; prompts,
+    # answers and paper excerpts are sent to LangSmith when on, unless the HIDE flags are set.
+    LANGSMITH_TRACING: bool = False
+    LANGSMITH_API_KEY: Optional[str] = None
+    LANGSMITH_PROJECT: str = "researchmate"
+    LANGSMITH_ENDPOINT: Optional[str] = None
+    LANGSMITH_HIDE_INPUTS: bool = False
+    LANGSMITH_HIDE_OUTPUTS: bool = False
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
 
     # ArXiv settings
@@ -84,7 +123,6 @@ class Settings(BaseSettings):
 
     # Recommendation settings
     TOP_PAPERS_COUNT: int = 5
-    TOP_ARTICLES_COUNT: int = 3
     MIN_SIMILARITY_THRESHOLD: float = 0.3
 
     # Learning-to-rank settings

@@ -2,7 +2,7 @@
 Feed-related Pydantic schemas for request/response validation
 """
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 
 
@@ -34,54 +34,9 @@ class PaperResponse(BaseModel):
     relevance_score: float = 0.0
     impact_score: Optional[float] = None
     summary: Optional[str] = None
+    # Why this paper is in the feed: the model's one-line reason, its judgement, and the
+    # recall channels that found it (src/pipelines/feed/judge.py). None for older feeds.
+    reasons: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
-
-
-class ArticleResponse(BaseModel):
-    """Schema for article in feed response"""
-    id: int
-    rank: int
-    source: str
-    title: str
-    url: str
-    author: Optional[str] = None
-    published_date: Optional[datetime] = None
-    upvotes: int = 0
-    relevance_score: float = 0.0
-    summary: Optional[str] = None
-    digest_summary: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-class FeedResponse(BaseModel):
-    """Schema for daily feed response"""
-    papers: List[PaperResponse] = []
-    articles: List[ArticleResponse] = []
-    generated_at: datetime
-    time_window_days: int
-    focus_areas: List[str] = []
-    used_ml_ranking: bool = False
-    total_papers_considered: int = 0
-    total_articles_considered: int = 0
-
-
-class FeedHistoryItem(BaseModel):
-    """Schema for a single feed history entry"""
-    id: int
-    generated_at: datetime
-    time_window_days: int
-    paper_count: int
-    article_count: int
-
-
-class FeedHistoryResponse(BaseModel):
-    """Schema for paginated feed history"""
-    items: List[FeedHistoryItem]
-    total: int
-    page: int
-    per_page: int
-    has_more: bool

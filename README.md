@@ -1,260 +1,202 @@
 # ResearchMate
 
-A multi-user research platform with a personalized paper feed, multi-agent chat with RAG, and a personal knowledge base that learns from your interactions.
+ResearchMate is a multi-user research learning platform with a personalized paper feed, routed research agents, retrieval over papers and user documents, and a Coding Agent for turning papers into teaching implementations or exploring public repositories.
 
 **Live:** https://www.researchmate.site
 
----
-
 ## Features
 
-- **Daily Feed** — ArXiv papers fetched nightly via RSS. *Recommended* uses ChromaDB retrieval; *Latest* filters by publication date. Both modes rank candidates with 11 features and use a trained per-user LightGBM model when eligible, with heuristic fallback.
-- **Multi-Agent Chat** — SSE streaming chat with automatic intent routing to five specialized agents. Intent classified in three stages: keyword rules → embedding cosine similarity → GPT-4o-mini.
-- **Paper Deep Dive** — "Ask Agent" button on any paper card injects the paper's title and abstract as context on the first message so agents can give grounded, specific answers.
-- **Personal Knowledge Base** — Upload PDF, TXT, DOCX, or Markdown files. Chunks are embedded into ChromaDB and become searchable by all agents in future conversations.
-- **User Fact Memory** — GPT-4o-mini extracts facts about you after each turn (interests, expertise, goals) and stores them in Redis for 30 days. These are prepended to agent system prompts to personalize every response.
-- **Adaptive Ranking** — Per-user LightGBM model trains after 50 distinct, labeled paper interactions (saved, viewed, or dismissed). Training uses historical feedback rather than the five current Feed rows. The model status reports sample and label counts; each Feed reports whether ML scoring actually ran and why it fell back when it did.
-- **LLM-as-Judge Evaluation** — Batch eval endpoint scores agent replies on groundedness, completeness, and clarity using CriticAgent (gpt-4o-mini). Also used inline by ReflectionAgent for quality control.
-- **Prometheus Metrics** — Request counts, latency histograms, tool usage, and eval scores exposed at `/metrics`.
-
----
+- **Personalized feed** — indexes arXiv papers, retrieves candidates from ChromaDB, and ranks them with an 11-feature heuristic or per-user LightGBM LambdaRank model.
+- **Agent chat** — routes research questions, recommendations, document requests, and general conversation. Research agents can use the knowledge base, full-paper retrieval, and Tavily web search when configured.
+- **Deep research** — plans up to five subtasks, gathers evidence, and streams a cited report.
+- **Personal knowledge base** — accepts PDF, TXT, DOCX, and Markdown uploads with user-scoped retrieval.
+- **Coding Agent** — uses LangGraph for paper implementation and public repository exploration.
+- **Evaluation and observability** — provides deterministic tests, offline and paid model evaluations, tool traces, and Prometheus metrics.
 
 ## Agent routing
 
-All `research_qa` messages go through intent recognition; the router then picks a sub-agent based on query shape.
+The main chat router classifies requests as research, recommendation, document management, or general chat. Research questions are then dispatched by query shape.
 
-| Query type | Signal | Agent |
-|---|---|---|
-| Comparison / trade-off | compare, vs, pros and cons, when to use… | PlanAndSolveAgent |
-| Multi-faceted or long | >90 chars, or survey / comprehensive / multiple… | DeepResearchAgent |
-| Simple (non-streaming) | everything else, non-streaming path | ReflectionAgent |
-| Simple (streaming) | everything else, SSE path | ResearchAgent |
-| Feed / recommendation | recommend, trending, show me papers… | RecommendationAgent |
-| Document management | my files, knowledge base, uploaded… | DocumentAgent |
-| General | greetings, meta questions, off-topic | GeneralAgent |
+| Request | Agent or flow |
+|---|---|
+| Simple research question, streaming | `ResearchAgent` |
+| Simple research question, non-streaming | `ReflectionAgent` |
+| Explicit comparison or trade-off | `PlanAndSolveAgent` |
+| Long or multi-part research request | `DeepResearchAgent` |
+| Feed or paper recommendation | `RecommendationAgent` |
+| User document request | `DocumentAgent` |
+| Greeting, meta question, or off-topic request | `GeneralAgent` in `router.py` |
+| Paper implementation or repository exploration | LangGraph Coding Agent |
 
-**DeepResearchAgent** runs a three-stage pipeline: `TodoPlanner` (gpt-4o) decomposes the question into up to 5 sub-tasks → `TaskSummarizer` (gpt-4o-mini) searches ChromaDB and the web per task → `ReportWriter` (gpt-4o) synthesizes a structured Markdown report, streamed token by token. Progress events (`plan`, `task_started`, `task_done`) arrive over SSE before the first token.
+The supervisor is retained as an offline experiment and is not part of the production router.
 
-**ReflectionAgent** wraps ResearchAgent with a one-shot critique loop. CriticAgent scores groundedness, completeness, and clarity (0–1 each). If the aggregate falls below 0.70, the critique is injected back and ResearchAgent produces a refined answer.
+## Coding Agent
 
-**PlanAndSolveAgent** generates a numbered analysis blueprint, executes each step with a focused KB search, then synthesizes all step results into a final Markdown answer.
+The paper workflow checks whether available evidence supports a single-file teaching implementation, generates annotated Python, optionally executes and repairs it, and reports runtime success separately from evidence faithfulness.
 
----
+The repository workflow pins a public GitHub repository to a commit, inspects selected files, explains architecture, answers grounded follow-up questions, and can compare teaching code with a candidate repository module.
 
-## Tech stack
+Coding Agent jobs use a durable database queue:
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| API | FastAPI · Uvicorn · APScheduler | REST + SSE, nightly indexer at 06:00 UTC |
-| Frontend | Next.js 14 · TypeScript · Tailwind CSS | Dashboard, feed, streaming chat |
-| LLM | OpenAI API (gpt-4o / gpt-4o-mini) | All agent reasoning, summarization, evaluation |
-| Embeddings | sentence-transformers/all-MiniLM-L6-v2 | 384-dim vectors for ChromaDB and intent classification |
-| Vector DB | ChromaDB (embedded, persistent) | Paper and document semantic search |
-| Ranking | LightGBM LambdaRank · scikit-learn | Per-user learning-to-rank (11 features) |
-| Database | PostgreSQL (prod) · SQLite (dev) | Users, papers, articles, interactions, model state |
-| Cache | Redis *(optional)* | Session memory, fact memory, feed job status, tool traces |
-| Web search | Tavily *(optional)* | Article discovery, agent `search_web` tool |
-| Auth | JWT (HS256) · bcrypt | 24 h access tokens, password hashing |
-| Observability | Prometheus · `/metrics` | Request counts, latency, tool calls, eval scores |
-| Deployment | Docker Compose · Nginx | Six-service stack (db, redis, api, frontend, prometheus, nginx) |
-
----
-
-## Quickstart (local dev)
-
-**Prerequisites:** Python 3.11+, Node 18+
-
-### 1. Clone and configure
-
-```bash
-git clone https://github.com/your-username/researchmate
-cd researchmate
-cp .env.example .env
-# Edit .env — at minimum set OPENAI_API_KEY and SECRET_KEY
+```text
+Browser → FastAPI queues PracticeRun in PostgreSQL
+        → practice-worker claims the job
+        → Paper or Repo LangGraph writes durable checkpoints
+        → browser polls the owner-scoped run endpoint
 ```
 
-### 2. Start the backend
+The worker-related names have distinct responsibilities:
+
+| Component | Trust boundary | Responsibility |
+|---|---|---|
+| `src/jobs/practice_worker.py` | Trusted application process | Runs model calls, advances LangGraph, resumes checkpoints, and writes results. It never executes generated Python. |
+| `sandbox_worker/` | Isolated untrusted-code service | Executes generated or edited Python with network, filesystem, CPU, memory, and timeout restrictions. |
+| `src/agents/coding_runtime.py` | Shared library | Owns the process-wide checkpointer and graph run/resume helpers. |
+
+Paper draft generation and repository exploration work without the sandbox. Code execution and automatic repair require a separately deployed sandbox configured through `PRACTICE_WORKER_URL` and `PRACTICE_WORKER_TOKEN`.
+
+## Technology
+
+| Layer | Technology |
+|---|---|
+| API | FastAPI, Uvicorn, SQLAlchemy |
+| Frontend | Next.js 14, TypeScript, Tailwind CSS |
+| Agent orchestration | OpenAI tool loop; LangGraph for Coding Agent workflows |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` |
+| Vector database | Persistent ChromaDB |
+| Ranking | LightGBM LambdaRank with 11 served features |
+| Database | PostgreSQL in production, SQLite for development/tests |
+| Cache and traces | Redis with documented in-process fallbacks |
+| Deployment | Docker Compose, Nginx, GitHub Actions |
+
+## Local development
+
+Prerequisites: Python 3.11+, Node.js 18+, and an OpenAI API key for model-backed features.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+git clone https://github.com/SamLv0114/Two_Mode_Learning_Assistant.git researchmate
+cd researchmate
+cp .env.example .env
+
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 uvicorn src.api.main:app --reload --port 8000
 ```
 
-Interactive API docs are at http://localhost:8000/docs.
+Start the trusted Coding Agent orchestration worker in a second terminal:
 
-### 3. Start the frontend
+```bash
+source venv/bin/activate
+python -m src.jobs.practice_worker
+```
+
+Start the frontend:
 
 ```bash
 cd frontend
 npm install
-npm run dev                     # http://localhost:3000
+npm run dev
 ```
 
-### 4. Seed the paper index
+The frontend runs at http://localhost:3000 and API documentation at http://localhost:8000/docs.
 
-The nightly indexer runs automatically at 06:00 UTC. To populate papers immediately:
+For the production-shaped stack:
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/admin/index-now
+cp .env.example .env
+docker compose up -d --build
 ```
 
-### Docker Compose (production)
+The core Compose stack has seven services: PostgreSQL, Redis, API, trusted Coding Agent worker, frontend, Prometheus, and Nginx. The isolated code-execution worker deliberately runs outside this stack on a separate host.
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | Chat, summarization, evaluation, and Coding Agent generation |
+| `SECRET_KEY` | Stable JWT signing key; required outside tests |
+| `DATABASE_URL` | SQLite default or production PostgreSQL connection |
+| `REDIS_URL` | Conversation memory, fact memory, traces, and caches |
+| `TAVILY_API_KEY` | Enables the `search_web` tool |
+| `SEMANTIC_SCHOLAR_API_KEY` | Raises ingestion and citation-refresh API capacity |
+| `PRACTICE_ENABLED` | Enables Coding Agent API/UI capabilities |
+| `PRACTICE_WORKER_URL` | HTTPS endpoint of the external isolated sandbox |
+| `PRACTICE_WORKER_TOKEN` | Authentication token shared with the sandbox |
+| `PRACTICE_TASK_POLL_SECONDS` | Trusted task worker database poll interval |
+
+See `.env.example` for the full set and optional feature flags.
+
+## Main API groups
+
+| Prefix | Responsibility |
+|---|---|
+| `/api/v1/auth` | Registration, login, token refresh, profile |
+| `/api/v1/feed` | Generate, poll, list, and refine feeds |
+| `/api/v1/interactions` | Feedback and ranking model status/retraining |
+| `/api/v1/chat` | Routed chat, SSE, history, trace, evaluation |
+| `/api/v1/qa` | User document upload, listing, deletion |
+| `/api/v1/whats_hot` | Trending research content |
+| `/api/v1/practice` | Coding Agent runs, discussion, comparison, execution |
+
+## Repository layout
+
+```text
+src/
+  agents/
+    coding_practice.py       # Paper and Repo LangGraph definitions
+    coding_runtime.py        # shared checkpoint/run/resume helpers
+    coding_services.py       # evidence, model, GitHub, sandbox adapters
+    deep_research_agent.py
+    router.py                # routing and GeneralAgent
+    tools.py
+  api/routers/
+    chat.py
+    feed.py
+    practice.py
+    qa.py
+    whats_hot.py
+  collectors/
+    paper_data.py            # shared PaperData record
+    arxiv_rss_collector.py
+  jobs/
+    practice_worker.py       # trusted Coding Agent task process
+    nightly_indexer.py
+    bulk_import.py
+  models/
+    feature_extractor.py
+    user_recommender.py
+    user_trainer.py
+frontend/src/components/
+  PracticeWorkspace.tsx
+  PracticeRunViews.tsx
+evaluation/
+  datasets/
+  runners/
+  results/
+sandbox_worker/              # separately deployed untrusted-code executor
+```
+
+## Evaluation
+
+Deterministic tests do not call paid model APIs:
 
 ```bash
-cp .env.example .env            # fill in all values
-docker-compose up -d
+python -m unittest discover -s tests -p 'test_*.py' -v
+python tests/smoke.py
 ```
 
-This starts PostgreSQL, Redis, the API, Next.js, Prometheus, and Nginx. The frontend is served at `:80`. Prometheus runs at `:9090`.
+Registered evaluation tracks:
 
----
-
-## Environment variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | Yes | Used by all agents, fact extraction, and evaluation. |
-| `SECRET_KEY` | Yes | JWT signing key. Generate once: `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Changing it invalidates all sessions. |
-| `DATABASE_URL` | — | Defaults to `sqlite:///./data/learning_assistant.db`. Use `postgresql://user:pw@host/db` for production. |
-| `REDIS_URL` | — | Enables session memory, fact memory, feed job tracking, and tool-call traces. Falls back to in-memory without it. |
-| `TAVILY_API_KEY` | — | Enables `WebArticleAgent` (daily article discovery) and the `search_web` agent tool. Articles are skipped without it. |
-| `LLM_MODEL` | — | Default model for ResearchAgent and GeneralAgent. Default: `gpt-4o-mini`. DeepResearch and PlanSolve always use gpt-4o for planning. |
-| `ARXIV_CATEGORIES` | — | ArXiv categories to index. Default: `cs.LG,cs.AI,cs.CV,cs.CL,cs.NE`. |
-| `CORS_ORIGINS` | — | Allowed origins, comma-separated. Default: `http://localhost:3000,http://localhost:8000`. |
-
----
-
-## API reference
-
-All `/api/v1/` routes except `/auth/register` and `/auth/login` require `Authorization: Bearer <token>`. Full docs at `/docs` (Swagger UI).
-
-### Auth
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/auth/register` | Create account. Returns user + access token. |
-| `POST` | `/api/v1/auth/login` | Form login. Returns JWT access token. |
-| `GET` | `/api/v1/auth/me` | Current user profile. |
-| `PUT` | `/api/v1/auth/me` | Update interests, focus areas, or password. |
-
-### Feed
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/feed/generate` | Start background feed generation job. Returns `job_id`. |
-| `GET` | `/api/v1/feed/status/{job_id}` | Poll the current user's job (`generating` → `collecting` → `ranking` → `done`, or `error`). |
-| `GET` | `/api/v1/feed/papers` | Paginated recommended papers for current user. |
-| `GET` | `/api/v1/feed/coldstart` | Papers for new users to rate. |
-| `POST` | `/api/v1/feed/refine` | Refine the current paper feed. |
-| `GET` | `/api/v1/feed/saved` | All saved papers and articles. |
-
-### Chat (agent)
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/chat/stream` | SSE streaming. Yields `intent`, `agent`, `plan`, `task_*`, `token`, `done` events. |
-| `GET` | `/api/v1/chat/history/{session_id}` | Retrieve conversation history. |
-| `DELETE` | `/api/v1/chat/history/{session_id}` | Clear a session. |
-| `GET` | `/api/v1/chat/trace/{session_id}` | Tool-call trace (tool, args, result preview, latency). Expires after 1 hour. |
-| `POST` | `/api/v1/chat/eval/run` | Batch eval over test cases. Returns per-case scores and averages. |
-
-### Knowledge base
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/qa/documents` | Upload a document (PDF, TXT, MD). Chunks and embeds into ChromaDB. |
-| `GET` | `/api/v1/qa/documents` | List uploaded documents for current user. |
-| `DELETE` | `/api/v1/qa/documents/{id}` | Delete document from both the database and ChromaDB. |
-
-### Interactions
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/interactions` | Record viewed / saved / dismissed on a paper or article. |
-| `GET` | `/api/v1/interactions/stats` | Interaction counts and paper-feedback training readiness. |
-| `GET` | `/api/v1/interactions/model/status` | Trained sample count, label distribution, and train/validation metrics. |
-| `POST` | `/api/v1/interactions/model/retrain` | Manually trigger per-user model retraining. |
-
-### Observability
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/metrics` | Prometheus metrics: `agent_requests_total`, `agent_latency_seconds`, `tool_calls_total`, `agent_eval_score`. |
-| `POST` | `/api/v1/admin/index-now` | Manually run the nightly ArXiv indexer. |
-
----
-
-## Project structure
-
-```
-researchmate/
-├── src/
-│   ├── agents/
-│   │   ├── base_agent.py           # OpenAI tool-calling loop + listener hook
-│   │   ├── router.py               # AgentRouter — intent → agent dispatch
-│   │   ├── intent_recognizer.py    # keyword → embedding → LLM (3-stage)
-│   │   ├── research_agent.py       # RAG Q&A with ChromaDB + web search
-│   │   ├── reflection_agent.py     # ResearchAgent + CriticAgent critique loop
-│   │   ├── deep_research_agent.py  # TodoPlanner → TaskSummarizer → ReportWriter
-│   │   ├── plan_and_solve_agent.py # structured Plan → Solve → Synthesize
-│   │   ├── recommendation_agent.py # fetches + presents personalized feed
-│   │   ├── document_agent.py       # KB list and search
-│   │   ├── critic_agent.py         # LLM-as-judge (groundedness/completeness/clarity)
-│   │   ├── memory.py               # ConversationMemory + UserFactMemory (Redis)
-│   │   ├── context_builder.py      # semantic history selection via cosine similarity
-│   │   ├── tool_aware_agent.py     # wraps any agent, records tool-call traces
-│   │   ├── tools.py                # OpenAI function schemas + execute_tool()
-│   │   └── web_article_agent.py    # Tavily-powered article discovery
-│   ├── api/
-│   │   ├── main.py                 # FastAPI app, lifespan, CORS, APScheduler
-│   │   └── routers/
-│   │       ├── auth.py             # register, login, me, update
-│   │       ├── feed.py             # generate, status, papers, articles, saved
-│   │       ├── interactions.py     # create, stats, model retrain
-│   │       ├── chat.py             # stream, non-stream, history, trace, eval
-│   │       └── qa.py               # document upload, list, delete (KB panel)
-│   ├── pipelines/
-│   │   └── daily_feed.py           # end-to-end feed generation pipeline
-│   ├── models/
-│   │   ├── embeddings.py           # EmbeddingManager (singleton, thread-safe)
-│   │   ├── user_recommender.py     # per-user LightGBM LTR (loaded from DB)
-│   │   ├── user_trainer.py         # trains / retrains per-user model
-│   │   └── feature_extractor.py    # 13-feature vector builder
-│   ├── collectors/
-│   │   ├── arxiv_rss_collector.py  # RSS feed parser for ArXiv categories
-│   │   └── arxiv_collector.py      # API-based fallback collector
-│   ├── jobs/
-│   │   ├── nightly_indexer.py      # embed + upsert new papers into ChromaDB
-│   │   └── bulk_import.py          # one-shot bulk paper import utility
-│   ├── evaluation/
-│   │   └── llm_judge.py            # LLMJudge wrapping CriticAgent (0–10 scale)
-│   ├── rag/
-│   │   ├── retriever.py            # vector search via EmbeddingManager
-│   │   └── generator.py            # LLM answer generation with citations
-│   ├── database/
-│   │   └── models.py               # SQLAlchemy models + init_db()
-│   └── utils/
-│       ├── config.py               # pydantic-settings with field validators
-│       └── preprocessing.py        # PDF (PyMuPDF), HTML, text chunking
-└── frontend/
-    └── src/
-        ├── app/
-        │   ├── page.tsx            # landing page
-        │   ├── login/page.tsx      # login
-        │   ├── register/page.tsx   # registration
-        │   └── dashboard/page.tsx  # main app — feed + agent chat
-        └── lib/
-            └── api.ts              # typed axios API client
+```bash
+python evaluation/run_all.py --help
 ```
 
----
+Paid model evaluations are explicitly invoked. The Coding Agent runner requires a curated JSONL case file and writes a dated output unless `CODING_AGENT_EVAL_OUTPUT` is supplied:
 
-## Architecture overview
-
-```
-Ingestion:   ArXiv RSS → NightlyIndexer (06:00 UTC) → PostgreSQL → ChromaDB
-Feedback:    Viewed / saved / dismissed paper → interaction history → per-user LightGBM
-
-Request:     HTTP / SSE → IntentRecognizer → AgentRouter → Agent → Stream
-Agents:      Research · DeepResearch · PlanSolve · Reflection · Document · Rec · General
-Memory:      ContextBuilder (cosine sim) + UserFactMemory (Redis) + ConversationMemory
-Eval:        CriticAgent (inline) · LLMJudge (batch) · Prometheus metrics
+```bash
+CODE_LAB_EVAL_CASES=evaluation/datasets/my_cases.jsonl \
+python evaluation/runners/run_code_lab_eval.py
 ```
 
----
+`RUN:PASS` means a synthetic program check ran successfully; it does not reproduce the paper's experimental claims. `FAITHFUL:PASS` is a constrained model review over cited evidence, not independent human verification.

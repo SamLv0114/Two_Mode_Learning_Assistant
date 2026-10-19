@@ -322,7 +322,7 @@ def main():
     report += ("\n\nThe questions do not identify their target papers; alternate valid answers "
                "may therefore score below the paper-specific reference. Treat these as "
                "exploratory results, not production answer accuracy. Source presence uses "
-               "exact citation IDs. Costs are SDK usage estimates from evaluation/pricing.json, "
+               "exact citation IDs. Costs are SDK usage estimates from src/utils/model_prices.json, "
                "not billed amounts or cache savings.\n")
     report += "\n\nRaw answers and per-case judgments are stored in the accompanying JSONL.\n"
     labels = [json.loads(line) for line in args.calibration.read_text(encoding="utf-8").splitlines() if line.strip()] \

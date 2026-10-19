@@ -3,12 +3,12 @@ User interaction endpoints
 """
 import json
 import logging
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from src.database.models import User, UserInteraction, UserModelState, Paper, Article, upsert_user_interaction, count_labeled_paper_interactions
+from src.api.demo import forbid_demo
+from src.database.models import User, UserInteraction, UserModelState, Paper, upsert_user_interaction, count_labeled_paper_interactions
 from src.api.deps import get_db_session, get_current_user
 
 logger = logging.getLogger(__name__)
@@ -32,25 +32,11 @@ async def create_interaction(
     db: Session = Depends(get_db_session)
 ):
     """
-    Record a user interaction with a paper or article
-
-    - **item_type**: "paper" or "article"
-    - **item_id**: Database ID of the item
-    - **interaction_type**: "viewed", "saved", or "dismissed"
-
-    If an interaction already exists for this item, it will be updated.
+    Record that the user viewed, saved or dismissed a paper (item_id is the paper's database id).
+    If an interaction already exists for this paper, it is updated.
     """
-    # Verify the item exists
-    if interaction.item_type == "paper":
-        item = db.query(Paper).filter(Paper.id == interaction.item_id).first()
-    else:
-        item = db.query(Article).filter(Article.id == interaction.item_id).first()
-
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"{interaction.item_type.capitalize()} not found"
-        )
+    if not db.query(Paper.id).filter(Paper.id == interaction.item_id).first():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Paper not found")
 
     saved = upsert_user_interaction(db, current_user.id, interaction.item_type,
                                     interaction.item_id, interaction.interaction_type)
@@ -63,7 +49,6 @@ async def create_interaction(
 async def list_interactions(
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=20, ge=1, le=100),
-    item_type: str = Query(default=None, pattern="^(paper|article)$"),
     interaction_type: str = Query(default=None, pattern="^(viewed|saved|dismissed)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_session)
@@ -72,11 +57,9 @@ async def list_interactions(
     List user interactions with pagination and optional filtering
     """
     query = db.query(UserInteraction).filter(
-        UserInteraction.user_id == current_user.id
+        UserInteraction.user_id == current_user.id,
+        UserInteraction.item_type == "paper",  # older "article" rows belong to the retired Article subsystem
     )
-
-    if item_type:
-        query = query.filter(UserInteraction.item_type == item_type)
     if interaction_type:
         query = query.filter(UserInteraction.interaction_type == interaction_type)
 
@@ -109,7 +92,8 @@ async def get_interaction_stats(
         UserInteraction.interaction_type,
         func.count(UserInteraction.id)
     ).filter(
-        UserInteraction.user_id == current_user.id
+        UserInteraction.user_id == current_user.id,
+        UserInteraction.item_type == "paper",
     ).group_by(
         UserInteraction.interaction_type
     ).all()
@@ -134,7 +118,7 @@ async def get_interaction_stats(
 @router.delete("/{interaction_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_interaction(
     interaction_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session)
 ):
     """
@@ -197,7 +181,7 @@ async def get_model_status(
 
 @router.post("/model/retrain", response_model=RetrainResponse)
 async def retrain_model(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session)
 ):
     """

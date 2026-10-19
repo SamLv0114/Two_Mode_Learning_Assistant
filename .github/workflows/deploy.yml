@@ -70,8 +70,8 @@ jobs:
             API_REBUILT=0
             if echo "$CHANGED" | grep -Eq '^(requirements\.txt|Dockerfile\.api|src/)'; then
               echo "API image input changed — rebuilding API image"
-              docker compose build --build-arg GIT_SHA="$AFTER" api
-              docker compose up -d --force-recreate api
+              docker compose build --build-arg GIT_SHA="$AFTER" api practice-worker
+              docker compose up -d --force-recreate api practice-worker
               API_REBUILT=1
             else
               echo "No API changes"
@@ -118,6 +118,12 @@ jobs:
                     echo "API image revision $RUNNING_SHA does not match deployed commit $AFTER"
                     exit 1
                   fi
+                  WORKER_RUNNING=$(docker inspect -f '{{.State.Running}}' learning_assistant_practice_worker)
+                  WORKER_SHA=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' learning_assistant_practice_worker)
+                  if [ "$WORKER_RUNNING" != "true" ] || [ "$WORKER_SHA" != "$AFTER" ]; then
+                    echo "Practice worker is not running the deployed commit (running=$WORKER_RUNNING revision=$WORKER_SHA expected=$AFTER)"
+                    exit 1
+                  fi
                 fi
                 docker image prune -f
                 echo "Deploy complete"
@@ -127,5 +133,5 @@ jobs:
             done
 
             echo "API or public routes failed health check after 45 attempts — recent logs:"
-            docker compose logs --tail=50 api nginx frontend
+            docker compose logs --tail=50 api practice-worker nginx frontend
             exit 1

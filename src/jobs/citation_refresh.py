@@ -21,11 +21,6 @@ from src.database.models import SessionLocal, Paper
 from src.models import EmbeddingManager
 from src.utils.config import settings
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 _S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
@@ -225,6 +220,11 @@ def run_citation_refresh(min_age_days: int = 14, batch_size: int = _MAX_BATCH) -
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
     parser = argparse.ArgumentParser(description="Backfill citation counts for papers with citation_count=0")
     parser.add_argument("--min-age-days", type=int, default=14,
                         help="Only update papers at least this many days old (default: 14)")

@@ -1,0 +1,43 @@
+{
+  "paper_id": "1412.6980",
+  "source_url": "https://arxiv.org/abs/1412.6980",
+  "evidence_count": 8,
+  "source_error": "",
+  "manifest": {
+    "feasible": true,
+    "method": "Adam optimizer",
+    "reason": "The Adam optimizer is well-defined in the excerpts, with clear update rules and parameters that can be implemented in a small Python program.",
+    "known_details": [
+      {
+        "detail": "Adam's update rule involves calculating biased first and second moment estimates.",
+        "evidence_ids": [
+          "E7"
+        ]
+      },
+      {
+        "detail": "The update for parameters θ is given by θt ← θt−1 − α · bmt / (√bvt + ϵ).",
+        "evidence_ids": [
+          "E4"
+        ]
+      },
+      {
+        "detail": "The algorithm uses hyperparameters β1 and β2 for the moment estimates.",
+        "evidence_ids": [
+          "E7"
+        ]
+      },
+      {
+        "detail": "The algorithm is designed for minimizing a stochastic objective function.",
+        "evidence_ids": [
+          "E2"
+        ]
+      }
+    ],
+    "unknown_details": [
+      "Specific values for hyperparameters α, β1, β2, and ϵ are not provided.",
+      "The exact form of the synthetic quadratic objective function is not specified."
+    ]
+  },
+  "input_tokens": 1255,
+  "output_tokens": 248
+}

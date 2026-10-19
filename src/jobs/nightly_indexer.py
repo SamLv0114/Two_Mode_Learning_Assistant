@@ -6,7 +6,6 @@ Fetches today's new papers, embeds them in one batch, and upserts into ChromaDB.
 
 This separates ingestion from feed generation so users never wait for embedding.
 """
-import json
 import logging
 from datetime import datetime, timezone
 
@@ -77,11 +76,7 @@ def run_nightly_index() -> dict:
         em = EmbeddingManager()
         texts = [f"{p.title}\n\n{p.abstract}" for p in new_papers]
         logger.info(f"Embedding {len(new_papers)} papers in one batch...")
-        embeddings = em.model.encode(
-            texts,
-            show_progress_bar=True,
-            batch_size=32,
-        ).tolist()
+        embeddings = em.embed_papers([p.title for p in new_papers], [p.abstract for p in new_papers])
 
         # Step 4: upsert into ChromaDB
         ids = [f"paper_{p.arxiv_id}" for p in new_papers]

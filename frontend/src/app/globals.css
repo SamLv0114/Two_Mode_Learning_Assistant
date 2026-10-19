@@ -54,6 +54,58 @@
     @apply bg-white rounded-2xl border border-gray-100 shadow-sm p-6;
   }
 
+  /* Smaller buttons for toolbars and inline actions; combine with btn-primary / btn-secondary. */
+  .btn-sm {
+    @apply py-1.5 px-3 text-xs rounded-lg shadow-none;
+  }
+
+  /* Text-only action, e.g. "Answer →" or "Show in code". */
+  .btn-link {
+    @apply inline-flex items-center gap-1 text-sm font-medium text-primary-600 hover:text-primary-700 hover:underline
+           disabled:opacity-40 disabled:no-underline;
+  }
+
+  /* Two or three mutually exclusive options (Recommended / Latest, Paper / Repository). */
+  .segmented {
+    @apply inline-flex rounded-xl border border-gray-200 bg-gray-50 p-0.5 gap-0.5;
+  }
+  .segmented-item {
+    @apply px-3 py-1.5 text-sm font-medium rounded-lg text-gray-500 hover:text-gray-700 transition-all duration-150;
+  }
+  .segmented-item-active {
+    @apply bg-white text-primary-600 shadow-sm hover:text-primary-600;
+  }
+
+  /* Uppercase label above a group of fields or a list. */
+  .section-label {
+    @apply block text-xs font-semibold uppercase tracking-wide text-gray-500;
+  }
+
+  /* A bordered block inside a card (method check, review, tour stop). */
+  .panel {
+    @apply bg-white rounded-xl border border-gray-200 p-4;
+  }
+
+  /* Status messages; pick one tone. */
+  .notice {
+    @apply rounded-xl border p-3 text-sm;
+  }
+  .notice-info {
+    @apply border-sky-200 bg-sky-50 text-sky-900;
+  }
+  .notice-warn {
+    @apply border-amber-200 bg-amber-50 text-amber-900;
+  }
+  .notice-success {
+    @apply border-emerald-200 bg-emerald-50 text-emerald-900;
+  }
+  .notice-error {
+    @apply border-rose-200 bg-rose-50 text-rose-800;
+  }
+  .notice-accent {
+    @apply border-violet-200 bg-violet-50 text-violet-900;
+  }
+
   .card-lift {
     @apply bg-white rounded-2xl border border-gray-100 shadow-sm p-6
            transition-all duration-200 hover:shadow-md hover:-translate-y-px;

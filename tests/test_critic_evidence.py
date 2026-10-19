@@ -15,8 +15,7 @@ class _Completion:
     def create(self, **kwargs):
         self.prompt = "\n".join(message["content"] for message in kwargs["messages"])
         payload = json.dumps({"groundedness": 0.9, "completeness": 0.8, "clarity": 0.8, "critique": ""})
-        call = SimpleNamespace(function=SimpleNamespace(arguments=payload))
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[call]))])
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=payload))])
 
 
 class CriticEvidenceTests(unittest.TestCase):

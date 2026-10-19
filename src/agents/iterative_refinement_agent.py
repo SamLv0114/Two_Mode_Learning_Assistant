@@ -14,13 +14,16 @@ back to the corpus; an earlier version searched the user's own recommendation
 rows, which are exactly the feed being refined, so it never found anything and
 the optimizer half silently did nothing.
 """
-import json
 import logging
 from typing import Callable, Dict, List, Optional
 
-from openai import OpenAI
 
+from pydantic import BaseModel, field_validator
+
+from src.agents.core.structured import structured_call
 from src.utils.config import settings
+from src.utils.llm_usage import model_for
+from src.utils.tracing import openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +46,19 @@ Score on:
 - Novelty (not all well-known papers the reader likely already knows)
 - Profile fit (does the mix of established and recent work match the reading profile above)
 
-Return JSON only: {{"score": <float 0-1>, "reason": "<one sentence>", "weak_indices": [<0-indexed positions to replace>]}}
+Give the score, a one-sentence reason, and the 0-indexed positions of the papers to replace.
 """
+
+
+class FeedEvaluation(BaseModel):
+    score: float
+    reason: str
+    weak_indices: List[int]
+
+    @field_validator("score")
+    @classmethod
+    def _clamp(cls, value: float) -> float:
+        return max(0.0, min(1.0, value))
 
 
 class IterativeRefinementAgent:
@@ -56,7 +70,7 @@ class IterativeRefinementAgent:
     def __init__(self):
         if not settings.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY is not configured")
-        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = openai_client()
 
     def refine(
         self,
@@ -146,18 +160,11 @@ class IterativeRefinementAgent:
             papers_block=papers_block,
         )
         try:
-            resp = self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.0,
-                response_format={"type": "json_object"},
+            result = structured_call(
+                self.client, FeedEvaluation, task="feed_evaluation", model=model_for("feed_evaluation"),
+                max_tokens=200, messages=[{"role": "user", "content": prompt}],
             )
-            data = json.loads(resp.choices[0].message.content)
-            score = float(data.get("score", 0.0))
-            reason = data.get("reason", "")
-            weak_indices = [int(i) for i in data.get("weak_indices", [])]
-            return score, reason, weak_indices
+            return result.score, result.reason, result.weak_indices
         except Exception as e:
             logger.warning(f"Evaluator LLM call failed: {e}")
             return 0.5, "evaluation unavailable", []

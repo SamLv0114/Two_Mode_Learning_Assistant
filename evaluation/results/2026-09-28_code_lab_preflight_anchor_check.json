@@ -1,0 +1,35 @@
+{
+  "paper_id": "1412.6980",
+  "evidence_chunk_indices": [
+    "9",
+    "84",
+    "62",
+    "4",
+    "11"
+  ],
+  "manifest": {
+    "feasible": true,
+    "method": "Adam optimizer",
+    "reason": "The Adam optimizer is described in detail with specific update rules and parameters, making it possible to implement a minimal version in Python.",
+    "known_details": [
+      {
+        "detail": "The update rules for the Adam optimizer include calculating biased first and second moment estimates.",
+        "evidence_ids": [
+          "E5"
+        ]
+      },
+      {
+        "detail": "Good default settings for the Adam optimizer are α = 0.001, β1 = 0.9, β2 = 0.999, and ϵ = 10−8.",
+        "evidence_ids": [
+          "E1"
+        ]
+      }
+    ],
+    "unknown_details": [
+      "The specific form of the synthetic quadratic objective function to be optimized."
+    ]
+  },
+  "input_tokens": 1175,
+  "output_tokens": 173,
+  "note": "Real OpenAI preflight over official PDF excerpts; vector hits mocked, Chroma exact-text anchor real; no code execution or human review"
+}

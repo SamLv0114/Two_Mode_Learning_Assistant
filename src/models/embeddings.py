@@ -2,47 +2,42 @@
 Embedding utilities for vector search
 """
 import chromadb
+import numpy as np
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Optional
 from src.utils.config import settings
 from src.utils.preprocessing import chunk_text, semantic_parent_child_chunks
+from src.utils.redis_client import get_redis
 import logging
 import threading
 from pathlib import Path
 import shutil
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def _scope_where(filter_type: Optional[str], user_id: Optional[int]) -> Optional[Dict]:
     """
-    Build a ChromaDB `where` clause that scopes "user_doc" chunks to their
-    owner. "paper"/"article" are global, shared content and are never scoped.
+    The ChromaDB `where` clause for a search.
 
-    A caller that knows filter_type == "user_doc" but omits user_id gets a
-    clause matching no real document, rather than silently falling back to
-    an unscoped query — the missing identity is a caller bug, and this
-    fails closed instead of leaking every user's uploads.
+    With no filter a search covers whole papers plus the requesting user's own
+    uploads. It used to be "anything but user_doc", which also let in the
+    per-paper full-text chunks fetch_full_paper stores ("paper_fulltext") and
+    vectors of the retired Article subsystem.
+
+    "user_doc" chunks are private: a caller that asks for them without a
+    user_id gets a clause matching nothing, rather than every user's uploads
+    (the missing identity is a caller bug, so this fails closed).
     """
+    own_docs = {"$and": [{"type": "user_doc"}, {"user_id": user_id if user_id is not None else -1}]}
     if filter_type == "user_doc":
-        return {"$and": [{"type": "user_doc"}, {"user_id": user_id if user_id is not None else -1}]}
+        return own_docs
     if filter_type:
         return {"type": filter_type}
     if user_id is not None:
-        # Unfiltered search still must not leak other users' uploads: any
-        # non-user_doc hit passes through, a user_doc hit only if it's this
-        # user's own.
-        return {
-            "$or": [
-                {"type": {"$ne": "user_doc"}},
-                {"$and": [{"type": "user_doc"}, {"user_id": user_id}]},
-            ]
-        }
-    # No identity at all (trusted system/background path) — exclude user_doc
-    # entirely rather than search across every user's private uploads.
-    return {"type": {"$ne": "user_doc"}}
+        return {"$or": [{"type": "paper"}, own_docs]}
+    return {"type": "paper"}  # a trusted system path with no user: never anyone's uploads
 
 
 class EmbeddingManager:
@@ -145,6 +140,50 @@ class EmbeddingManager:
         """Generate embeddings for multiple texts"""
         return self.model.encode(texts, show_progress_bar=True).tolist()
 
+    PIECE_OVERLAP_TOKENS = 32
+
+    def paper_pieces(self, title: str, abstract: str) -> List[str]:
+        """
+        "title + abstract" cut into pieces the model can read whole, each starting with the title.
+
+        all-MiniLM-L6-v2 reads at most 256 tokens and silently drops the rest, which cut off
+        roughly the last third of a typical abstract, often where its results are stated.
+        """
+        tokenizer = self.model.tokenizer
+        limit = self.model.max_seq_length - 2  # room for the [CLS] and [SEP] tokens
+        full = f"{title}\n\n{abstract}" if abstract else title
+        if len(tokenizer(full, add_special_tokens=False)["input_ids"]) <= limit:
+            return [full]
+        head = tokenizer(f"{title}\n\n", add_special_tokens=False)["input_ids"][:limit // 3]
+        body = tokenizer(abstract, add_special_tokens=False)["input_ids"]
+        room = limit - len(head)
+        step = max(1, room - self.PIECE_OVERLAP_TOKENS)
+        pieces = []
+        for start in range(0, len(body), step):
+            pieces.append(tokenizer.decode(head + body[start:start + room]))
+            if start + room >= len(body):
+                break
+        return pieces
+
+    def embed_papers(self, titles: List[str], abstracts: List[str]) -> List[List[float]]:
+        """
+        One vector per paper: the mean of its pieces' normalised embeddings, so text past the
+        model's input limit still counts. Every write to the paper index goes through here.
+        """
+        pieces, owners = [], []
+        for index, (title, abstract) in enumerate(zip(titles, abstracts)):
+            for piece in self.paper_pieces(title or "", abstract or ""):
+                pieces.append(piece)
+                owners.append(index)
+        if not pieces:
+            return []
+        vectors = np.asarray(self.model.encode(pieces, batch_size=32, show_progress_bar=False,
+                                               normalize_embeddings=True))
+        pooled = np.zeros((len(titles), vectors.shape[1]))
+        np.add.at(pooled, np.asarray(owners), vectors)
+        pooled /= np.maximum(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12)
+        return pooled.tolist()
+
     @staticmethod
     def _chunk_records(text: str) -> List[Dict]:
         if settings.RAG_SEMANTIC_CHUNKING_ENABLED:
@@ -158,11 +197,11 @@ class EmbeddingManager:
     @staticmethod
     def _bump_public_corpus_revision() -> None:
         """Invalidate Redis retrieval caches even when an update preserves count."""
-        if not settings.REDIS_URL:
+        client = get_redis()
+        if client is None:
             return
         try:
-            import redis
-            redis.from_url(settings.REDIS_URL).incr("rag:public_corpus_revision")
+            client.incr("rag:public_corpus_revision")
         except Exception as exc:
             logger.warning("Could not advance public corpus revision: %s", exc)
     
@@ -176,7 +215,7 @@ class EmbeddingManager:
             if existing["ids"]:
                 # Update existing
                 text = f"{title}\n\n{abstract}"
-                embedding = self.generate_embedding(text)
+                embedding = self.embed_papers([title], [abstract])[0]
                 self.collection.update(
                     ids=[paper_id_str],
                     embeddings=[embedding],
@@ -189,12 +228,12 @@ class EmbeddingManager:
                 )
                 self._bump_public_corpus_revision()
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Existing-paper lookup failed, adding as new: %s", exc)
         
         # Add new
         text = f"{title}\n\n{abstract}"
-        embedding = self.generate_embedding(text)
+        embedding = self.embed_papers([title], [abstract])[0]
         
         try:
             self.collection.add(
@@ -211,51 +250,6 @@ class EmbeddingManager:
         except Exception as e:
             logger.debug(f"Error adding paper {paper_id}: {e}")
     
-    def add_article(self, article_id: str, title: str, content: str, metadata: Dict):
-        """Add an article to the vector database (updates if exists)"""
-        article_id_str = f"article_{article_id}"
-        
-        # Check if already exists
-        try:
-            existing = self.collection.get(ids=[article_id_str])
-            if existing["ids"]:
-                # Update existing
-                text = f"{title}\n\n{content[:1000]}"
-                embedding = self.generate_embedding(text)
-                self.collection.update(
-                    ids=[article_id_str],
-                    embeddings=[embedding],
-                    documents=[text],
-                    metadatas=[{
-                        **metadata,
-                        "type": "article",
-                        "article_id": article_id
-                    }]
-                )
-                self._bump_public_corpus_revision()
-                return
-        except Exception:
-            pass
-        
-        # Add new
-        text = f"{title}\n\n{content[:1000]}"
-        embedding = self.generate_embedding(text)
-        
-        try:
-            self.collection.add(
-                embeddings=[embedding],
-                documents=[text],
-                metadatas=[{
-                    **metadata,
-                    "type": "article",
-                    "article_id": article_id
-                }],
-                ids=[article_id_str]
-            )
-            self._bump_public_corpus_revision()
-        except Exception as e:
-            logger.debug(f"Error adding article {article_id}: {e}")
-
     def add_user_document(self, doc_id: str, title: str, content: str, metadata: Dict) -> int:
         """
         Add a user-uploaded document to the vector database as chunked entries.
@@ -411,9 +405,9 @@ class EmbeddingManager:
         Args:
             query: Search query text
             n_results: Number of results to return
-            filter_type: Optional filter by "paper", "article", or "user_doc"
+            filter_type: Optional filter by "paper" or "user_doc"
             user_id: Requesting user's id. "user_doc" chunks are private per-user
-                (unlike "paper"/"article", which are global) — this scopes any
+                (unlike papers, which are global) — this scopes any
                 user_doc results to this user so one user's uploads never surface
                 in another user's search results. Pass the current user's id on
                 every user-facing call; omit only for trusted system/background

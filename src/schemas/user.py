@@ -70,6 +70,7 @@ class UserResponse(UserBase):
     created_at: datetime
     interaction_count: int = 0
     model_trained: bool = False
+    is_demo: bool = False   # the shared demo account; the UI says so and hides account actions
 
     class Config:
         from_attributes = True

@@ -1,5 +1,7 @@
 """
-Q&A Assistant endpoints
+Knowledge base documents: upload, list and delete the files Agent Chat can search.
+
+Questions over them are answered by the chat agents (search_user_documents), not here.
 """
 import hashlib
 from typing import Optional, List
@@ -7,26 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
+from src.api.demo import forbid_demo
 from src.database.models import User, UserDocument
 from src.api.deps import get_db_session, get_current_user, get_embedding_manager
 from src.models.embeddings import EmbeddingManager
-from src.utils.config import settings
 
 router = APIRouter(prefix="/qa", tags=["Q&A Assistant"])
-
-
-class QuestionRequest(BaseModel):
-    """Schema for asking a question"""
-    question: str
-    n_context: int = 5
-    filter_type: Optional[str] = None  # "paper", "article", "user_doc", or None for all
-
-
-class QuestionResponse(BaseModel):
-    """Schema for Q&A response"""
-    answer: str
-    citations: List[dict]
-    sources_used: int
 
 
 class DocumentUploadResponse(BaseModel):
@@ -46,79 +34,11 @@ class DocumentListItem(BaseModel):
     created_at: str
 
 
-# Disabled — zero callers from the frontend. The Knowledge Base panel only
-# does document management (upload/list/delete); actual Q&A over the
-# knowledge base happens through the chat agent's search_knowledge_base /
-# search_user_documents tools instead, not this direct endpoint. Left
-# commented rather than deleted in case a direct, non-agent Q&A endpoint is
-# wanted again later.
-# @router.post("/ask", response_model=QuestionResponse)
-# async def ask_question(
-#     request: QuestionRequest,
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db_session),
-#     embedding_manager: EmbeddingManager = Depends(get_embedding_manager)
-# ):
-#     """
-#     Ask a question and get an answer from the knowledge base
-#
-#     - **question**: The question to ask
-#     - **n_context**: Number of context documents to retrieve (3-10)
-#     - **filter_type**: Optional filter by content type
-#     """
-#     if not request.question.strip():
-#         raise HTTPException(
-#             status_code=status.HTTP_400_BAD_REQUEST,
-#             detail="Question cannot be empty"
-#         )
-#
-#     try:
-#         # Import QA components
-#         from src.rag.retriever import Retriever
-#         from src.rag.generator import Generator
-#
-#         retriever = Retriever(embedding_manager)
-#         generator = Generator()
-#
-#         # Retrieve relevant documents
-#         results = retriever.retrieve(
-#             query=request.question,
-#             n_results=request.n_context,
-#             filter_type=request.filter_type,
-#             user_id=current_user.id,
-#         )
-#
-#         if not results:
-#             return QuestionResponse(
-#                 answer="I couldn't find any relevant information in the knowledge base to answer your question.",
-#                 citations=[],
-#                 sources_used=0
-#             )
-#
-#         # Generate answer
-#         answer_result = generator.generate_answer(
-#             question=request.question,
-#             context=results
-#         )
-#
-#         return QuestionResponse(
-#             answer=answer_result.get("answer", ""),
-#             citations=answer_result.get("citations", []),
-#             sources_used=len(results)
-#         )
-#
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail=f"Failed to generate answer: {str(e)}"
-#         )
-
-
 @router.post("/documents", response_model=DocumentUploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session),
     embedding_manager: EmbeddingManager = Depends(get_embedding_manager)
 ):
@@ -241,7 +161,7 @@ async def list_documents(
 @router.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
     doc_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(forbid_demo),
     db: Session = Depends(get_db_session),
     embedding_manager: EmbeddingManager = Depends(get_embedding_manager),
 ):

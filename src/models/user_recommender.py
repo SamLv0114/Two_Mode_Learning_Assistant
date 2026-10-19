@@ -151,7 +151,7 @@ class UserRecommender:
         Rank items by ML score (or heuristic fallback).
 
         Args:
-            items: List of Paper/Article objects
+            items: Papers to rank
             features: List of feature dictionaries
 
         Returns:
@@ -361,7 +361,8 @@ class UserRecommender:
         train_mrr: float,
         val_ndcg: Optional[float] = None,
         val_mrr: Optional[float] = None,
-        interaction_count: int = 0
+        interaction_count: int = 0,
+        val_baseline_ndcg: Optional[float] = None,
     ):
         """Save training metrics to the database"""
         state = self.db.query(UserModelState).filter(
@@ -373,6 +374,7 @@ class UserRecommender:
             state.train_mrr = train_mrr
             state.val_ndcg = val_ndcg
             state.val_mrr = val_mrr
+            state.val_baseline_ndcg = val_baseline_ndcg
             state.interaction_count_at_training = interaction_count
             state.last_trained_at = datetime.now(timezone.utc)
             self.db.commit()

@@ -12,7 +12,8 @@ import logging
 
 from src.utils.config import settings
 from src.database.models import init_db
-from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router, whats_hot_router
+from src.api.routers import auth_router, feed_router, interactions_router, qa_router, chat_router, whats_hot_router, public_router, profile_router
+from src.api.routers.practice import router as practice_router
 from src.api.middleware import RateLimitMiddleware
 from src.api.deps import get_current_superuser
 from src.jobs.nightly_indexer import run_nightly_index
@@ -91,7 +92,7 @@ app = FastAPI(
     ## Features
 
     - **Authentication**: JWT-based user authentication
-    - **Daily Feed**: Personalized paper and article recommendations
+    - **Daily Feed**: Personalized paper recommendations
     - **Interactions**: Track saved, viewed, and dismissed items
     - **Q&A Assistant**: Ask questions about your knowledge base
     - **Document Upload**: Add your own documents to the knowledge base
@@ -162,6 +163,9 @@ app.include_router(interactions_router, prefix=settings.API_V1_PREFIX)
 app.include_router(qa_router, prefix=settings.API_V1_PREFIX)
 app.include_router(chat_router, prefix=settings.API_V1_PREFIX)
 app.include_router(whats_hot_router, prefix=settings.API_V1_PREFIX)
+app.include_router(practice_router, prefix=settings.API_V1_PREFIX)
+app.include_router(public_router, prefix=settings.API_V1_PREFIX)
+app.include_router(profile_router, prefix=settings.API_V1_PREFIX)
 
 
 # Prometheus metrics endpoint (scraped by Prometheus every 15s)

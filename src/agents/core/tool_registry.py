@@ -5,12 +5,15 @@ Inspired by Hello-Agents ch7 "everything is a tool" philosophy.
 Agents call registry.schemas() to get their tool list and registry.execute()
 to dispatch calls, rather than scattering schema dicts and if/elif chains.
 """
+import contextvars
 import logging
 import random
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Dict, List
+
+from src.utils.tracing import annotate, traceable
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +98,6 @@ class ToolRegistry:
         logger.debug(f"ToolRegistry: registered tool '{name}' (timeout={timeout}s)")
         return self
 
-    def schemas(self) -> List[Dict]:
-        """Return all registered OpenAI tool schemas."""
-        return list(self._schemas.values())
-
     def _circuit_is_open(self, name: str) -> bool:
         """True if `name` is currently short-circuited (too many recent failures)."""
         with self._circuit_lock:
@@ -128,6 +127,8 @@ class ToolRegistry:
                         f"{state['failures']} consecutive failures"
                     )
 
+    # Only the tool name and arguments are traced: the request context holds the DB session and user.
+    @traceable(run_type="tool", name="tool", process_inputs=lambda i: {"tool": i.get("name"), "args": i.get("args")})
     def execute(self, name: str, args: Dict[str, Any], context: Dict) -> Dict:
         """
         Execute a tool by name, with a hard timeout, bounded jittered retries,
@@ -146,6 +147,7 @@ class ToolRegistry:
         further calls fail immediately instead of each paying the full
         timeout+retry cost again while the dependency is still down.
         """
+        annotate(name=f"tool:{name}")
         fn = self._executors.get(name)
         if fn is None:
             logger.warning(f"ToolRegistry: unknown tool '{name}'")
@@ -158,7 +160,9 @@ class ToolRegistry:
         timeout = self._timeouts.get(name, TOOL_TIMEOUT_SECONDS)
         last_error = "unknown error"
         for attempt in range(TOOL_MAX_RETRIES + 1):
-            future: Future = self._executor_pool.submit(fn, args, context)
+            # A fresh copy of the caller's context per attempt keeps trace nesting (LangSmith reads
+            # contextvars) across the pool; an abandoned timed-out attempt may still be inside its own.
+            future: Future = self._executor_pool.submit(contextvars.copy_context().run, fn, args, context)
             try:
                 result = future.result(timeout=timeout)
                 self._circuit_record(name, success=True)
@@ -177,18 +181,6 @@ class ToolRegistry:
 
         self._circuit_record(name, success=False)
         return {"error": f"Tool '{name}' failed after {TOOL_MAX_RETRIES + 1} attempt(s): {last_error}"}
-
-    def subset(self, *names: str) -> "ToolRegistry":
-        """Return a new registry containing only the named tools."""
-        sub = ToolRegistry()
-        for name in names:
-            if name in self._schemas:
-                sub._schemas[name] = self._schemas[name]
-                sub._executors[name] = self._executors[name]
-                sub._timeouts[name] = self._timeouts[name]
-            else:
-                logger.warning(f"ToolRegistry.subset: tool '{name}' not found")
-        return sub
 
     def names(self) -> List[str]:
         return list(self._schemas.keys())
