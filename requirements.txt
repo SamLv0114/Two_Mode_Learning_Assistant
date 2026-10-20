@@ -57,7 +57,9 @@ apscheduler>=3.10.0
 tqdm>=4.66.0
 
 # PDF Processing
-PyMuPDF>=1.23.0
+# 2.0 (2026-10-19) splits simple ruled tables into extra empty columns and breaks numbers
+# apart (tests/test_chunking_pdf.py); stay on 1.x until table extraction is re-checked.
+PyMuPDF>=1.23.0,<2.0
 
 # Streamlit (legacy UI, optional - not needed for production)
 # streamlit>=1.28.0
