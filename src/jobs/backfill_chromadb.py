@@ -85,10 +85,8 @@ def run_backfill(reembed: bool = False) -> dict:
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         result.update({"indexed": indexed, "skipped": skipped, "elapsed_s": round(elapsed, 1)})
-        logger.info(
-            f"Backfill complete: {indexed} new papers indexed, "
-            f"{skipped} already existed — {elapsed:.1f}s"
-        )
+        done = "re-embedded" if reembed else "newly indexed"
+        logger.info(f"Backfill complete: {indexed} papers {done}, {skipped} already existed — {elapsed:.1f}s")
 
     except Exception as e:
         result["error"] = str(e)

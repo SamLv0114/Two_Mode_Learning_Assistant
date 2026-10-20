@@ -71,6 +71,10 @@ def run_graph_job(run_id: str) -> None:
     from src.api.deps import get_embedding_manager
 
     db = SessionLocal()
+    # The graph's nodes run on LangGraph's worker threads while this loop records their events
+    # and status. A SQLAlchemy session must never be used by two threads at once (sharing one
+    # failed runs with "This session is in 'prepared' state"), so the nodes get their own.
+    services_db = SessionLocal()
     services = None
     recorded_input = 0
     recorded_output = 0
@@ -79,7 +83,7 @@ def run_graph_job(run_id: str) -> None:
         if row is None or row.status == "cancelled":
             return
         services = CodingServices(
-            db,
+            services_db,
             embedding_manager=get_embedding_manager() if row.kind == "paper" else None,
             run_id=run_id,
             user_id=row.user_id,
@@ -147,6 +151,7 @@ def run_graph_job(run_id: str) -> None:
                     input_tokens=PracticeRun.input_tokens + delta_input,
                     output_tokens=PracticeRun.output_tokens + delta_output))
                 db.commit()
+        services_db.close()
         db.close()
 
 

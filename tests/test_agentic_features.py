@@ -1,6 +1,8 @@
 """Plan confirmation, evidence gathering across agents, call-graph tools, live events and exercises."""
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from fastapi import FastAPI
@@ -9,7 +11,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from src.agents.coding_practice import (build_paper_graph, code_map, evidence_gaps,
                                         fill_exercise, make_exercise, plan_from_decision)
@@ -341,9 +342,24 @@ def sse(response):
     return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
 
 
+def sqlite_engine(test: unittest.TestCase):
+    """
+    A throwaway SQLite file where every session gets its own connection, as with Postgres in
+    production. An in-memory database needs one shared connection (StaticPool), and the
+    threaded endpoints and the worker interleaved their transactions on it, which made these
+    tests fail now and then on slower CI machines.
+    """
+    folder = tempfile.TemporaryDirectory()
+    test.addCleanup(folder.cleanup)
+    engine = create_engine(f"sqlite:///{Path(folder.name) / 'test.db'}",
+                           connect_args={"check_same_thread": False, "timeout": 30})
+    test.addCleanup(engine.dispose)  # cleanups run last-in first-out: dispose before deleting the file
+    return engine
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
-        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        engine = sqlite_engine(self)
         Base.metadata.create_all(engine)
         self.sessions = sessionmaker(bind=engine, expire_on_commit=False)
         with self.sessions() as db:
@@ -454,9 +470,38 @@ class ApiTests(unittest.TestCase):
 
 
 class WorkerInterruptTests(unittest.TestCase):
+    def test_graph_nodes_do_not_share_the_runtime_session(self):
+        """Nodes run on LangGraph's threads while the runtime records events; one shared session
+        failed in production with "This session is in 'prepared' state"."""
+        from src.agents import coding_runtime
+        engine = sqlite_engine(self)
+        Base.metadata.create_all(engine)
+        sessions = sessionmaker(bind=engine)
+        with sessions() as db:
+            db.add(User(id=1, email="own@example.com", hashed_password="x"))
+            db.add(PracticeRun(run_id="own-run", user_id=1, kind="paper", source="2106.09685",
+                               status="running", stage="starting"))
+            db.commit()
+        opened, given = [], {}
+
+        def open_session():
+            opened.append(sessions())
+            return opened[-1]
+
+        def services(db, **kwargs):
+            given["db"] = db
+            raise RuntimeError("stop once the services exist")
+
+        with patch.object(coding_runtime, "SessionLocal", open_session), \
+             patch("src.api.deps.get_embedding_manager", return_value=object()), \
+             patch("src.agents.coding_services.CodingServices", side_effect=services):
+            coding_runtime.run_graph_job("own-run")
+        self.assertEqual(len(opened), 2)
+        self.assertIs(given["db"], opened[1])  # not opened[0], which records events and status
+
     def test_worker_marks_the_run_waiting_then_finishes_after_the_plan(self):
         from src.agents import coding_runtime
-        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        engine = sqlite_engine(self)
         Base.metadata.create_all(engine)
         sessions = sessionmaker(bind=engine)
         with sessions() as db:
